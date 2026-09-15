@@ -1,0 +1,83 @@
+# Single image, two entrypoints (api / worker) selected by CMD override —
+# same code and dependencies drive both, since capabilities/tools/planner
+# are shared between the FastAPI process and the Temporal worker process.
+#
+# python:3.12-slim ships with NEITHER git NOR node/npm — both are hard
+# requirements here, not optional: clone_repo shells out to `git`, and
+# every opencode-backed capability (analyze/generate_fix/verify/publish_pr)
+# shells out to the `opencode` binary (github.com/sst/opencode, an npm
+# package). Confirmed by running `which git`/`which node` against the bare
+# base image — both come back empty.
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        ca-certificates \
+        golang-go \
+        openjdk-21-jdk-headless \
+        maven \
+    && rm -rf /var/lib/apt/lists/*
+
+# `repo.url` can be a local filesystem path (e.g. a bind-mounted volume),
+# not just a network remote — and git refuses to clone a source directory
+# owned by a different user than the current process ("detected dubious
+# ownership"), which is exactly what a bind mount into this container
+# looks like. Confirmed live that `-c safe.directory=*` on the clone
+# command itself does NOT suppress this for a local clone's source (git
+# only honors it from real global config for that specific check) — hence
+# setting it here, once, at image build time, rather than per-invocation.
+RUN git config --system --add safe.directory '*'
+
+# `golang-go` / `openjdk-21-jdk-headless` + `maven` above are for `verify`
+# to be able to build/test *target* repos written in Go or Java — a
+# deliberate, bounded bet (Go/Java/Node/Python are the languages this
+# agent has actually been exercised against; see docs/MEMORY.md — Java 21
+# specifically because that's what a real target repo,
+# insightfinder/InfrastructureCore, requires via maven-compiler-plugin's
+# <source>/<target>). This is NOT full multi-language coverage: a repo
+# needing Rust, .NET, etc. will clone/analyze/fix fine (opencode doesn't
+# need the target's toolchain for that) but `verify` will fail with
+# "command not found" — correctly reported as a real failure
+# (fail_needs_human after retries), just not automatically fixable without
+# adding that toolchain here too. Extend this list as real requests need
+# more languages, or revisit with a per-request build sandbox if the
+# language spread outgrows "just add it to the image."
+#
+# Known limitation, not fixed here: a Maven repo can depend on jars that
+# were only ever `mvn install:install-file`'d into a developer's local
+# ~/.m2 by hand (no <repositories> entry, no README step) —
+# InfrastructureCore does exactly this for two of its own internal jars,
+# vendored directly in the repo root. A clean container has no way to know
+# about that by itself; `mvn compile` will fail with an unresolvable
+# dependency until something (ideally `ari-verify`/`ari-fix` noticing the
+# vendored jar and self-resolving it, since that's exactly the kind of
+# thing an LLM-driven agent — not a hardcoded script — should figure out
+# from the error and the repo contents) installs it first. Not a toolchain
+# gap; a per-repo build-convention gap.
+
+# Node.js + opencode, pinned to the exact version this integration was
+# actually verified against (see docs/MEMORY.md — the "mode: primary" /
+# stdout-error / --format json findings are all against 1.18.31; a newer
+# opencode release could change any of that).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g opencode-ai@1.18.31
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY src ./src
+COPY configs ./configs
+
+RUN pip install --no-cache-dir .
+
+ENV PYTHONUNBUFFERED=1
+# Global npm install puts `opencode` on PATH already; settings.py's
+# OPENCODE_BIN default ("opencode") relies on exactly that, so nothing
+# else to configure here.
+
+EXPOSE 8000
+
+CMD ["uvicorn", "ari_agent.main:app", "--host", "0.0.0.0", "--port", "8000"]

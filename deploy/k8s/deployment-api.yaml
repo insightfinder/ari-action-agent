@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ari-oncall-agent-api
+  labels:
+    app: ari-oncall-agent
+    component: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ari-oncall-agent
+      component: api
+  template:
+    metadata:
+      labels:
+        app: ari-oncall-agent
+        component: api
+    spec:
+      containers:
+        - name: api
+          image: ari-oncall-agent:latest
+          command: ["uvicorn", "ari_agent.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: ari-oncall-agent-env
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ari-oncall-agent-api
+spec:
+  selector:
+    app: ari-oncall-agent
+    component: api
+  ports:
+    - port: 80
+      targetPort: 8000

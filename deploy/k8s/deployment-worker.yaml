@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ari-oncall-agent-worker
+  labels:
+    app: ari-oncall-agent
+    component: worker
+spec:
+  # Scale workers independently of API replicas — this is where opencode
+  # sandboxes, git clones, and LLM calls actually run.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ari-oncall-agent
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: ari-oncall-agent
+        component: worker
+    spec:
+      containers:
+        - name: worker
+          image: ari-oncall-agent:latest
+          command: ["python", "-m", "ari_agent.orchestration.worker"]
+          envFrom:
+            - secretRef:
+                name: ari-oncall-agent-env
+          volumeMounts:
+            - name: sandbox
+              mountPath: /var/lib/ari-agent/sandbox
+            - name: repo-cache
+              mountPath: /var/lib/ari-agent/repo-cache
+      volumes:
+        - name: sandbox
+          emptyDir: {}
+        # emptyDir here (like `sandbox`) means each replica gets its own
+        # independent repo cache, reset on pod restart — still valuable
+        # for that pod's own request stream, but not shared cluster-wide.
+        # For the caching benefit to apply across all replicas, replace
+        # this with a PVC backed by a ReadWriteMany volume (e.g. NFS/EFS)
+        # mounted at the same path on every replica — see
+        # docs/design.md §7 and REPO_CACHE_ROOT in .env.example.
+        - name: repo-cache
+          emptyDir: {}
