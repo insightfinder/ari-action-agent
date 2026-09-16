@@ -129,3 +129,5 @@ See `docs/MEMORY.md` for what's been verified against real infrastructure
 secrets unencrypted in its event history — needs a Payload Codec before any
 non-local deploy; a few real A2A SDK integration bugs only surfaced by
 actually calling the endpoints, not by reading the SDK source).
+
+<!-- CI test: verifying test-branch docker tag pushes correctly -->
