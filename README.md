@@ -34,7 +34,7 @@ credentials) and it is meant to be built, deployed, and scaled independently
   the registered capability/tool catalog and emits an ordered step plan,
   including which branch to work from and which to open a PR against when
   the prompt names them. A generic executor then runs whatever that plan says.
-- **opencode does the actual coding work.** `analyze` / `generate_fix` /
+- **opencode does the actual coding work.** `analyze` / `generate_change` /
   `verify` are thin capability wrappers around opencode running against the
   cloned repo in an isolated sandbox workspace. This service does not
   reimplement code-editing or test-running logic.
@@ -78,7 +78,7 @@ on-call-ari-agent/
 │   ├── api/                  # internal config models (validated out of a request's DataPart)
 │   ├── orchestration/        # Temporal client, worker, workflow, activities
 │   ├── planning/              # LLM-driven dynamic step planner
-│   ├── capabilities/          # one module per pipeline step (clone, analyze, fix, verify, publish, respond)
+│   ├── capabilities/          # one module per pipeline step (clone, analyze, change, verify, publish, respond)
 │   ├── tools/                 # concrete actions capabilities call (git, repo cache, opencode, sandbox)
 │   ├── llm/                   # per-request LLM client factory (never a global/shared key)
 │   └── models/                 # Plan/Step schema shared by planner + executor

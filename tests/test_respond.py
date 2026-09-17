@@ -28,7 +28,7 @@ def _ctx(prompt, results, params, history=None, tools=None):
 def test_respond_is_excluded_from_planner_catalog():
     names = {c["name"] for c in catalog()}
     assert "respond" not in names
-    assert {"clone_repo", "analyze", "generate_fix", "verify", "publish_pr"} <= names
+    assert {"clone_repo", "analyze", "generate_change", "verify", "publish_pr"} <= names
 
 
 @pytest.mark.asyncio
@@ -56,7 +56,7 @@ async def test_respond_synthesizes_full_pipeline_results():
         prompt="fix the bug",
         results={
             "analyze": {"root_cause": {"summary": "race condition", "evidence": []}},
-            "generate_fix": {"summary": "added a mutex", "diff": "..."},
+            "generate_change": {"summary": "added a mutex", "diff": "..."},
             "verify": {"status": "passed"},
             "publish_pr": {"pr": {"url": "https://github.com/x/y/pull/1", "branch": "b"}},
         },

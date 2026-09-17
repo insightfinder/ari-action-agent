@@ -14,7 +14,7 @@ src/session/message-v2.ts as of the `dev` branch):
   API key and, if this request needs to publish, the GitHub MCP server
   pointed at the request's own repo PAT. Nothing here is shared across
   requests or persisted past the sandbox's lifetime.
-- **Four scoped agents** (`ari-analyze` / `ari-fix` / `ari-verify` /
+- **Four scoped agents** (`ari-analyze` / `ari-change` / `ari-verify` /
   `ari-publish`), one per capability that touches opencode, each declaring
   only the permissions that capability needs (least privilege — e.g.
   `analyze` can't edit files, `publish` can't touch build tooling, only
@@ -26,7 +26,7 @@ src/session/message-v2.ts as of the `dev` branch):
   subprocess kept alive across separate activity invocations (which
   Temporal doesn't guarantee land on the same worker) is exactly the kind
   of hidden cross-activity state that breaks that model. Continuity across
-  steps (analyze → fix → verify → publish, in whatever order the planner
+  steps (analyze → change → verify → publish, in whatever order the planner
   picked) instead comes from opencode's own `--continue` flag, which
   resumes the most recent session for that `--dir` from disk — no session
   ID needs to be threaded through Temporal payloads.
@@ -71,15 +71,16 @@ from ..settings import get_settings
 # about the capability itself.
 CAPABILITY_AGENTS = {
     "analyze": "ari-analyze",
-    "generate_fix": "ari-fix",
+    "generate_change": "ari-change",
     "verify": "ari-verify",
     "publish_pr": "ari-publish",
 }
 
 _AGENT_DEFS = {
-    # Read-only: localize the root cause without touching the tree.
+    # Read-only: investigate (root cause for a bug, or scope for a
+    # feature/edit) without touching the tree.
     "ari-analyze": {
-        "description": "Analyzes the repo to localize a root cause. Never edits files.",
+        "description": "Investigates the repo — root cause for a bug, or scope for a feature/edit. Never edits files.",
         "mode": "primary",
         "permission": {
             "edit": "deny",
@@ -89,8 +90,8 @@ _AGENT_DEFS = {
     },
     # Can edit, can inspect git history, cannot run arbitrary build/test
     # commands (that's verify's job) and cannot touch GitHub.
-    "ari-fix": {
-        "description": "Generates a code fix for the analyzed issue.",
+    "ari-change": {
+        "description": "Makes the requested code change — a bug fix, feature, refactor, or edit.",
         "mode": "primary",
         "permission": {
             "edit": "allow",
@@ -101,7 +102,7 @@ _AGENT_DEFS = {
     # Needs to actually run the project's build/lint/test tooling, which is
     # unpredictable per-repo — broad bash allow is required here. Isolation
     # comes from the ephemeral per-request sandbox, not command whitelisting.
-    # Never edits code — a failure just reports failure, generate_fix retries.
+    # Never edits code — a failure just reports failure, generate_change retries.
     "ari-verify": {
         "description": "Runs the project's build/lint/test suite and reports pass/fail.",
         "mode": "primary",
@@ -113,7 +114,7 @@ _AGENT_DEFS = {
     },
     # The only agent with GitHub MCP tools enabled. No build tooling.
     "ari-publish": {
-        "description": "Pushes the fix branch and opens a pull request via the GitHub MCP server.",
+        "description": "Pushes the change branch and opens a pull request via the GitHub MCP server.",
         "mode": "primary",
         "permission": {
             "edit": "deny",

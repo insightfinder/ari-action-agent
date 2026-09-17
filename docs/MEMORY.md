@@ -760,3 +760,234 @@ flows through to the actual `git clone --branch`. Full suite: 65 passed.
 the source tree; the hosted `test-ari-oncall-agent` runs a previously built
 image and won't pick this up until rebuilt/redeployed (see the image-tag
 notes above this entry).
+
+## 2026-09-17 — Fixed: a failed capability skipped `respond` and `cleanup_workspace` entirely
+
+After the branch-default fix above was deployed and re-tested live against
+`insightfinder/InsightAgent`, the pipeline got much further (clone → analyze
+→ generate_fix → verify → publish_pr, ~11.5 minutes) but `publish_pr` failed
+for a real, external reason — the GitHub MCP server's token (account
+`neyaadeez`) got a genuine `403 Resource not accessible by personal access
+token` trying to create a branch on that repo, not something opencode
+mishandled. **The bug found here is what happened next**: the caller got
+back only `"Internal error: Workflow execution failed"` — no root cause, no
+explanation, nothing actionable — even though opencode had already written a
+detailed, correct explanation (which account, which repo, the exact 403,
+three concrete options to resolve it).
+
+**Root cause:** `publish_pr.run()` (like `run_opencode`/`git_ops.clone` on
+any hard failure) raises a plain `RuntimeError` rather than returning a
+soft-failure dict — only `verify.py` has that soft-failure/`on_failure`-goto
+contract in `configs/capabilities.yaml`. `orchestration/workflow.py`'s step
+loop had no `try`/`except` around `workflow.execute_activity("execute_step",
+...)` itself — only around the later, separate `respond` call. So once
+Temporal exhausted `publish_pr`'s retries (3 attempts, each producing the
+same 403, confirmed in the worker logs) and raised `ActivityError`, that
+exception propagated straight out of `AriOnCallWorkflow.run()`: skipping
+`cleanup_workspace` (sandbox left behind) *and* skipping `respond` (the one
+step whose entire job is turning a failure into a real explanation — see the
+2026-09-15 "Fixed: responses had no real synthesis" entry, whose stated
+guarantee — "the request must never come back empty-handed" — this exact
+path violated). The generic message the caller saw is just the A2A
+executor's own catch-all for an unhandled workflow exception.
+
+A second, smaller compounding bug in the same failure: `publish_pr.py`
+truncated its exception message to `result['text'][:500]`, which would have
+cut off opencode's explanation mid-sentence (before the concrete
+fork/grant-access/manual-push options) even if `respond` had run.
+
+**Fix:** wrapped the step-execution `workflow.execute_activity` call in
+`try/except ActivityError` inside the loop itself (`workflow.py`) — any hard
+capability failure now sets `final_status = "failed"` with a real
+`failure_reason` (extracted via new `_activity_failure_detail()`, which reads
+the wrapped `ApplicationError.message` — the original exception's clean
+`str()`, not Temporal's generic "activity task failed" wrapper text — falling
+back to `str(exc)` only if there's no cause at all) and `break`s the loop,
+same as the existing soft-failure path — so `cleanup_workspace` and `respond`
+always run afterward, regardless of which of the two ways a step failed.
+Also raised `publish_pr.py`'s truncation limit from 500 to 4000 characters,
+since that text is exactly what `respond` synthesizes the caller's
+explanation from.
+
+**Verified:** new `tests/test_workflow.py` (`_activity_failure_detail`
+correctly prefers the wrapped exception's real message over the generic
+`ActivityError` wrapper text, and falls back to `str(exc)` when there's no
+cause). Full suite: 68 passed. **Not yet re-verified live** — needs a
+rebuild/redeploy and another real run against a repo/token combination that
+either succeeds or fails, to confirm the caller now gets a real, synthesized
+explanation instead of the generic message in both cases.
+
+**Still open, not fixed in this pass:** the immediate trigger (GitHub MCP
+token `neyaadeez` lacking write access to `insightfinder/InsightAgent`) is a
+credential/permissions issue outside this agent's code — same class of gap
+called out in the 2026-09-15 "opencode + GitHub MCP integration" entry
+(`403 Resource not accessible by personal access token` on a different repo,
+that time from a wrongly-scoped fine-grained PAT). Whoever owns that PAT
+needs to grant it `contents:write` + `pull_requests:write` on the target
+repo (or use a token that already has broader access) before a real PR can
+be opened against `insightfinder/InsightAgent`.
+
+## 2026-09-17 — Generalized `analyze`/`generate_fix` past a bug-fix framing
+
+User's ask, directly: `generate_fix` needs to be "more dynamic for various
+requests like fix bugs, make changes, edits, etc" — real requests aren't
+only bug fixes (the live test earlier this session was itself a plain field-
+removal edit, not a bug).
+
+**Found the gap wasn't really in `generate_fix`'s code — it already accepts
+a planner-supplied `params.instruction` override** (`ctx.params.get
+("instruction") or <default>`); the mechanism for per-request dynamism
+already existed. Two real problems instead:
+1. The *default* wording (used whenever the planner doesn't set
+   `instruction`, which in practice is every request so far) was hardcoded
+   bug-fix language: `analyze` said "localize the root cause of the
+   reported issue"; `generate_fix` said "Fix the following issue... Make
+   the minimal correct change." Fine for an actual bug, misleading framing
+   for a feature/edit/refactor ask.
+2. `planning/planner.py`'s system prompt never told the LLM it *could* set
+   `instruction` per step, or that it could skip `analyze` when a request
+   already names exactly what to change and there's nothing to
+   investigate — so the override path was structurally there but never
+   actually exercised.
+
+**Fix:** generalized the default instruction text in
+`capabilities/opencode_analyze.py` and `capabilities/opencode_fix.py` (and
+their descriptions in `configs/capabilities.yaml`, which the planner reads
+verbatim from `catalog()`) to name bug fix / feature / edit / refactor as
+equally normal outcomes, not bug-as-default with everything else an
+afterthought. Added explicit guidance to `planner.py`'s system prompt: skip
+`analyze` when the request already names the exact change with nothing to
+investigate; set a tailored `instruction` param on `analyze`/`generate_fix`
+when the generic wording would fit poorly. No new Python branching — the
+dynamism is the planner's own LLM call deciding this per request, consistent
+with this project's "the LLM figures it out, not hardcoded" pattern (see the
+2026-09-15 Maven-dependency entry for the same pattern applied to `verify`).
+
+**Not unit-tested** — this is entirely prompt wording for planner/opencode
+LLM calls with no new Python control flow, and no existing test file covers
+`planner.py`, `opencode_analyze.py`, or `opencode_fix.py`; correctness here
+is a live-LLM-call concern, same as every other planner behavior verified
+in this file. Full suite still 68 passed (no regressions). Next real
+verification: rerun a mixed set of prompts (a real bug, a pure edit like the
+InsightAgent field-removal case, a feature add) against a live LLM and
+confirm the planner actually varies the plan (skips `analyze` for the edit
+case, tailors wording) rather than always falling through to the same
+five-step pipeline.
+
+### Same session — renamed `generate_fix` → `generate_change` (and `ari-fix` → `ari-change`)
+
+Direct follow-up to the generalization above: the capability's *name*
+itself still said "fix," undercutting the whole point of making it handle
+features/edits/refactors as first-class, not bug-fixes-with-exceptions.
+User's ask was explicit ("rename the skill to reflect its use") and left
+the actual strategy up to me.
+
+**Renamed, consistently, everywhere:**
+- Capability `generate_fix` → `generate_change` (`configs/capabilities.yaml`,
+  including `verify`'s `on_failure.goto`).
+- Module `capabilities/opencode_fix.py` → `capabilities/opencode_change.py`
+  (`git mv`, contents unchanged — already generic after the wording fix
+  above).
+- opencode agent `ari-fix` → `ari-change` (`tools/opencode_cli.py`'s
+  `CAPABILITY_AGENTS` mapping and `_AGENT_DEFS`), with its description
+  updated from "Generates a code fix for the analyzed issue" to "Makes the
+  requested code change — a bug fix, feature, refactor, or edit."
+- Every place that read the old capability name out of `ctx.results`
+  (`publish_pr.py`'s `ctx.results.get("generate_fix", ...)`,
+  `capabilities/base.py`'s `_OPENCODE_CAPABILITIES` set used for the
+  `--continue` check, `planner.py`'s prompt text and JSON-fallback pipeline,
+  `clone_repo.py`/`git_ops.py` comments) — updated together so nothing is
+  left looking up a results key that no longer exists.
+- `publish_pr.py`'s own bug-flavored branding along the same lines: PR
+  title prefix `"ARI fix: ..."` → `"ARI: ..."`, example branch name
+  `ari/fix-<slug>` → `ari/change-<slug>`, local variable `fix` → `change`.
+- Docs: `README.md`, `docs/design.md` (current-state description) updated
+  to the new names. `docs/MEMORY.md` entries before this one are left
+  exactly as written — they're a historical record of what was true when
+  written, not a description of current state; the old name will keep
+  appearing in earlier entries on purpose.
+- **Deliberately left unrenamed:** `settings.temporal_task_queue`'s default
+  value `"oncall-ari-fix-queue"` — that's an operational Temporal queue
+  name (already deployed, already in `.env`/the Helm chart's values), not
+  a reference to this specific capability; renaming it would be a real
+  deployment-coordination concern for zero benefit here.
+
+**Verified:** full suite 68 passed (updated `tests/test_respond.py`'s
+catalog-membership assertion and `tests/test_capabilities.py`'s
+`results={"generate_fix": ...}` fixtures to the new key — nothing else
+referenced the old name). Also directly imported the registry/tool-mapping
+modules after the rename and confirmed live: `catalog()` lists
+`generate_change`, its `CapabilitySpec.module` resolves to
+`ari_agent.capabilities.opencode_change`, `CAPABILITY_AGENTS["generate_change"]
+== "ari-change"` and that key exists in `_AGENT_DEFS`, and `verify`'s
+`on_failure.goto` now reads `"generate_change"` — the whole chain resolves
+correctly, not just the YAML text. Not yet re-verified against a live
+opencode run (needs a rebuild/redeploy, same as the pending fixes above).
+
+## 2026-09-17 — Audited (and closed the remaining gaps in) "is the workspace always cleaned up?"
+
+User asked directly, before deploying everything above: is the sandbox
+workspace *always* cleaned up, success or failure — fault tolerance,
+avoiding a slow disk/memory leak on the worker. Prompted a full audit of
+`orchestration/workflow.py`'s `run()`, not just the `publish_pr`/execute_step
+case already fixed earlier this session.
+
+**Found two more real gaps, same family as the one already fixed:**
+1. **`plan_task` was still unguarded.** `prepare_workspace` runs first and
+   creates the sandbox dir; if `plan_task` then fails after exhausting its
+   3 retries (e.g. the LLM call itself raises — a bad/expired key, an API
+   outage, a rate limit — as opposed to just returning malformed JSON,
+   which `planning/planner.py` already handles internally), the
+   `ActivityError` escaped `run()` entirely: `cleanup_workspace` never ran
+   (the just-created workspace leaks), and `respond` never ran (the caller
+   got the SDK's generic error, not a real explanation) — identical failure
+   shape to the `publish_pr` bug fixed earlier, one activity call earlier
+   in the same function.
+2. **`cleanup_workspace`'s `execute_activity` call had no `retry_policy` at
+   all.** An unset `RetryPolicy` defaults to `maximum_attempts=0`
+   (unlimited) — confirmed directly: `RetryPolicy()` in the installed
+   `temporalio` really does construct with `maximum_attempts=0`. Same root
+   cause already documented for `plan_task` in the 2026-09-15 A2A-adoption
+   entry ("Temporal's default retry policy has no maximum, made a blocking
+   call hang far past any reasonable timeout"), left unfixed here. In
+   practice this is low-risk — `tools/sandbox.py:cleanup_workspace` calls
+   `shutil.rmtree(..., ignore_errors=True)`, which essentially never raises
+   for real filesystem reasons — but an unbounded retry policy sitting in
+   production code is exactly the class of thing that already bit this
+   project once, so closed it anyway rather than relying on one function's
+   current implementation detail to make it safe.
+
+**Also closed for full symmetry, not because a failure was observed:**
+`prepare_workspace` itself was unguarded too. If it fails outright (it's a
+single `mkdir`, so rare), nothing was created — no leak — but the caller
+still got the generic SDK error instead of a `respond` explanation.
+
+**Fix, same pattern throughout:** every activity call in `run()` is now
+either already retry-capped (`prepare_workspace`, unchanged) or newly capped
+(`cleanup_workspace`: `maximum_attempts=3`) and wrapped in `try/except
+ActivityError`, each setting `final_status = "failed"` + a real
+`failure_reason` on the way down to the same guaranteed `cleanup_workspace`
++ `respond` tail — nothing new to remember per call site, it's the identical
+shape as the `execute_step` fix from earlier today. `plan_task`'s own
+step-loop only runs `if workspace is not None`, i.e. only once workspace
+setup actually succeeded. A `cleanup_workspace` failure (still `except
+ActivityError: pass`, deliberately swallowed) never blocks `respond` from
+running — a leaked directory is a disk-space concern to notice separately,
+never a reason to leave the caller with nothing.
+
+**Net result, answering the actual question asked:** `cleanup_workspace`
+now runs unconditionally after *every* code path through `run()` —
+`prepare_workspace` failing, `plan_task` failing, any step failing (soft or
+hard), or the full pipeline completing — and none of those paths can hang
+indefinitely (every retry policy in this function is now bounded) or skip
+`respond`. The only way a workspace can still be left on disk is
+`cleanup_workspace` itself failing 3 times in a row, which `tools/
+sandbox.py`'s `ignore_errors=True` makes practically impossible.
+
+**Verified:** full suite still 68 passed; no test in this repo exercises
+`workflow.py`'s control flow directly (see the "ActivityError escaped
+`cleanup_workspace`/`respond`" entry above — same reasoning, Temporal
+workflow testing needs `temporalio[testing]`'s time-skipping environment,
+not present in this project's test deps). Not yet re-verified live —
+bundled into the same pending rebuild/redeploy as everything else from this
+session.

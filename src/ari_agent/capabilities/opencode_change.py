@@ -9,10 +9,13 @@ async def run(ctx: StepContext) -> dict:
     prior_failure = ctx.results.get("verify", {}).get("failure")
 
     instruction = ctx.params.get("instruction") or (
-        f"Fix the following issue in this repository.\n\nOriginal request: {ctx.prompt}\n\n"
+        f"Make the following change to this repository — a bug fix, a feature, a "
+        f"refactor, or a specific edit, whatever it actually asks for.\n\n"
+        f"Original request: {ctx.prompt}\n\n"
         + (f"Prior analysis: {analysis}\n\n" if analysis else "")
         + (f"The previous attempt failed verification with:\n{prior_failure}\n\n" if prior_failure else "")
-        + "Make the minimal correct change and explain what you changed and why."
+        + "Make the smallest change that fully satisfies the request and explain what "
+          "you changed and why."
     )
     result = await opencode(ctx, instruction)
     diff = await git_diff(ctx.repo_dir)

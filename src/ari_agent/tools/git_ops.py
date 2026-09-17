@@ -120,7 +120,7 @@ async def diff(workdir: str) -> str:
 
 
 async def changed_files(workdir: str) -> list[str]:
-    """Names of files generate_fix actually modified (tracked files only,
+    """Names of files generate_change actually modified (tracked files only,
     relative to HEAD). Used to scope publish_pr's staging to exactly this —
     live testing showed the verify agent can leave scratch files behind
     (e.g. a throwaway test script, __pycache__) despite being asked to

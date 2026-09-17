@@ -17,18 +17,34 @@ from ..llm.client import complete
 from ..models.plan import Plan
 
 _SYSTEM_PROMPT_TEMPLATE = """You are the planning stage of an autonomous on-call \
-code-fix agent. Given a user's prompt (and, for a multi-turn chat, prior \
-conversation history) and the capabilities available below, produce a JSON \
-plan: an ordered list of steps, each naming one capability and any params it \
-needs. Only use capability names from the catalog. Respect explicit user \
-directives (e.g. "skip tests" means omit the "verify" step; "just open a \
-PR" means skip straight to publish_pr assuming a fix already exists in the \
-workspace). Use the conversation history to resolve references like "yes, \
-go ahead and fix it" to what was discussed earlier. If the prompt needs no \
+agent that fixes bugs and ships code changes. Given a user's prompt (and, for a \
+multi-turn chat, prior conversation history) and the capabilities available \
+below, produce a JSON plan: an ordered list of steps, each naming one \
+capability and any params it needs. Only use capability names from the \
+catalog. Respect explicit user directives (e.g. "skip tests" means omit the \
+"verify" step; "just open a PR" means skip straight to publish_pr assuming \
+a change already exists in the workspace). Use the conversation history to \
+resolve references like "yes, go ahead and do it" to what was discussed \
+earlier. If the prompt needs no \
 repo/code action at all (a plain question, or a request already fully \
 answered by the conversation so far), return an empty step list — a \
 separate step always turns your plan (or the lack of one) into the actual \
 response, so an empty list is a normal, complete answer, not a failure.
+
+Requests vary in kind — a bug fix, a new feature, a specific edit/refactor \
+("remove field X, keep it empty", "rename Y to Z", "add a param to this \
+endpoint"), or a bare question. Don't default to treating every repo \
+request as a bug fix:
+- Skip "analyze" when the request already names exactly what to change \
+(specific fields/files/behavior) and there's nothing to investigate — go \
+straight to "generate_change". Use "analyze" when there's a bug/issue to \
+localize first (a stack trace, "it's broken", a flaky test) or the request \
+is broad enough that it needs scoping out before editing.
+- Set a step's `instruction` param with wording tailored to what's actually \
+being asked (e.g. "implement this feature: ...", "make this specific edit: \
+...", "fix this bug: ...") whenever the capability's generic default \
+wording would fit poorly — most useful for "analyze" and "generate_change". \
+Leave it unset when the generic default already fits fine.
 
 Branches are dynamic per request, not fixed — read the prompt carefully for \
 them: if it names a specific branch to work from ("check the repo in dev \
@@ -66,7 +82,7 @@ async def create_plan(prompt: str, config: dict, history: list[dict] | None = No
             "steps": [
                 {"capability": "clone_repo"},
                 {"capability": "analyze"},
-                {"capability": "generate_fix"},
+                {"capability": "generate_change"},
                 {"capability": "verify"},
                 {"capability": "publish_pr"},
             ],

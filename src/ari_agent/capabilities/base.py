@@ -6,7 +6,7 @@ from typing import Any, Callable
 # Capabilities that talk to opencode. Used to figure out, from whatever
 # subset of steps the planner actually chose, whether an opencode session
 # already exists for this request (so we know to pass --continue).
-_OPENCODE_CAPABILITIES = {"analyze", "generate_fix", "verify", "publish_pr"}
+_OPENCODE_CAPABILITIES = {"analyze", "generate_change", "verify", "publish_pr"}
 
 
 @dataclass

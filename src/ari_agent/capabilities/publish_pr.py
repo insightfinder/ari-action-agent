@@ -41,10 +41,10 @@ def _extract_pr(result: dict) -> dict | None:
 
 async def run(ctx: StepContext) -> dict:
     opencode = ctx.tool("opencode")
-    fix = ctx.results.get("generate_fix", {})
+    change = ctx.results.get("generate_change", {})
 
-    title = ctx.params.get("title") or f"ARI fix: {(fix.get('summary') or ctx.prompt)[:72]}"
-    changed_files = fix.get("changed_files") or []
+    title = ctx.params.get("title") or f"ARI: {(change.get('summary') or ctx.prompt)[:72]}"
+    changed_files = change.get("changed_files") or []
     files_clause = (
         f"Stage and commit exactly these files (nothing else — do not use `git add -A` or `git add .`, "
         f"other tools may have left unrelated scratch files in the working tree): {', '.join(changed_files)}.\n\n"
@@ -62,13 +62,19 @@ async def run(ctx: StepContext) -> dict:
     instruction = ctx.params.get("instruction") or (
         f"Repository: {_repo_slug(repo_url)} ({repo_url}).\n\n"
         f"{files_clause}"
-        f"Push the committed changes to a new branch (e.g. ari/fix-<short-slug>) and open a "
+        f"Push the committed changes to a new branch (e.g. ari/change-<short-slug>) and open a "
         f"pull request in that repository against {base_ref} "
         f"using the github MCP tools — do not ask for the repository, it is given above. "
-        f"Title: {title!r}. Body: summarize the fix below.\n\n{fix.get('summary', '')}"
+        f"Title: {title!r}. Body: summarize the change below.\n\n{change.get('summary', '')}"
     )
     result = await opencode(ctx, instruction)
     pr = _extract_pr(result)
     if not pr:
-        raise RuntimeError(f"publish_pr: could not find a PR url in opencode's response: {result['text'][:500]}")
+        # This message becomes the failure detail `respond` synthesizes the
+        # final explanation from (see orchestration/workflow.py) — opencode's
+        # own explanation of *why* (e.g. a specific 403 and whose token/scope
+        # caused it) is exactly what the caller needs, so keep enough of it
+        # to be useful rather than cutting it off mid-sentence at an
+        # arbitrary length.
+        raise RuntimeError(f"publish_pr: could not find a PR url in opencode's response: {result['text'][:4000]}")
     return {"pr": pr}

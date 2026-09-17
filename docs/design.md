@@ -117,7 +117,7 @@ flow) — `respond` (§4) always gives a definitive answer instead.
 |---|---|---|
 | **Request** | `RequestConfig` — repo, llm, system_prompt override, options. Self-contained, immutable. | `api/schemas.py` |
 | **Plan** | Ordered list of `Step`s (capability + params), produced per-request by the planner. | `models/plan.py`, `planning/planner.py` |
-| **Capability** | One pipeline step's behavior (`clone_repo`, `analyze`, `generate_fix`, `verify`, `publish_pr`, `respond`). Declared in `configs/capabilities.yaml` (description, tools, retry, on_failure); implemented as `run(ctx) -> dict` in `capabilities/`. | `capabilities/` |
+| **Capability** | One pipeline step's behavior (`clone_repo`, `analyze`, `generate_change`, `verify`, `publish_pr`, `respond`). Declared in `configs/capabilities.yaml` (description, tools, retry, on_failure); implemented as `run(ctx) -> dict` in `capabilities/`. | `capabilities/` |
 | **Tool** | A concrete callable a capability may use (`git_clone`, `opencode`, `repo_cache`, `llm_complete`, ...). Declared in `configs/tools.yaml`; implemented in `tools/`. | `tools/` |
 
 Adding a capability or tool = new module + new YAML entry. No changes to
@@ -131,18 +131,25 @@ capabilities/tools/catalog entries, not a rewrite.
    prompt + `capabilities.registry.catalog()` (names, descriptions, tools)
    to the request's own LLM and gets back an ordered step list. It honors
    `config.options` (e.g. `skip_tests`) and dynamic branch names in the
-   prompt (§6) as explicit directives. Malformed planner output falls back
-   to the standard clone→analyze→fix→verify→publish pipeline rather than
-   failing the request.
+   prompt (§6) as explicit directives; it also decides per request whether
+   `analyze` is worth running at all (skippable when the request already
+   names exactly what to change) and can tailor a step's `instruction` when
+   the generic default wording (bug-fix vs. feature vs. edit/refactor)
+   would fit poorly. Malformed planner output falls back to the standard
+   clone→analyze→change→verify→publish pipeline rather than failing the
+   request.
 2. `plan_task` enriches each step with its capability's `retry` and
    `on_failure` policy from `configs/capabilities.yaml`, so
    `orchestration/workflow.py` itself never has to read the registry
    (keeps it free of filesystem/import side effects, required for
    Temporal's workflow sandbox).
 3. `workflow.py` walks the steps via the generic `execute_step` activity.
-   `verify` failing loops back to `generate_fix` up to `max_attempts`,
+   `verify` failing loops back to `generate_change` up to `max_attempts`,
    then the run ends in `fail_needs_human` (`status: "failed"`) rather
-   than spinning forever.
+   than spinning forever. A step's raised exception (as opposed to a soft
+   `{"status": "failed"}` return) is caught the same way, so any hard
+   capability failure still reaches `cleanup_workspace` and `respond`
+   instead of aborting the workflow with no explanation.
 4. Every step happens against one ephemeral sandbox workspace
    (`tools/sandbox.py`, keyed by `request_id`), cleaned up when the
    workflow ends — one request's bad patch/hung test can't affect another.
@@ -157,7 +164,7 @@ capabilities/tools/catalog entries, not a rewrite.
   "status": "completed",
   "message": "Fixed the WaitGroup Add/Wait race in discoverScan.go and added CLI flags for subnet/port range; verify passed; opened PR #1.",
   "root_cause": { "summary": "...", "evidence": [...] },
-  "pr": { "url": "...", "branch": "ari/fix-..." },
+  "pr": { "url": "...", "branch": "ari/change-..." },
   "data": { "...": "raw per-capability results, for programmatic callers" }
 }
 ```
@@ -206,11 +213,11 @@ pointed at the public GitHub MCP server, not a custom Python MCP client.
   `.gitignore` (which opencode itself could edit).
 - **Four scoped opencode agents**, each `mode: "primary"` (required for
   `--agent <name>` selection to actually take effect): `ari-analyze`
-  (read-only, `edit: deny`), `ari-fix` (`edit: allow`, no build tooling),
+  (read-only, `edit: deny`), `ari-change` (`edit: allow`, no build tooling),
   `ari-verify` (`edit: deny`, broad `bash: allow` since test/build
   commands are unpredictable per-repo), `ari-publish` (`edit: deny`, the
   *only* agent with `github_*` MCP tools enabled). `analyze`/
-  `generate_fix`/`verify`/`publish_pr` each call `opencode run --agent
+  `generate_change`/`verify`/`publish_pr` each call `opencode run --agent
   <name> ...` with only the matching agent.
 - **One ephemeral `opencode run` process per capability step**, not a
   long-lived `opencode serve` — a Temporal activity is a self-contained
@@ -228,7 +235,7 @@ pointed at the public GitHub MCP server, not a custom Python MCP client.
   `state.{status,input,output,error}`); a fatal error arrives as a
   top-level `{"type": "error", ...}` event on stdout, not stderr.
   `publish_pr` reads the PR URL out of the matching GitHub MCP tool call's
-  result, with a regex-over-response-text fallback. `generate_fix`
+  result, with a regex-over-response-text fallback. `generate_change`
   captures the diff via plain `git diff HEAD` rather than trusting
   opencode's own account of what it changed.
 

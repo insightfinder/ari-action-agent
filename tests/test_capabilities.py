@@ -57,7 +57,7 @@ async def test_publish_pr_instruction_scopes_staging_to_changed_files():
         {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/x/y/pull/1"}}
     ]})
     ctx = _ctx(
-        results={"generate_fix": {"summary": "fixed it", "changed_files": ["cart_service.py"]}},
+        results={"generate_change": {"summary": "fixed it", "changed_files": ["cart_service.py"]}},
         tools={"opencode": opencode},
     )
 
@@ -72,7 +72,7 @@ async def test_publish_pr_instruction_scopes_staging_to_changed_files():
 @pytest.mark.asyncio
 async def test_publish_pr_raises_clear_error_when_no_pr_found():
     opencode = AsyncMock(return_value={"text": "I could not open a PR", "tool_calls": []})
-    ctx = _ctx(results={"generate_fix": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools={"opencode": opencode})
+    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools={"opencode": opencode})
 
     with pytest.raises(RuntimeError, match="could not find a PR url"):
         await publish_pr.run(ctx)
@@ -92,7 +92,7 @@ async def test_publish_pr_instruction_states_repo_explicitly():
     opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
         {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/n/r/pull/1"}}
     ]})
-    ctx = _ctx(results={"generate_fix": {"summary": "fixed it", "changed_files": ["a.go"]}}, tools={"opencode": opencode})
+    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.go"]}}, tools={"opencode": opencode})
     ctx.config["repo"]["url"] = "https://github.com/neyaadeez/go-script"
 
     await publish_pr.run(ctx)
@@ -108,7 +108,7 @@ async def test_publish_pr_base_ref_param_overrides_repo_default():
         {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/x/y/pull/1"}}
     ]})
     ctx = _ctx(
-        results={"generate_fix": {"summary": "fixed it", "changed_files": ["a.py"]}},
+        results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}},
         tools={"opencode": opencode},
         params={"base_ref": "staging"},
     )
@@ -125,7 +125,7 @@ async def test_publish_pr_base_ref_defaults_to_repo_ref_when_unset():
     opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
         {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/x/y/pull/1"}}
     ]})
-    ctx = _ctx(results={"generate_fix": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools={"opencode": opencode})
+    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools={"opencode": opencode})
 
     await publish_pr.run(ctx)
 
