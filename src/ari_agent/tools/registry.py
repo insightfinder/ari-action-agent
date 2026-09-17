@@ -6,12 +6,11 @@ A tool function's signature is `async def fn(ctx: StepContext, **params) -> dict
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import import_module
-from pathlib import Path
 from typing import Callable
 
 import yaml
 
-_CONFIG_PATH = Path(__file__).resolve().parents[3] / "configs" / "tools.yaml"
+from ..config_paths import config_file
 
 
 @dataclass
@@ -27,7 +26,7 @@ class ToolSpec:
 
 @lru_cache
 def _load_specs() -> dict[str, ToolSpec]:
-    raw = yaml.safe_load(_CONFIG_PATH.read_text())
+    raw = yaml.safe_load(config_file("tools.yaml").read_text())
     return {
         name: ToolSpec(name=name, module=entry["module"], function=entry["function"])
         for name, entry in raw.get("tools", {}).items()

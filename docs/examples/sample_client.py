@@ -23,11 +23,20 @@ etc.) rather than raw JSON dicts, and needs an `AuthInterceptor` +
 for a first example, so this script sticks to plain HTTP.
 
 Secrets are read from environment variables, never hardcoded:
-    OPENAI_API_KEY   real key for config.llm
-    GITHUB_PAT       only needed for task-poll/task-webhook (opens a real PR)
+    OPENAI_API_KEY   real key for config.llm (the default provider)
+    GITHUB_PAT       needed to clone a private REPO_URL, and to open a PR
     ARI_BASE_URL     default http://localhost:8000
     ARI_API_KEY      default dev-local-e2e-key
     REPO_URL         default https://github.com/octocat/Hello-World
+
+Optional, for anything that is not the default setup:
+    LLM_PROVIDER     default "openai"; "anthropic" also supported
+    LLM_API_KEY      overrides <PROVIDER>_API_KEY
+    LLM_MODEL        overrides the provider's default model
+    WEBHOOK_URL      task-webhook callback; default http://localhost:9300/callback,
+                     which only works when the agent shares a host with this
+                     script -- set a reachable address otherwise
+    ARI_CHAT_TIMEOUT seconds to wait in chat mode, default 600
 """
 
 import argparse
@@ -50,13 +59,38 @@ def _headers() -> dict:
     }
 
 
-def _config(with_pat: bool = False) -> dict:
+# Defaults keep the original OpenAI behaviour: set OPENAI_API_KEY and every
+# mode runs unedited. Point LLM_PROVIDER/LLM_MODEL elsewhere (e.g. "anthropic"
+# + "claude-haiku-4-5", reading ANTHROPIC_API_KEY) to use another provider
+# without touching this file.
+_DEFAULT_MODELS = {"openai": "gpt-4o-mini", "anthropic": "claude-haiku-4-5"}
+
+
+def _llm() -> dict:
+    provider = os.environ.get("LLM_PROVIDER", "openai")
+    key = os.environ.get("LLM_API_KEY") or os.environ.get(f"{provider.upper()}_API_KEY")
+    if not key:
+        raise SystemExit(
+            f"no API key for provider {provider!r}: set LLM_API_KEY or {provider.upper()}_API_KEY"
+        )
+    model = os.environ.get("LLM_MODEL") or _DEFAULT_MODELS.get(provider)
+    if not model:
+        raise SystemExit(f"no default model known for provider {provider!r}: set LLM_MODEL")
+    return {"provider": provider, "api_key": key, "model": model}
+
+
+def _config() -> dict:
     repo = {"url": os.environ.get("REPO_URL", "https://github.com/octocat/Hello-World")}
-    if with_pat:
-        repo["pat"] = os.environ["GITHUB_PAT"]
+    # Carried whenever it is set, in every mode. A private REPO_URL needs it
+    # even to clone, so gating it on "the mode that opens a PR" made `chat`
+    # fail against a private repo with git's unhelpful "could not read
+    # Username for 'https://github.com'".
+    pat = os.environ.get("GITHUB_PAT")
+    if pat:
+        repo["pat"] = pat
     return {
         "repo": repo,
-        "llm": {"provider": "openai", "api_key": os.environ["OPENAI_API_KEY"], "model": "gpt-4o-mini"},
+        "llm": _llm(),
         "options": {"skip_tests": True},
     }
 
@@ -82,7 +116,10 @@ def chat(base_url: str) -> None:
         f"{base_url}/message:send",
         headers=_headers(),
         json={"message": _message(prompt, _config())},
-        timeout=60,
+        # A full pipeline run is ~2 minutes; the original 60s expired before
+        # the agent could answer, surfacing as a client-side ReadTimeout even
+        # though the task itself had completed.
+        timeout=float(os.environ.get("ARI_CHAT_TIMEOUT", "600")),
     )
     resp.raise_for_status()
     task = resp.json()["task"]
@@ -97,7 +134,7 @@ def task_poll(base_url: str) -> None:
         f"{base_url}/message:send",
         headers=_headers(),
         json={
-            "message": _message(prompt, _config(with_pat=True)),
+            "message": _message(prompt, _config()),
             "configuration": {"return_immediately": True},
         },
         timeout=30,
@@ -148,7 +185,7 @@ def task_webhook(base_url: str) -> None:
         f"{base_url}/message:send",
         headers=_headers(),
         json={
-            "message": _message(prompt, _config(with_pat=True)),
+            "message": _message(prompt, _config()),
             "configuration": {
                 "return_immediately": True,
                 # localhost works when this script and the agent run on the
@@ -158,7 +195,14 @@ def task_webhook(base_url: str) -> None:
                 # process from inside that container instead —
                 # host.docker.internal (Docker Desktop) or this host's LAN
                 # IP, not localhost.
-                "task_push_notification_config": {"url": "http://localhost:9300/callback"},
+                # Must be an address the AGENT can reach, not this script's
+                # own view of the world. Overridable because "localhost" is
+                # wrong the moment the agent is not a sibling process -- in
+                # Kubernetes it resolves to the agent's own pod, so nothing is
+                # ever delivered. Point it at a Service DNS name there.
+                "task_push_notification_config": {
+                    "url": os.environ.get("WEBHOOK_URL", "http://localhost:9300/callback")
+                },
             },
         },
         timeout=30,

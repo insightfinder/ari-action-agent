@@ -8,16 +8,14 @@ nothing in orchestration/ changes.
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 import yaml
 
+from ..config_paths import config_file
 from ..models.plan import OnFailure
 from .base import StepContext
 from ..tools.registry import get_tools
-
-_CONFIG_PATH = Path(__file__).resolve().parents[3] / "configs" / "capabilities.yaml"
 
 
 @dataclass
@@ -46,7 +44,7 @@ class CapabilitySpec:
 
 @lru_cache
 def _load_specs() -> dict[str, CapabilitySpec]:
-    raw = yaml.safe_load(_CONFIG_PATH.read_text())
+    raw = yaml.safe_load(config_file("capabilities.yaml").read_text())
     specs: dict[str, CapabilitySpec] = {}
     for name, entry in raw.get("capabilities", {}).items():
         retry = RetryPolicy(**entry.get("retry", {}))

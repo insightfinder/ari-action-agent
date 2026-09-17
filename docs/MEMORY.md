@@ -563,3 +563,153 @@ examples throughout, not hand-written) and a runnable
 `docs/examples/sample_client.py` demonstrating all three patterns with
 plain `httpx` — tested against the real running server, including the
 webhook mode (confirmed real progressive deliveries arriving).
+
+## 2026-09-17 — Fixed: the published image could never complete a workflow
+
+Deploying `insightfinderinc/ari-oncall-agent:test` to a real cluster (Test
+EKS, via the `oncallari` Helm chart) surfaced a bug that never shows up in
+development: **every containerised run died in its first activity.**
+
+```
+FileNotFoundError: '/usr/local/lib/python3.12/configs/capabilities.yaml'
+```
+
+Both registries located their YAML with a fixed number of hops —
+`Path(__file__).resolve().parents[3] / "configs" / ...`. That is the repo
+root when running from the source tree, but the Dockerfile runs
+`pip install .`, so in the image the package sits in site-packages and
+parents[3] resolves to `/usr/local/lib/python3.12`, while
+`COPY configs ./configs` under `WORKDIR /app` puts the files at
+`/app/configs`. Nothing bridged the two.
+
+What made it easy to miss: **the API pod looks perfectly healthy.** It never
+loads a registry at import time, so `/healthz` and the Agent Card both
+answer 200. Only the worker's first activity (`plan_task`) touches
+`catalog()`, so the failure reads as "the workflow failed", not "the image
+is broken". Confirmed it was the image and not the deployment by exec'ing
+into the pod: `/app/configs/` held both YAMLs all along, and symlinking
+`/usr/local/lib/python3.12/configs -> /app/configs` made `catalog()` return
+5 capabilities immediately.
+
+**Fix — new `src/ari_agent/config_paths.py`.** Resolution is now a search,
+not a hop count: `ARI_CONFIGS_DIR` if set, then the source-tree layout, then
+`Path.cwd() / "configs"` (which is what covers the image, without
+hard-coding `/app`), then `/app/configs`. The same wheel now works from a
+checkout, from an editable install, and from the image. When nothing
+matches, the error lists every location tried and names the env var, rather
+than quoting one meaningless absolute path. Both registries call
+`config_file(...)`; their `_CONFIG_PATH` constants and now-unused `pathlib`
+imports are gone.
+
+Verified inside a clean image, with no symlink:
+
+```
+configs_dir = /app/configs
+capabilities loaded = 5
+```
+
+### Same session — made docs/examples/sample_client.py runnable as published
+
+Three separate things forced an edit before the sample could run against a
+deployed agent; all three are now environment-driven, with the previous
+behaviour as the default.
+
+- **The PAT was attached only in the modes that open a PR.** A private
+  `REPO_URL` cannot even be *cloned* without it, so `chat` failed with git's
+  own unhelpful `could not read Username for 'https://github.com'`. It is
+  now included in every mode whenever `GITHUB_PAT` is set, and omitted when
+  it isn't, so public repos still work untouched. `_config(with_pat=...)`
+  is gone.
+- **The provider was hardcoded to OpenAI.** `LLM_PROVIDER` / `LLM_API_KEY` /
+  `LLM_MODEL` now override it, defaulting to openai + gpt-4o-mini exactly as
+  before — an OpenAI key still needs no edits, and Anthropic no longer needs
+  a patch. Missing keys and unknown providers exit with a message naming the
+  variable to set.
+- **`chat` timed out at 60s** while a full pipeline run takes ~2 minutes, so
+  it reported a client-side `ReadTimeout` for tasks that had actually
+  completed. Now 600s, `ARI_CHAT_TIMEOUT` to override.
+- **The webhook callback was hardcoded to `http://localhost:9300/callback`.**
+  In Kubernetes that address resolves to the agent's *own pod*, so no
+  delivery can ever arrive — the existing note in the file covers the Docker
+  case, but K8s is one layer further out. `WEBHOOK_URL` overrides it.
+  Verified by deploying a receiver Pod + Service in-cluster and pointing the
+  callback at its Service DNS: one task produced five deliveries — `task`,
+  `statusUpdate WORKING`, `artifactUpdate root_cause`,
+  `artifactUpdate pull_request`, `statusUpdate COMPLETED`. Artifacts stream
+  as they are produced rather than arriving batched at the end.
+
+### Tests
+
+`tests/test_config_paths.py` (6) and `tests/test_sample_client.py` (8) are
+new; the sample is loaded by path since `docs/examples/` isn't part of the
+installed package. Full suite: **49 passed** on Linux. Three files
+(`test_a2a_agent_card`, `test_a2a_executor`, `test_repo_cache`) import
+`fcntl` and cannot be collected on Windows — run the suite on Linux, or in
+the image, to cover them.
+
+### Deployment notes (the chart lives in insightfinder/charts)
+
+Two things the agent can't fix from its own side, handled in the
+`oncallari` chart:
+
+- **The worker exits if its Temporal namespace doesn't exist**
+  (`Worker validation failed: Namespace oncall-ari-agent is not found`), and
+  `temporal server start-dev` only ever auto-creates `default`. An init
+  container on the worker now registers it on every pod start (idempotent).
+- **`start-dev` keeps everything in one SQLite file.** On an `emptyDir` that
+  file dies with the pod: a node rotation took the registered namespace and
+  all workflow history with it and left the worker CrashLooping for hours.
+  The chart's dev-mode persistence is now enabled by default.
+
+Note for whoever tests this: the agent picks a genuinely different problem
+each run against the same repo — a `None` guard, float rounding on money, a
+return-type mismatch — so two runs do not produce the same PR. That is the
+analysis working, not a flake.
+
+### The persistence change broke the install, and only a clean one showed it
+
+Turning dev-mode persistence on swapped the `emptyDir` for an EBS claim, and
+Temporal then CrashLooped:
+
+```
+failed setting up schema: unable to create SQLite admin DB:
+unable to open database file (14)
+```
+
+`temporalio/temporal` runs as `uid=1000(temporal)` (confirmed with
+`docker run --entrypoint id`), but a freshly provisioned block volume mounts
+root-owned, so `start-dev` cannot create its database file. Fixed with
+`securityContext.fsGroup: 1000` on the pod, rendered only when persistence is
+enabled — an emptyDir is already writable.
+
+Worth recording *why this was nearly missed*: `helm upgrade` over the
+existing release would never have hit it. The old release was still using its
+emptyDir, so no claim was ever provisioned and nothing changed ownership.
+The bug only appeared after `helm uninstall` + deleting the PVC + installing
+from nothing. "It is running fine right now" is not evidence that a fresh
+install works.
+
+### Image tags, and why the test tag currently holds a hand-built image
+
+CI only builds `main`/`staging`/`test`, so a feature branch produces no
+image at all. The chart's default was `main`, which has never been built —
+a release pinned to it fails ImagePullBackOff before anything else can be
+diagnosed. The default is now `test`, with other branches left to an
+install-time `--set ariOncallAgent.image.tag=...` rather than a chart edit.
+
+That default is only correct once this fix is merged to the `test` branch.
+Until then the `test` tag was **manually overwritten** with a build off
+II-24719 (digest `sha256:9ee0dafa…`), so the Test EKS deployment runs exactly
+what it will run post-merge and needs no change when that happens. The same
+build was also pushed as `ii-24719`, which CI cannot clobber.
+
+**The risk that buys:** a push to the `test` branch before this PR merges
+rebuilds `test` without the configs fix, and the cluster silently reverts to
+a worker that dies in `plan_task` — no alert, nothing visibly wrong until
+someone runs a task. Recovery is one command:
+
+```
+helm upgrade oncallari <chart> -n insightfinder -f test-eks-values.yaml   --set ariOncallAgent.image.tag=ii-24719 --wait
+```
+
+Delete that override again once CI has rebuilt `test` from the merged code.
