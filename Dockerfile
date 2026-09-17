@@ -4,7 +4,7 @@
 #
 # python:3.12-slim ships with NEITHER git NOR node/npm — both are hard
 # requirements here, not optional: clone_repo shells out to `git`, and
-# every opencode-backed capability (analyze/generate_fix/verify/publish_pr)
+# every opencode-backed capability (analyze/generate_change/verify/publish_pr)
 # shells out to the `opencode` binary (github.com/sst/opencode, an npm
 # package). Confirmed by running `which git`/`which node` against the bare
 # base image — both come back empty.
@@ -64,7 +64,7 @@ ENV MAVEN_OPTS="-Xmx2g"
 # InfrastructureCore does exactly this for two of its own internal jars,
 # vendored directly in the repo root. A clean container has no way to know
 # about that by itself; `mvn compile` will fail with an unresolvable
-# dependency until something (ideally `ari-verify`/`ari-fix` noticing the
+# dependency until something (ideally `ari-verify`/`ari-change` noticing the
 # vendored jar and self-resolving it, since that's exactly the kind of
 # thing an LLM-driven agent — not a hardcoded script — should figure out
 # from the error and the repo contents) installs it first. Not a toolchain

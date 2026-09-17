@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     temporal_task_queue: str = "oncall-ari-fix-queue"
     temporal_tls_enabled: bool = False
     temporal_api_key: str | None = None
+    # Base64-encoded 32-byte AES-256 key. When set, every workflow/activity
+    # payload (which carries a request's LLM api_key and repo pat/ssh_key)
+    # is encrypted before Temporal persists it, instead of sitting as
+    # plaintext-in-base64 in Temporal's event history/Web UI — see
+    # orchestration/payload_codec.py. Unset (the local-dev default) means
+    # no encryption, matching this setting's role as a deployment-level
+    # secret, not something request-scoped.
+    temporal_payload_encryption_key: str | None = None
 
     # Inbound auth: API keys this agent accepts on `x-api-key`.
     agent_api_keys: str = "change-me-dev-key"

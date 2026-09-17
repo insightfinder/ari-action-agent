@@ -991,3 +991,62 @@ workflow testing needs `temporalio[testing]`'s time-skipping environment,
 not present in this project's test deps). Not yet re-verified live —
 bundled into the same pending rebuild/redeploy as everything else from this
 session.
+
+## 2026-09-17 — Fixed: request secrets sat in plaintext in Temporal's event history (the gap flagged 2026-09-15, now actually closed)
+
+User saw it directly, live: `temporal workflow show --output json` on a
+real workflow from this session's own testing showed the exact GitHub PAT
+and Anthropic API key from the request, base64-but-otherwise-plaintext in
+the `ActivityTaskScheduled` event's input, visible to anyone with Temporal
+UI/API access to the namespace. This is exactly the gap the 2026-09-15
+"Adopted the real A2A protocol" entry flagged and explicitly deferred
+("needs a Temporal Payload Codec before any non-local deploy") — closed now.
+
+**Fix: a real Temporal `PayloadCodec`**, not a workaround that fights this
+agent's own architecture (no shared secrets store — every request is
+self-contained by design, so redacting fields before they reach the
+workflow input and re-fetching them from somewhere else isn't an option
+here). New `orchestration/payload_codec.py`: `EncryptionCodec` wraps
+AES-256-GCM (`cryptography` — new dependency, `pyproject.toml`), one random
+12-byte nonce per payload, prefixed to the ciphertext. Encrypts/decrypts
+the *entire* `Payload` protobuf message (metadata + data) as one blob,
+tagged with `encoding: binary/encrypted` so `decode` can tell an encrypted
+payload from a plain one — necessary so a payload written to history
+*before* this codec was enabled (old plain data) doesn't break replay once
+it is.
+
+**Wired in one place**: `orchestration/temporal_client.py`'s
+`get_temporal_client()` — the single `Client.connect()` shared by both the
+API process (`a2a_server/executor.py`, which starts workflows) and the
+worker process (`orchestration/worker.py`, which polls/executes them) — so
+one `DataConverter(payload_codec=...)` covers every payload this agent
+ever sends or reads, not just some of them. New setting
+`TEMPORAL_PAYLOAD_ENCRYPTION_KEY` (base64-encoded 32-byte AES-256 key,
+`.env.example` documents how to generate one) — a deployment-level secret
+like `AGENT_API_KEYS`/`TEMPORAL_API_KEY`, not per-request; unset (the local
+dev default) means no encryption, so nothing about local development
+changes. Deliberately **no Temporal codec-server** set up — the ask was to
+stop secrets from being visible in the Web UI at all, not to let the UI
+decrypt them for authorized viewers, so an unset codec server means the UI
+can only ever show opaque ciphertext for these payloads.
+
+**Verified:** `tests/test_payload_codec.py` — round-trip recovers the
+original payload exactly; the encoded bytes provably do not contain the
+plaintext secret substring; decode passes plain (untagged) payloads through
+unchanged for the old-history case; a non-32-byte key is rejected at
+construction; `_data_converter()` returns `DataConverter.default` (no-op)
+when the setting is unset, and a real `EncryptionCodec` when it is. Also
+ran a direct end-to-end check outside pytest: built a `DataConverter` with
+a random key, ran a realistic `{"repo": {"pat": "ghp_..."}}` payload through
+the actual `payload_converter` + `payload_codec` pipeline together (not
+just the codec in isolation), confirmed the secret substring is absent from
+the encoded bytes and the decoded result matches the original input
+exactly. Full suite: 74 passed.
+
+**Not yet re-verified against live Temporal** — needs the new dependency
+installed, the env var set on the actual deployment (chart secret, not
+covered in this repo), and a real run inspected via `temporal workflow show`
+to confirm the Web UI/API genuinely can no longer show the plaintext.
+Bundled into the same pending rebuild/redeploy as everything else from this
+session — this one additionally needs the Helm chart's secret to actually
+carry a generated key, which is a `charts` repo change, not this one.
