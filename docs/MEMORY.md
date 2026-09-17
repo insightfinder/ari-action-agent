@@ -1043,10 +1043,56 @@ just the codec in isolation), confirmed the secret substring is absent from
 the encoded bytes and the decoded result matches the original input
 exactly. Full suite: 74 passed.
 
-**Not yet re-verified against live Temporal** — needs the new dependency
-installed, the env var set on the actual deployment (chart secret, not
-covered in this repo), and a real run inspected via `temporal workflow show`
-to confirm the Web UI/API genuinely can no longer show the plaintext.
-Bundled into the same pending rebuild/redeploy as everything else from this
-session — this one additionally needs the Helm chart's secret to actually
-carry a generated key, which is a `charts` repo change, not this one.
+**Deployed and tested live** — `charts/oncallari` updated (new
+`ariOncallAgent.temporalPayloadEncryptionKey` value, wired into the
+Secret template) and `helm upgrade` run against the `ari-oncall` release
+in the `test` namespace with a freshly generated key. Also used this
+opportunity to delete the 3 pre-existing `AriOnCallWorkflow` executions
+from this session's earlier testing (`temporal workflow delete
+--workflow-id ...`, confirmed via `temporal workflow list` returning
+empty afterward) — those predated the codec and had the real PAT/API key
+in plaintext in their history.
+
+**Immediately found (by the user, looking at the real Temporal UI) that
+the first version of this fix was the wrong design**: encrypting the
+*entire* payload as one opaque blob also hid the prompt, capability name,
+params, and every step's results (diffs, PR links, root cause) — the
+Temporal UI became useless for actually observing a request, which is
+the whole reason to look at it. The ask was only ever to hide the actual
+credentials.
+
+**Redesigned: field-level masking, not whole-payload encryption.** New
+`payload_codec.py` parses the `json/plain`-encoded payload, walks it
+recursively, and replaces only the *value* of dict keys named `api_key`,
+`pat`, or `ssh_key` (wherever they appear, at any nesting depth) with an
+AES-256-GCM-encrypted, `enc:v1:`-prefixed, base64-armored string —
+everything else in the structure (prompt, capability, params, results,
+diffs, PR urls) is left completely untouched. Critically, the payload's
+`encoding` metadata stays `json/plain`, unchanged — so it still renders as
+ordinary readable JSON to the Temporal Web UI or `temporal workflow show`,
+just with those specific field values unreadable, instead of the whole
+thing looking like a "can't decode this" blob.
+
+**Verified**: `tests/test_payload_codec.py` rewritten for the new
+behavior (8 tests) — round-trip recovers the original structure exactly;
+a realistic nested payload (capability/prompt/config.llm.api_key/
+config.repo.pat/results.diff) shows every non-sensitive field completely
+readable after encode while both secret values are masked and provably
+absent from the encoded bytes; decode recovers the real secret values
+(the worker still needs them to actually clone/call the LLM); decode
+passes through un-prefixed values unchanged (old pre-codec history, or a
+field that was never set); non-JSON payloads pass through untouched.
+Also ran a direct simulation of what the Temporal UI would actually
+render: built a realistic `clone_repo` step payload through the real
+`payload_converter` + `payload_codec` pipeline together, confirmed the
+rendered JSON has `prompt`/`provider`/`model`/`repo.url` fully readable,
+`api_key`/`pat` masked, both real secret substrings absent from the
+stored bytes, and decode recovers the correct originals. Full suite: 76
+passed.
+
+**Not yet redeployed with this corrected version** — this fix is only in
+the source tree so far. No chart change is needed for it (the encryption
+key already lives in the deployed Secret from the first version of this
+fix); it just needs a new image build containing the corrected
+`payload_codec.py` and a rollout, same as every other pending fix from
+this session.
