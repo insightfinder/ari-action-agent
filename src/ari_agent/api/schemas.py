@@ -26,7 +26,11 @@ from pydantic import BaseModel, ConfigDict, Field
 class RepoConfig(BaseModel):
     provider: Literal["github", "gitlab", "generic-git"] = "github"
     url: str
-    ref: str = "main"
+    # None (not "main") when the caller doesn't name a branch — the remote
+    # doesn't necessarily use "main" (e.g. "master", or something else
+    # entirely), so clone_repo resolves it dynamically from the remote
+    # itself rather than this model assuming a fixed name.
+    ref: Optional[str] = None
     # Credentials are inlined in the request payload (not env-var refs) —
     # this agent has nowhere else to keep them and never persists a request.
     pat: Optional[str] = None

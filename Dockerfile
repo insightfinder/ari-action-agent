@@ -29,6 +29,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # setting it here, once, at image build time, rather than per-invocation.
 RUN git config --system --add safe.directory '*'
 
+# Without this, `mvn`/`javac` fall back to JVM ergonomics' default heap —
+# 25% of the container's visible memory (confirmed via `java
+# -XX:+PrintFlagsFinal`: 512MiB on a 2Gi pod) — which is too small for a
+# real multi-module Spring/Netty/Azure-SDK-BOM classpath: verified live
+# against insightfinder/InfrastructureCore, `mvn compile` throws
+# `java.lang.OutOfMemoryError: Java heap space` well before the
+# container's own memory limit is anywhere near exhausted (peaked at
+# ~880MiB of a 2Gi limit). Raising the pod's memory limit alone would NOT
+# fix this on its own, since ergonomics would just take 25% of whatever
+# that new limit is — an explicit -Xmx is what actually fixes it. Bump
+# this (and the matching worker resources.limits.memory in the Helm
+# chart) together if a real target repo still OOMs.
+ENV MAVEN_OPTS="-Xmx2g"
+
 # `golang-go` / `openjdk-21-jdk-headless` + `maven` above are for `verify`
 # to be able to build/test *target* repos written in Go or Java — a
 # deliberate, bounded bet (Go/Java/Node/Python are the languages this
@@ -63,7 +77,24 @@ RUN git config --system --add safe.directory '*'
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g opencode-ai@1.18.31
+    && npm install -g opencode-ai@1.18.31 \
+    && OPENCODE_DIR="$(npm root -g)/opencode-ai" \
+    && ACTIVE_INODE="$(stat -c %i "$OPENCODE_DIR/bin/opencode.exe")" \
+    && for variant in "$OPENCODE_DIR"/node_modules/opencode-linux-*; do \
+         [ "$(stat -c %i "$variant/bin/opencode" 2>/dev/null)" = "$ACTIVE_INODE" ] || rm -rf "$variant"; \
+       done
+# opencode-ai's own package.json declares optionalDependencies for every
+# platform/arch/libc/AVX-baseline combination it ships (12 packages) —
+# npm's os/cpu fields can't express "AVX2 vs baseline" or "glibc vs musl",
+# so on `npm install -g` it pulls down every linux-x64 variant (confirmed:
+# both opencode-linux-x64 and opencode-linux-x64-baseline landed on disk,
+# ~177MB each) and opencode-ai's own postinstall script picks exactly one
+# via runtime AVX2 detection, hardlinking it to bin/opencode.exe. The loop
+# above deletes every sibling variant that ISN'T the one actually
+# hardlinked, which is safe here specifically because GitHub Actions'
+# hosted amd64 runners always support AVX2 (so the same variant is picked
+# on every build) — this would need reworking if this image were ever
+# built on a non-AVX2 host.
 
 WORKDIR /app
 

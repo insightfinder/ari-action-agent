@@ -28,6 +28,10 @@ tools:
     module: ari_agent.tools.git_ops
     function: set_origin
 
+  git_default_branch:
+    module: ari_agent.tools.git_ops
+    function: default_branch
+
   repo_cache:
     module: ari_agent.tools.repo_cache
     function: ensure_cache

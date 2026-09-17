@@ -63,6 +63,25 @@ async def clone(repo_config: dict, workspace: str) -> str:
     return dest
 
 
+async def default_branch(cache_dir: str) -> str:
+    """The remote's actual default branch (e.g. "main" vs "master" vs
+    something else entirely), read from a local `--mirror` cache rather
+    than assumed. A `--mirror` clone mirrors the remote's `HEAD` symref
+    verbatim at clone time, so `git symbolic-ref` here reports exactly what
+    the remote considers its default branch — no guessing, no hardcoded
+    fallback string."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "symbolic-ref", "--short", "HEAD",
+        cwd=cache_dir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"git symbolic-ref failed: {stderr.decode(errors='replace')}")
+    return stdout.decode().strip()
+
+
 async def set_origin(workdir: str, repo_config: dict) -> None:
     """Re-points `origin` at the real upstream URL (PAT-embedded if
     configured). Used after cloning from the local repo cache — that

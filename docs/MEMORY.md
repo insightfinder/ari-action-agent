@@ -713,3 +713,50 @@ helm upgrade oncallari <chart> -n insightfinder -f test-eks-values.yaml   --set 
 ```
 
 Delete that override again once CI has rebuilt `test` from the merged code.
+
+## 2026-09-17 — Fixed: `clone_repo` hardcoded "main" as the default branch
+
+Live test against the deployed `test-ari-oncall-agent` (a real request against
+`github.com/insightfinder/InsightAgent`, whose default branch is `master`, no
+`ref` named in the prompt or request config) failed 3/3 attempts:
+
+```
+fatal: Remote branch main not found in upstream origin
+```
+
+**Root cause, traced through three layers, all assuming the same fixed
+string:** `api/schemas.py`'s `RepoConfig.ref` defaulted to the literal
+`"main"` (so `repo.get("ref")` in `clone_repo.py` was never actually falsy —
+the "fall back to the remote's own default" branch could never be reached
+even before it existed), `capabilities/clone_repo.py` had its own `"main"`
+fallback, and `capabilities/publish_pr.py` re-derived `base_ref` from the same
+repo config with a third independent `"main"` fallback. Three hardcodes,
+none of them checked against what the remote actually reports.
+
+**Fix, consistent with this project's "declarative, not hardcoded" rule for
+capabilities/tools (see the 2026-09-15 scaffolding entry):** `RepoConfig.ref`
+is now `Optional[str] = None` — "unset" is representable instead of silently
+becoming `"main"`. New `tools/git_ops.py:default_branch()` reads
+`git symbolic-ref --short HEAD` against the local mirror cache — a `--mirror`
+clone mirrors the remote's `HEAD` symref verbatim, so this reports whatever
+the remote's actual default branch is (`main`, `master`, anything else), no
+guessing. New tool `git_default_branch` (`configs/tools.yaml`), added to
+`clone_repo`'s tool list (`configs/capabilities.yaml`). `clone_repo.py`'s
+resolution order is now: planner-named `ref` → request-configured `ref` →
+the remote's real default branch — only hitting the cache lookup in the
+genuinely-nothing-specified case. `publish_pr.py`'s `base_ref` fallback now
+reads `clone_repo`'s already-resolved `ref` from `ctx.results` instead of
+re-deriving its own guess from repo config.
+
+**Verified**: a real git repo initialized with `-b trunk` (deliberately not
+`main`/`master`) round-trips correctly through `--mirror` clone +
+`default_branch()` (`tests/test_git_ops.py`). New
+`test_clone_repo_ref_resolves_from_remote_default_when_nothing_named`
+(`tests/test_capabilities.py`) confirms `git_default_branch` is only called
+when neither the planner nor the request named a branch, and that its result
+flows through to the actual `git clone --branch`. Full suite: 65 passed.
+
+**Not yet re-verified against the live deployment** — this fix is only in
+the source tree; the hosted `test-ari-oncall-agent` runs a previously built
+image and won't pick this up until rebuilt/redeployed (see the image-tag
+notes above this entry).

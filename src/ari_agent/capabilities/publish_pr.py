@@ -54,9 +54,11 @@ async def run(ctx: StepContext) -> dict:
     repo_url = ctx.config["repo"]["url"]
     # The planner can override the PR's target branch independently of
     # whatever branch clone_repo actually checked out — "raise a PR
-    # against staging" while working from dev, say. Falls back to the
-    # same default clone_repo would use.
-    base_ref = ctx.params.get("base_ref") or ctx.config["repo"].get("ref", "main")
+    # against staging" while working from dev, say. Falls back to
+    # whichever branch clone_repo actually resolved and cloned (itself
+    # already resolved dynamically against the remote when nothing named
+    # one), not a re-derived guess.
+    base_ref = ctx.params.get("base_ref") or ctx.results.get("clone_repo", {}).get("ref") or "main"
     instruction = ctx.params.get("instruction") or (
         f"Repository: {_repo_slug(repo_url)} ({repo_url}).\n\n"
         f"{files_clause}"

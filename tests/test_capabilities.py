@@ -133,51 +133,54 @@ async def test_publish_pr_base_ref_defaults_to_repo_ref_when_unset():
     assert "against main" in instruction
 
 
+def _clone_repo_tools(**overrides):
+    tools = {
+        "repo_cache": AsyncMock(return_value="/cache/repo-x"),
+        "git_clone": AsyncMock(return_value="/tmp/ws/repo"),
+        "git_set_origin": AsyncMock(),
+        "opencode_config": Mock(),  # called synchronously (not awaited) in clone_repo.py
+        "git_default_branch": AsyncMock(return_value="master"),
+    }
+    tools.update(overrides)
+    return tools
+
+
 @pytest.mark.asyncio
 async def test_clone_repo_ref_param_overrides_repo_default():
-    ensure_cache = AsyncMock(return_value="/cache/repo-x")
-    git_clone = AsyncMock(return_value="/tmp/ws/repo")
-    set_origin = AsyncMock()
-    write_config = Mock()  # write_config is called synchronously (not awaited) in clone_repo.py
-
-    ctx = _ctx(
-        results={},
-        tools={
-            "repo_cache": ensure_cache,
-            "git_clone": git_clone,
-            "git_set_origin": set_origin,
-            "opencode_config": write_config,
-        },
-        params={"ref": "dev"},
-        capability="clone_repo",
-    )
+    tools = _clone_repo_tools()
+    ctx = _ctx(results={}, tools=tools, params={"ref": "dev"}, capability="clone_repo")
 
     result = await clone_repo.run(ctx)
 
-    git_clone.assert_awaited_once_with({"url": "/cache/repo-x", "ref": "dev"}, "/tmp/ws")
-    set_origin.assert_awaited_once()
+    tools["git_clone"].assert_awaited_once_with({"url": "/cache/repo-x", "ref": "dev"}, "/tmp/ws")
+    tools["git_set_origin"].assert_awaited_once()
+    tools["git_default_branch"].assert_not_awaited()
     assert result == {"cloned_path": "/tmp/ws/repo", "ref": "dev"}
 
 
 @pytest.mark.asyncio
 async def test_clone_repo_ref_defaults_to_repo_config_when_unset():
-    ensure_cache = AsyncMock(return_value="/cache/repo-x")
-    git_clone = AsyncMock(return_value="/tmp/ws/repo")
-    set_origin = AsyncMock()
-    write_config = Mock()
-
-    ctx = _ctx(
-        results={},
-        tools={
-            "repo_cache": ensure_cache,
-            "git_clone": git_clone,
-            "git_set_origin": set_origin,
-            "opencode_config": write_config,
-        },
-        capability="clone_repo",
-    )
+    tools = _clone_repo_tools()
+    ctx = _ctx(results={}, tools=tools, capability="clone_repo")
 
     result = await clone_repo.run(ctx)
 
-    git_clone.assert_awaited_once_with({"url": "/cache/repo-x", "ref": "main"}, "/tmp/ws")
+    tools["git_clone"].assert_awaited_once_with({"url": "/cache/repo-x", "ref": "main"}, "/tmp/ws")
+    tools["git_default_branch"].assert_not_awaited()
     assert result["ref"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_clone_repo_ref_resolves_from_remote_default_when_nothing_named():
+    # Neither the planner nor the request config named a branch — must not
+    # assume "main"; must ask the remote (via the local mirror cache) what
+    # its actual default branch is.
+    tools = _clone_repo_tools()
+    ctx = _ctx(results={}, tools=tools, capability="clone_repo")
+    ctx.config["repo"] = {"url": "https://github.com/x/y"}  # no "ref" key at all
+
+    result = await clone_repo.run(ctx)
+
+    tools["git_default_branch"].assert_awaited_once_with("/cache/repo-x")
+    tools["git_clone"].assert_awaited_once_with({"url": "/cache/repo-x", "ref": "master"}, "/tmp/ws")
+    assert result["ref"] == "master"

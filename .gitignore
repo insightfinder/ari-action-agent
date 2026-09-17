@@ -16,3 +16,4 @@ node_modules/
 .opencode-bin/
 logs/
 *.pid
+tmp/

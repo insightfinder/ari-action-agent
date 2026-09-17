@@ -26,9 +26,11 @@ capabilities:
       request's opencode.json (LLM key, GitHub MCP server + PAT, scoped
       agents). Accepts an optional `ref` param (branch to check out) when
       the prompt names one explicitly, e.g. "check the repo in dev
-      branch" — otherwise falls back to the request's configured default.
+      branch" — otherwise falls back to the request's configured default,
+      and if neither is set, to whatever branch the remote itself reports
+      as its default (main/master/whatever it actually is, never assumed).
       Always the first step of any pipeline that touches a repo.
-    tools: [repo_cache, git_clone, git_set_origin, opencode_config]
+    tools: [repo_cache, git_clone, git_set_origin, opencode_config, git_default_branch]
     retry:
       max_attempts: 3
       backoff_seconds: 5

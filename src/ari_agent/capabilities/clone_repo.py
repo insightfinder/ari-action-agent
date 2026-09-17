@@ -6,14 +6,17 @@ async def run(ctx: StepContext) -> dict:
     clone = ctx.tool("git_clone")
     set_origin = ctx.tool("git_set_origin")
     write_config = ctx.tool("opencode_config")
+    get_default_branch = ctx.tool("git_default_branch")
 
     repo = ctx.config["repo"]
-    # The planner can override which branch to actually work from —
-    # "check the repo in dev branch" → params.ref = "dev" — falling back
-    # to the request's configured default when the prompt didn't name one.
-    ref = ctx.params.get("ref") or repo.get("ref", "main")
-
     cache_dir = await ensure_cache(repo)
+
+    # The planner can override which branch to actually work from —
+    # "check the repo in dev branch" → params.ref = "dev" — falling back to
+    # the request's configured default when the prompt didn't name one, and
+    # finally to whatever the remote itself reports as its default branch
+    # (main/master/anything else) rather than assuming a fixed name.
+    ref = ctx.params.get("ref") or repo.get("ref") or await get_default_branch(cache_dir)
 
     # Per-request working copy: a fast local clone FROM the shared,
     # already-fresh cache — no credentials needed for this step (it's a
