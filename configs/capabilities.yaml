@@ -30,7 +30,7 @@ capabilities:
       and if neither is set, to whatever branch the remote itself reports
       as its default (main/master/whatever it actually is, never assumed).
       Always the first step of any pipeline that touches a repo.
-    tools: [repo_cache, git_clone, git_set_origin, opencode_config, git_default_branch]
+    tools: [repo_cache_and_clone, git_set_origin, opencode_config]
     retry:
       max_attempts: 3
       backoff_seconds: 5

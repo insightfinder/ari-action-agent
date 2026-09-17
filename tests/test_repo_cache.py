@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import sys
 from pathlib import Path
@@ -121,6 +122,84 @@ async def test_cache_origin_is_scrubbed_after_initial_clone(source_repo, cache_r
         ["git", "remote", "get-url", "origin"], cwd=cache_dir, capture_output=True, text=True, check=True
     )
     assert result.stdout.strip() == str(source_repo)
+
+
+@pytest.mark.asyncio
+async def test_ensure_cache_and_clone_returns_resolved_ref_and_isolated_clones(source_repo, cache_root, tmp_path):
+    ws1 = tmp_path / "request-1"
+    ws1.mkdir()
+    ws2 = tmp_path / "request-2"
+    ws2.mkdir()
+
+    path1, ref1 = await repo_cache.ensure_cache_and_clone({"url": str(source_repo)}, None, str(ws1))
+    path2, ref2 = await repo_cache.ensure_cache_and_clone({"url": str(source_repo)}, None, str(ws2))
+
+    assert ref1 == ref2 == "main"  # resolved from the remote, nothing named it explicitly
+    (Path(path1) / "a.txt").write_text("edited by request 1\n")
+    (Path(path2) / "a.txt").write_text("edited by request 2\n")
+    assert (Path(path1) / "a.txt").read_text() == "edited by request 1\n"
+    assert (Path(path2) / "a.txt").read_text() == "edited by request 2\n"
+
+
+@pytest.mark.asyncio
+async def test_ensure_cache_and_clone_never_lets_a_refresh_run_while_another_requests_clone_is_reading(
+    source_repo, cache_root, tmp_path, monkeypatch
+):
+    """The actual bug this fixes, live: the old code released its lock
+    right after the cache *fetch*, before the subsequent local clone read
+    from it — so a second request's fetch (`--prune`) could delete/repack
+    a pack file the first request's clone was still mid-copy on
+    (`fatal: failed to copy file to '.../pack-<hash>.pack': No such file
+    or directory`, confirmed against a real deployment). Assert the two
+    phases can no longer interleave: whichever call's refresh runs second
+    must not start until the *other* call's clone has fully finished."""
+    order: list[str] = []
+
+    real_refresh = repo_cache._sync_refresh_cache
+
+    def recording_refresh(repo_config, cache_root_):
+        order.append("refresh_start")
+        try:
+            return real_refresh(repo_config, cache_root_)
+        finally:
+            order.append("refresh_end")
+
+    real_git_clone = repo_cache.git_clone
+
+    async def slow_clone(repo_config, workspace):
+        order.append("clone_start")
+        try:
+            # Widen the window a concurrent request's refresh would have
+            # to race into, to make an interleaving bug reliably visible
+            # if the lock scope regresses.
+            await asyncio.sleep(0.05)
+            return await real_git_clone(repo_config, workspace)
+        finally:
+            order.append("clone_end")
+
+    monkeypatch.setattr(repo_cache, "_sync_refresh_cache", recording_refresh)
+    monkeypatch.setattr(repo_cache, "git_clone", slow_clone)
+
+    ws1 = tmp_path / "request-1"
+    ws1.mkdir()
+    ws2 = tmp_path / "request-2"
+    ws2.mkdir()
+
+    await asyncio.gather(
+        repo_cache.ensure_cache_and_clone({"url": str(source_repo)}, "main", str(ws1)),
+        repo_cache.ensure_cache_and_clone({"url": str(source_repo)}, "main", str(ws2)),
+    )
+
+    assert order == [
+        "refresh_start",
+        "refresh_end",
+        "clone_start",
+        "clone_end",
+        "refresh_start",
+        "refresh_end",
+        "clone_start",
+        "clone_end",
+    ]
 
 
 def test_authed_url_only_transforms_when_pat_present():

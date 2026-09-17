@@ -36,6 +36,10 @@ tools:
     module: ari_agent.tools.repo_cache
     function: ensure_cache
 
+  repo_cache_and_clone:
+    module: ari_agent.tools.repo_cache
+    function: ensure_cache_and_clone
+
   opencode_config:
     module: ari_agent.tools.opencode_cli
     function: write_config

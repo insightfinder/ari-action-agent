@@ -2,27 +2,23 @@ from .base import StepContext
 
 
 async def run(ctx: StepContext) -> dict:
-    ensure_cache = ctx.tool("repo_cache")
-    clone = ctx.tool("git_clone")
+    ensure_cache_and_clone = ctx.tool("repo_cache_and_clone")
     set_origin = ctx.tool("git_set_origin")
     write_config = ctx.tool("opencode_config")
-    get_default_branch = ctx.tool("git_default_branch")
 
     repo = ctx.config["repo"]
-    cache_dir = await ensure_cache(repo)
 
     # The planner can override which branch to actually work from —
     # "check the repo in dev branch" → params.ref = "dev" — falling back to
     # the request's configured default when the prompt didn't name one, and
     # finally to whatever the remote itself reports as its default branch
-    # (main/master/anything else) rather than assuming a fixed name.
-    ref = ctx.params.get("ref") or repo.get("ref") or await get_default_branch(cache_dir)
-
-    # Per-request working copy: a fast local clone FROM the shared,
-    # already-fresh cache — no credentials needed for this step (it's a
-    # plain filesystem clone), and fully independent of every other
-    # request sharing the same cache, so concurrent edits never collide.
-    path = await clone({"url": cache_dir, "ref": ref}, ctx.workspace)
+    # (main/master/anything else) rather than assuming a fixed name. Refresh,
+    # ref resolution and the local clone all happen atomically under one
+    # held cache lock — see tools/repo_cache.py for why: a concurrent
+    # request's cache refresh could otherwise delete/repack a pack file
+    # this clone is still reading from.
+    ref = ctx.params.get("ref") or repo.get("ref")
+    path, ref = await ensure_cache_and_clone(repo, ref, ctx.workspace)
 
     # `origin` right after that clone points at the local cache dir, not
     # the real repo — fix that up so anything inspecting `git remote -v`

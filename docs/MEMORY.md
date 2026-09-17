@@ -1096,3 +1096,112 @@ key already lives in the deployed Secret from the first version of this
 fix); it just needs a new image build containing the corrected
 `payload_codec.py` and a rollout, same as every other pending fix from
 this session.
+
+## 2026-09-17 — First real full pipeline success, and two real bugs found from it
+
+The corrected branch-resolution + fault-tolerance + new-PAT deploy actually
+worked end to end against `insightfinder/InsightAgent` for real: a genuine
+PR was opened, https://github.com/insightfinder/InsightAgent/pull/983 —
+first time this exact deployment made it all the way through
+`clone_repo → generate_change → verify → publish_pr`. Investigating two
+things the user noticed live led to two more real, confirmed bugs.
+
+### Fixed: repo-cache corruption race between a fetch and a concurrent read
+
+User's question: could concurrent requests against the same repo cause a
+problem, and does the cache truly isolate them? Directly confirmed **yes,
+this was already happening** — worker logs from a genuinely concurrent
+pair of requests (this session's own accidental double-submit, see the
+"did you trigger two tasks?" exchange) showed:
+
+```
+fatal: failed to copy file to '.../repo/.git/objects/pack/pack-<hash>.pack': No such file or directory
+```
+
+**Root cause:** `repo_cache.ensure_cache()` held its lock (in-process
+`asyncio.Lock` + `fcntl.flock`) only for the duration of the mirror
+*fetch*, then released it and returned the cache directory.
+`capabilities/clone_repo.py` then did a **separate, unlocked** local `git
+clone` reading from that same directory. So: request A's fetch finishes,
+releases the lock, and starts its local clone (reading pack files) — while
+request B's `ensure_cache()` (same repo) acquires the now-free lock and
+runs its own `git fetch ... --prune` on that same mirror. `--prune` can
+delete/repack the exact pack file request A is still mid-copy on,
+producing exactly the observed error. Not a memory issue — a git-level
+race on the shared cache directory that the original lock scope never
+actually covered.
+
+**Fix:** `tools/repo_cache.py` restructured — `_sync_refresh_cache()` is
+now a pure, lock-free fetch/create helper; a new `ensure_cache_and_clone()`
+holds one lock acquisition across the refresh, the default-branch
+resolution (when `ref` is unset), *and* the local clone, so a concurrent
+request's fetch can never run while another is still reading. `ensure_cache()`
+is kept as a separately-self-locking wrapper around the same core, for
+existing callers/tests that only need the refresh. New tool
+`repo_cache_and_clone` replaces `clone_repo`'s three separate tool calls
+(`repo_cache`, `git_default_branch`, `git_clone`) with one atomic call —
+`configs/tools.yaml`, `configs/capabilities.yaml` updated accordingly.
+Deliberate trade-off, documented in the module: this fully serializes
+same-repo requests through that (short) window rather than allowing reads
+and writes to interleave — correctness over throughput; different repos
+are completely unaffected (separate lock keys).
+
+**Verified**: `tests/test_repo_cache.py` — a new concurrency test
+instruments `_sync_refresh_cache`/`git_clone` to record call order and
+artificially widens the clone's window with a sleep, runs two concurrent
+`ensure_cache_and_clone` calls against the same repo, and asserts the two
+phases never interleave. Confirmed this test is meaningful, not a
+tautology: ran the exact same scenario against a reconstructed version of
+the *old* locking (lock released right after the fetch, clone unlocked)
+outside pytest and got `['refresh_start', 'refresh_end', 'clone_start',
+'refresh_start', 'refresh_end', 'clone_start', 'clone_end', 'clone_end']`
+— a real interleaving, exactly the bug — versus full serialization with the
+fix. `tests/test_capabilities.py`'s `clone_repo` tests updated for the new
+single-tool interface. Full suite: 82 passed.
+
+### Fixed: PR title/body were raw agent narration, not a summary
+
+User's second question ("is each phase a fresh session, or shared?") led
+somewhere different than expected. **The shared-environment design is
+correct and was already working**: `clone_repo` runs once, every later
+step (`analyze`/`generate_change`/`verify`/`publish_pr`) operates on the
+exact same `ctx.repo_dir` (no re-cloning), and `tools/opencode_cli.py`
+passes `--continue` on every step after the first so opencode resumes the
+same session — confirmed genuinely working by the real PR body correctly
+describing cross-file changes (`models.go`, `worker.go`,
+`insightfinder.go`, `README.md`) that only `generate_change` would have
+known about.
+
+**The actual bug, found by reading PR #983 itself**: its title was `"ARI:
+Now let's make the edits. First \`models.go\`:\nLet me fix gofmt
+alignment "` — and the body was almost entirely opencode's own step-by-step
+narration ("Now let's make the edits...", "Let me fix gofmt alignment...")
+with the real "Summary of changes" section buried partway through. Traced
+to `opencode_cli.py`'s `_parse_events()`: `text` is *every* text chunk from
+the whole agentic turn concatenated together, not a final summary — that
+raw blob was used directly as `generate_change`'s `summary`, which
+`publish_pr.py` both truncates to 72 characters for the PR title (hence
+the title being literally the first 72 characters of the narration) and
+uses verbatim as the PR body.
+
+**Fix:** `opencode_change.py`'s instruction now asks the agent to end with
+a line reading exactly `SUMMARY:` followed by a clean, PR-ready
+description with no narration; a new `_extract_summary()` takes everything
+after the *last* such marker (robust to the agent mentioning the word
+"summary" earlier in its own narration), falling back to the full text if
+the marker never appears so nothing is silently dropped. `_parse_events`
+itself is left unchanged (other consumers may still want the full raw
+text) — this is a targeted fix at the one place the raw blob was reaching
+a human-facing surface (the PR) without ever being cleaned up.
+
+**Verified**: new tests in `tests/test_capabilities.py` —
+`_extract_summary` returns everything after the last marker, falls back to
+the full text when the marker is absent, and correctly picks the *last*
+occurrence when the agent mentions "summary" earlier in its own narration;
+`generate_change`'s `run()` returns only the marked summary, not the raw
+narration, given a realistic mixed-text opencode response. Full suite: 82
+passed.
+
+**Not yet redeployed** — both fixes are only in the source tree; needs a
+new image build + rollout, same as everything else pending from this
+session.

@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent.capabilities import clone_repo, publish_pr  # noqa: E402
+from ari_agent.capabilities import clone_repo, opencode_change, publish_pr  # noqa: E402
 from ari_agent.capabilities.base import StepContext  # noqa: E402
 
 
@@ -135,11 +135,13 @@ async def test_publish_pr_base_ref_defaults_to_repo_ref_when_unset():
 
 def _clone_repo_tools(**overrides):
     tools = {
-        "repo_cache": AsyncMock(return_value="/cache/repo-x"),
-        "git_clone": AsyncMock(return_value="/tmp/ws/repo"),
+        # (cloned_path, resolved_ref) — ensure_cache_and_clone's actual
+        # return shape (see tools/repo_cache.py). A single atomic tool now,
+        # not separate repo_cache/git_default_branch/git_clone calls — see
+        # the module docstring for why (a real cache-corruption race).
+        "repo_cache_and_clone": AsyncMock(return_value=("/tmp/ws/repo", "main")),
         "git_set_origin": AsyncMock(),
         "opencode_config": Mock(),  # called synchronously (not awaited) in clone_repo.py
-        "git_default_branch": AsyncMock(return_value="master"),
     }
     tools.update(overrides)
     return tools
@@ -147,14 +149,15 @@ def _clone_repo_tools(**overrides):
 
 @pytest.mark.asyncio
 async def test_clone_repo_ref_param_overrides_repo_default():
-    tools = _clone_repo_tools()
+    tools = _clone_repo_tools(repo_cache_and_clone=AsyncMock(return_value=("/tmp/ws/repo", "dev")))
     ctx = _ctx(results={}, tools=tools, params={"ref": "dev"}, capability="clone_repo")
 
     result = await clone_repo.run(ctx)
 
-    tools["git_clone"].assert_awaited_once_with({"url": "/cache/repo-x", "ref": "dev"}, "/tmp/ws")
+    tools["repo_cache_and_clone"].assert_awaited_once_with(
+        {"url": "https://github.com/x/y", "ref": "main"}, "dev", "/tmp/ws"
+    )
     tools["git_set_origin"].assert_awaited_once()
-    tools["git_default_branch"].assert_not_awaited()
     assert result == {"cloned_path": "/tmp/ws/repo", "ref": "dev"}
 
 
@@ -165,22 +168,62 @@ async def test_clone_repo_ref_defaults_to_repo_config_when_unset():
 
     result = await clone_repo.run(ctx)
 
-    tools["git_clone"].assert_awaited_once_with({"url": "/cache/repo-x", "ref": "main"}, "/tmp/ws")
-    tools["git_default_branch"].assert_not_awaited()
+    tools["repo_cache_and_clone"].assert_awaited_once_with(
+        {"url": "https://github.com/x/y", "ref": "main"}, "main", "/tmp/ws"
+    )
     assert result["ref"] == "main"
 
 
 @pytest.mark.asyncio
 async def test_clone_repo_ref_resolves_from_remote_default_when_nothing_named():
     # Neither the planner nor the request config named a branch — must not
-    # assume "main"; must ask the remote (via the local mirror cache) what
-    # its actual default branch is.
-    tools = _clone_repo_tools()
+    # assume "main"; ensure_cache_and_clone itself resolves the remote's
+    # actual default branch when given `ref=None`.
+    tools = _clone_repo_tools(repo_cache_and_clone=AsyncMock(return_value=("/tmp/ws/repo", "master")))
     ctx = _ctx(results={}, tools=tools, capability="clone_repo")
     ctx.config["repo"] = {"url": "https://github.com/x/y"}  # no "ref" key at all
 
     result = await clone_repo.run(ctx)
 
-    tools["git_default_branch"].assert_awaited_once_with("/cache/repo-x")
-    tools["git_clone"].assert_awaited_once_with({"url": "/cache/repo-x", "ref": "master"}, "/tmp/ws")
+    tools["repo_cache_and_clone"].assert_awaited_once_with({"url": "https://github.com/x/y"}, None, "/tmp/ws")
     assert result["ref"] == "master"
+
+
+def test_extract_summary_returns_everything_after_the_last_marker():
+    text = "Now let's edit models.go.\nLet's fix gofmt.\nSUMMARY:\nRemoved the Zone field."
+    assert opencode_change._extract_summary(text) == "Removed the Zone field."
+
+
+def test_extract_summary_falls_back_to_full_text_when_marker_absent():
+    text = "Just did the thing, no marker here."
+    assert opencode_change._extract_summary(text) == "Just did the thing, no marker here."
+
+
+def test_extract_summary_uses_the_last_marker_if_the_word_appears_earlier():
+    # Guards against the agent mentioning "summary" in its own narration
+    # before actually reaching the real, marked summary.
+    text = "I'll write a SUMMARY: section once I'm done.\nSUMMARY:\nReal summary here."
+    assert opencode_change._extract_summary(text) == "Real summary here."
+
+
+@pytest.mark.asyncio
+async def test_generate_change_returns_only_the_marked_summary_not_raw_narration():
+    # This is the actual bug found live: without extraction, this raw text
+    # (narration + tool-use commentary + the real summary all concatenated)
+    # became the literal PR title/body via publish_pr.py.
+    opencode = AsyncMock(
+        return_value={"text": "Now let's edit models.go.\nDoing the edit now.\nSUMMARY:\nRemoved the Zone field."}
+    )
+    ctx = _ctx(
+        results={},
+        tools={
+            "opencode": opencode,
+            "git_diff": AsyncMock(return_value="diff --git a/models.go b/models.go"),
+            "git_changed_files": AsyncMock(return_value=["models.go"]),
+        },
+        capability="generate_change",
+    )
+
+    result = await opencode_change.run(ctx)
+
+    assert result["summary"] == "Removed the Zone field."
