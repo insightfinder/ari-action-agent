@@ -41,7 +41,13 @@ async def run(ctx: StepContext) -> dict:
         f"Original request: {ctx.prompt}\n\n"
         + (f"Prior analysis: {analysis}\n\n" if analysis else "")
         + (f"The previous attempt failed verification with:\n{prior_failure}\n\n" if prior_failure else "")
-        + "Make the smallest change that fully satisfies the request. End your response "
+        + "This may be a large monorepo with many unrelated modules — if the request "
+          "names a specific module/component/directory, scope your search to it first "
+          "and only look elsewhere if something it directly imports/references genuinely "
+          "requires it. Search efficiently: consolidate related terms into one regex "
+          "search rather than issuing several overlapping single-term searches, and don't "
+          "re-search for something you've already found. "
+          "Make the smallest change that fully satisfies the request. End your response "
           "with a line reading exactly 'SUMMARY:' followed by a concise, PR-ready "
           "description of what changed and why — written for someone who did not watch "
           "you work, with no step-by-step narration or 'let's do X' commentary."
