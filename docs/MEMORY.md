@@ -1308,3 +1308,133 @@ thing but faster" — it closes an actual capability `ari-change` had
 (committing/pushing to the real authenticated repo, and via delegation,
 running arbitrary commands outside its declared permissions) that nothing
 in this project's design ever intended it to have.
+
+Also added, same session: efficiency guidance in `opencode_change.py`/
+`opencode_analyze.py`'s instructions (scope to the named module first in a
+monorepo, consolidate overlapping search terms) — a lower-confidence,
+unverified-by-trace prompt tweak riding along with the confirmed `task`-tool
+fix, since re-verifying it specifically would need another live run.
+
+## 2026-09-18 — The SUMMARY: marker fix regressed on the very next real run
+
+Deployed everything above (`2609180021-test`) and reran against a
+different module (`positron-agent`, same kind of request). Pipeline
+succeeded — PR #986 opened — but the PR **title was raw narration again**:
+`"ARI: Now let's implement all the changes. Starting with
+positron/util.go:\nGood, strings is still used by looksLikeName."` —
+the exact bug the `SUMMARY:` marker fix (earlier this session) was
+supposed to have closed.
+
+**Not a stale deployment** — confirmed by reading `opencode_change.py`'s
+actual source directly out of the running worker pod
+(`kubectl exec ... python3 -c "import ari_agent.capabilities.opencode_change as m; print(inspect.getsource(m))"`)
+: the fix, including the same-session efficiency-prompt tweak, was
+genuinely present in the deployed image.
+
+**Real root cause: the marker instruction isn't reliably followed.**
+opencode/the model doesn't always end its turn with the literal `SUMMARY:`
+line as asked — a probabilistic instruction-following gap, not a code
+bug. `_extract_summary`'s fallback path for "marker not found" was
+`return text.strip()` — i.e. the full raw narration blob — which quietly
+reintroduces the exact problem being fixed, in exactly the cases where
+compliance fails. A prompt instruction alone was never going to be 100%
+reliable; the code needs to *detect* non-compliance and correct it, not
+just hope.
+
+**Fix:** `_extract_summary()` now returns `None` (not the fallback full
+text) when the marker is absent. `opencode_change.run()` treats `None` as
+"issue one enforcement follow-up call" — a short, narrow instruction
+("reply with ONLY a concise, PR-ready description... no narration, no
+markdown, no tool calls") sent via a **new `continue_session` parameter**
+on `run_opencode()` (`tools/opencode_cli.py`). That parameter exists
+because `ctx.opencode_session_started`'s automatic `--continue` detection
+is based on `ctx.results`, which doesn't get this capability's own entry
+until *after* `run()` returns — so a same-`run()` follow-up call needs to
+force-continue the session explicitly, or it would start a fresh,
+context-less session with no idea what was just changed. The follow-up's
+own reply is used directly (no marker needed for it — it's already
+single-purpose), falling back to the original raw text only if the
+follow-up itself somehow comes back empty, so a response is never lost
+entirely.
+
+**Verified**: `tests/test_capabilities.py` — `_extract_summary` returns
+`None` (not full text) when the marker is missing;
+`test_generate_change_issues_enforcement_followup_when_marker_missing`
+mocks two sequential opencode calls (first without the marker, second a
+clean reply) and confirms the second is used as the summary, called with
+`continue_session=True` specifically (not relying on the automatic
+detection). Full suite: 86 passed. **Not yet re-verified live** — this
+needs a new image build + rollout + another real run to confirm the
+enforcement call actually produces clean PR titles in practice; the
+underlying "does opencode reliably comply with a *second*, narrower
+instruction" question is itself unverified until then.
+
+**PR #986 itself was left as-is** (title/body still raw narration) —
+fixing it retroactively wasn't requested; flagged for the user to decide
+whether it's worth editing given the fix is now understood.
+
+## 2026-09-18 — Added real observability instead of one-off manual reproductions
+
+Same real run (`positron-agent`, task `8cacdd96-...`): `publish_pr` alone
+took ~4m51s (00:35:21 → 00:40:12) for what should be a mechanical stage/
+commit/push/open-PR job. User asked two things: why is `publish_pr`
+specifically slow, and — more durably — build real end-to-end tracing of
+what opencode does, so this class of question never again requires
+manually installing opencode and replaying a reproduction (as the
+`task`-tool investigation the day before required).
+
+**Root problem with the "reproduce it locally" method**: it's exactly what
+caused the PR #985 incident. It doesn't scale as a debugging strategy
+(each investigation is a manual, ~5-10 minute, real-API-cost exercise) and
+it's genuinely risky for anything touching `ari-publish` specifically —
+that agent's job (`git push` + real GitHub MCP `github_create_pull_request`
+calls) can't be meaningfully isolated the way `ari-change` was; a
+reproduction that actually exercises the PR-opening path only means
+anything against a real repo. Investigating *why `publish_pr` is slow*
+this same way was correctly avoided this time rather than risking a repeat.
+
+**Fix: instrument every opencode call, always, for free.** `_parse_events`
+already computed `raw_events`/`raw_stdout` and discarded them — the exact
+data a manual reproduction had to be run to get. New `_build_trace()` in
+`tools/opencode_cli.py` extracts, from opencode's own per-event
+timestamps (not just a single start/end wall-clock number): tool-call
+counts by name, and the 5 biggest gaps-before-a-tool-call (`slowest_gaps`)
+— the precise signal that manually found "4 `task` calls = 68% of one
+run" the day before, now computed on *every* real call automatically.
+`run_opencode()` attaches this as `result["trace"]` and logs it via
+`structlog` (`opencode_call` event: request_id, capability, agent,
+continued_session, elapsed_s, tool_call_counts, tool_call_total,
+slowest_gaps) — visible in `kubectl logs` immediately, no reproduction
+needed. New `merge_traces()` combines multiple calls into one trace for a
+capability that makes more than one opencode call itself (`generate_change`'s
+enforcement follow-up).
+
+**Every opencode-backed capability now returns its trace**
+(`opencode_analyze.py`, `opencode_change.py`, `verify.py`, `publish_pr.py`
+all add `"trace": result["trace"]` to their returned dict), which flows
+into `ctx.results[capability]` and therefore into the final A2A response's
+existing `data` field — meaning any caller (or a human polling
+`GET /tasks/{id}`) can see exactly where each step's time went, straight
+from the response, with zero new infrastructure. Logging happens even on
+an opencode failure (before the `proc.returncode != 0` check), so a failed
+step is diagnosable too, not just successful ones.
+
+**Verified**: `tests/test_opencode_cli.py` — `_build_trace` correctly
+counts tools and identifies the single biggest gap from synthetic
+timestamped events; handles a no-tool-calls response; `merge_traces`
+combines elapsed time, counts, and top gaps across two traces. Updated
+every existing test that mocks the `opencode` tool to include a stub
+`trace` key (capabilities now access `result["trace"]` unconditionally).
+Full suite: 89 passed.
+
+**`publish_pr`'s actual slowness is not yet diagnosed** — deliberately, per
+the reasoning above. This is exactly what the new `trace` field will
+answer on the next real deploy + test run, without needing another
+reproduction. Candidates worth checking once real data exists: genuine
+GitHub API/MCP round-trip latency (create branch, push, create PR are 3+
+sequential network calls) vs. something more fixable (redundant
+inspection calls before pushing, similar in spirit to what was found in
+`generate_change`).
+
+**Not yet redeployed** — needs a new image build + rollout, same as
+everything else pending.

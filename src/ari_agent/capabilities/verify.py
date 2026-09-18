@@ -24,5 +24,5 @@ async def run(ctx: StepContext) -> dict:
     result = await opencode(ctx, instruction)
     text = result["text"]
     if "RESULT: PASS" in text:
-        return {"status": "passed"}
-    return {"status": "failed", "failure": text}
+        return {"status": "passed", "trace": result["trace"]}
+    return {"status": "failed", "failure": text, "trace": result["trace"]}

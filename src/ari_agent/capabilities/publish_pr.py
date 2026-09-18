@@ -77,4 +77,4 @@ async def run(ctx: StepContext) -> dict:
         # to be useful rather than cutting it off mid-sentence at an
         # arbitrary length.
         raise RuntimeError(f"publish_pr: could not find a PR url in opencode's response: {result['text'][:4000]}")
-    return {"pr": pr}
+    return {"pr": pr, "trace": result["trace"]}

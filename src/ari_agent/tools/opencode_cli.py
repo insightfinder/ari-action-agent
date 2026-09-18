@@ -61,10 +61,15 @@ CLI/config behavior, not just docs):
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from ..settings import get_settings
+
+logger = structlog.get_logger()
 
 # Mirrors configs/capabilities.yaml's capability→agent mapping. Kept here
 # (not just in the YAML) because it's opencode-specific wiring, not a fact
@@ -285,13 +290,100 @@ def _parse_events(raw: bytes) -> dict:
     }
 
 
-async def run_opencode(ctx, instruction: str) -> dict:
+def _build_trace(events: list[dict], wall_elapsed_s: float) -> dict:
+    """Per-opencode-call observability: tool-call counts and *where the
+    time actually went*, extracted from opencode's own per-event
+    timestamps rather than a single start/end wall-clock number.
+
+    This is exactly the kind of thing that used to require a one-off
+    manual reproduction to find out — see docs/MEMORY.md, 2026-09-17: the
+    only reason "4 delegated `task` calls ate 68% of one run" was ever
+    discovered was installing opencode locally, replaying the same
+    instruction, and eyeballing a hand-written analysis script's output.
+    `slowest_gaps` below is that same "biggest gap before a tool call"
+    signal, computed automatically on every real call from now on, so a
+    slow step can be diagnosed straight from `data.<capability>.trace` in
+    the final response (or the structured log line this feeds) instead of
+    needing to reproduce it after the fact.
+    """
+    counts: dict[str, int] = {}
+    gaps: list[dict] = []
+    first_ts: int | None = None
+    prev_ts: int | None = None
+
+    for event in events:
+        if not isinstance(event, dict) or "timestamp" not in event:
+            continue
+        ts = event["timestamp"]
+        if first_ts is None:
+            first_ts = ts
+        part = event.get("part", event)
+        is_tool = isinstance(part, dict) and (
+            part.get("type") == "tool" or str(part.get("type", "")).startswith("tool-")
+        )
+        if is_tool:
+            tool = part.get("tool") or str(part.get("type", "")).removeprefix("tool-")
+            counts[tool] = counts.get(tool, 0) + 1
+            if prev_ts is not None:
+                gaps.append(
+                    {
+                        "tool": tool,
+                        "at_s": round((ts - first_ts) / 1000, 2),
+                        "preceded_by_gap_s": round((ts - prev_ts) / 1000, 2),
+                    }
+                )
+        prev_ts = ts
+
+    return {
+        "elapsed_s": round(wall_elapsed_s, 2),
+        # Raw per-event-line counts, not deduplicated per logical tool
+        # invocation — a single call can emit multiple state-transition
+        # events (e.g. pending -> completed), so this over-counts somewhat.
+        # Still a reliable *relative* signal across runs/capabilities.
+        "tool_call_counts": counts,
+        "tool_call_total": sum(counts.values()),
+        "slowest_gaps": sorted(gaps, key=lambda g: -g["preceded_by_gap_s"])[:5],
+    }
+
+
+def merge_traces(*traces: dict) -> dict:
+    """Combines multiple `run_opencode()` traces into one — for a
+    capability that makes more than one opencode call in its own `run()`
+    (e.g. `generate_change`'s enforcement follow-up), so the final
+    per-capability trace reflects the *whole* step, not just its last
+    call."""
+    counts: dict[str, int] = {}
+    gaps: list[dict] = []
+    elapsed = 0.0
+    for trace in traces:
+        elapsed += trace["elapsed_s"]
+        for tool, n in trace["tool_call_counts"].items():
+            counts[tool] = counts.get(tool, 0) + n
+        gaps.extend(trace["slowest_gaps"])
+    return {
+        "elapsed_s": round(elapsed, 2),
+        "tool_call_counts": counts,
+        "tool_call_total": sum(counts.values()),
+        "slowest_gaps": sorted(gaps, key=lambda g: -g["preceded_by_gap_s"])[:5],
+    }
+
+
+async def run_opencode(ctx, instruction: str, *, continue_session: bool | None = None) -> dict:
     """Runs one opencode turn for the calling capability. `ctx` is the
     capability's `StepContext` — this function derives the agent, working
-    directory, model, and whether to `--continue` a prior session from it,
-    so every capability calls it the same way:
+    directory, model, and (by default) whether to `--continue` a prior
+    session from it, so every capability calls it the same way:
 
         result = await ctx.tool("opencode")(ctx, "<instruction>")
+
+    `continue_session` overrides the automatic `ctx.opencode_session_started`
+    detection — needed when a capability makes more than one opencode call
+    *within its own `run()`* (e.g. a follow-up enforcement call after the
+    first response didn't comply with a formatting instruction): from
+    `ctx.results`'s point of view that capability hasn't "started" a
+    session yet (its own entry is only set by the orchestrator after
+    `run()` returns), so the automatic check alone would wrongly start a
+    second, context-less session instead of continuing the first.
     """
     settings = get_settings()
     llm = ctx.config["llm"]
@@ -306,17 +398,29 @@ async def run_opencode(ctx, instruction: str) -> dict:
         "--format", "json",
         "--auto",
     ]
-    if ctx.opencode_session_started:
+    should_continue = ctx.opencode_session_started if continue_session is None else continue_session
+    if should_continue:
         cmd.append("--continue")
     cmd.append(instruction)
 
+    start = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
+    wall_elapsed = time.monotonic() - start
     result = _parse_events(stdout)
+    result["trace"] = _build_trace(result["raw_events"], wall_elapsed)
+    logger.info(
+        "opencode_call",
+        request_id=ctx.request_id,
+        capability=ctx.capability,
+        agent=agent,
+        continued_session=should_continue,
+        **result["trace"],
+    )
     if proc.returncode != 0:
         # stderr is reliably empty in production (confirmed live — even a
         # hard 401 produces nothing on stderr); the real message is in the

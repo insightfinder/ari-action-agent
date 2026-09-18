@@ -16,4 +16,4 @@ async def run(ctx: StepContext) -> dict:
         f"{ctx.prompt}"
     )
     result = await opencode(ctx, instruction)
-    return {"root_cause": {"summary": result["text"], "evidence": []}}
+    return {"root_cause": {"summary": result["text"], "evidence": []}, "trace": result["trace"]}

@@ -8,7 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ari_agent.tools.opencode_cli import (  # noqa: E402
     _AGENT_DEFS,
     CAPABILITY_AGENTS,
+    _build_trace,
     _parse_events,
+    merge_traces,
     write_config,
 )
 
@@ -136,6 +138,58 @@ def test_write_config_disables_task_tool_globally_too(tmp_path):
     )
     cfg = json.loads(Path(path).read_text())
     assert cfg["tools"]["task"] is False
+
+
+def test_build_trace_counts_tools_and_finds_the_biggest_gap():
+    # This is the exact signal that used to require a one-off manual
+    # reproduction to find (docs/MEMORY.md, 2026-09-17: "4 delegated task
+    # calls ate 68% of one run") — now computed automatically from
+    # opencode's own event timestamps on every real call.
+    events = [
+        {"type": "step-start", "timestamp": 1000},
+        {"type": "tool", "tool": "read", "timestamp": 1200, "state": {"status": "completed"}},
+        {"type": "tool", "tool": "read", "timestamp": 1500, "state": {"status": "completed"}},
+        {"type": "tool", "tool": "task", "timestamp": 8000, "state": {"status": "completed"}},
+    ]
+
+    trace = _build_trace(events, wall_elapsed_s=12.3)
+
+    assert trace["elapsed_s"] == 12.3
+    assert trace["tool_call_counts"] == {"read": 2, "task": 1}
+    assert trace["tool_call_total"] == 3
+    assert trace["slowest_gaps"][0] == {"tool": "task", "at_s": 7.0, "preceded_by_gap_s": 6.5}
+
+
+def test_build_trace_handles_no_tool_calls():
+    events = [{"type": "step-start", "timestamp": 1000}, {"type": "text", "timestamp": 1050, "text": "done"}]
+
+    trace = _build_trace(events, wall_elapsed_s=1.0)
+
+    assert trace["tool_call_counts"] == {}
+    assert trace["tool_call_total"] == 0
+    assert trace["slowest_gaps"] == []
+
+
+def test_merge_traces_combines_elapsed_counts_and_top_gaps():
+    first = {
+        "elapsed_s": 5.0,
+        "tool_call_counts": {"read": 2},
+        "tool_call_total": 2,
+        "slowest_gaps": [{"tool": "read", "at_s": 1.0, "preceded_by_gap_s": 3.0}],
+    }
+    second = {
+        "elapsed_s": 2.5,
+        "tool_call_counts": {"read": 1, "edit": 1},
+        "tool_call_total": 2,
+        "slowest_gaps": [{"tool": "edit", "at_s": 0.5, "preceded_by_gap_s": 1.0}],
+    }
+
+    merged = merge_traces(first, second)
+
+    assert merged["elapsed_s"] == 7.5
+    assert merged["tool_call_counts"] == {"read": 3, "edit": 1}
+    assert merged["tool_call_total"] == 4
+    assert merged["slowest_gaps"][0]["preceded_by_gap_s"] == 3.0
 
 
 def test_ari_analyze_and_ari_change_cannot_commit_or_push():

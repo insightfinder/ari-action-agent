@@ -9,6 +9,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ari_agent.capabilities import clone_repo, opencode_change, publish_pr  # noqa: E402
 from ari_agent.capabilities.base import StepContext  # noqa: E402
 
+# Stub `run_opencode()`'s trace field (tools/opencode_cli.py) — every
+# capability reads `result["trace"]` unconditionally now, so any mocked
+# "opencode" tool return value needs one present, even when a test has
+# nothing to assert about it.
+_STUB_TRACE = {"elapsed_s": 0.0, "tool_call_counts": {}, "tool_call_total": 0, "slowest_gaps": []}
+
 
 def _ctx(results: dict, tools: dict, params: dict | None = None, capability: str = "publish_pr") -> StepContext:
     return StepContext(
@@ -55,7 +61,7 @@ def test_extract_pr_returns_none_when_nothing_found():
 async def test_publish_pr_instruction_scopes_staging_to_changed_files():
     opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
         {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/x/y/pull/1"}}
-    ]})
+    ], "trace": _STUB_TRACE})
     ctx = _ctx(
         results={"generate_change": {"summary": "fixed it", "changed_files": ["cart_service.py"]}},
         tools={"opencode": opencode},
@@ -91,7 +97,7 @@ async def test_publish_pr_instruction_states_repo_explicitly():
     # instruction must state owner/repo up front.
     opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
         {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/n/r/pull/1"}}
-    ]})
+    ], "trace": _STUB_TRACE})
     ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.go"]}}, tools={"opencode": opencode})
     ctx.config["repo"]["url"] = "https://github.com/neyaadeez/go-script"
 
@@ -106,7 +112,7 @@ async def test_publish_pr_instruction_states_repo_explicitly():
 async def test_publish_pr_base_ref_param_overrides_repo_default():
     opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
         {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/x/y/pull/1"}}
-    ]})
+    ], "trace": _STUB_TRACE})
     ctx = _ctx(
         results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}},
         tools={"opencode": opencode},
@@ -124,7 +130,7 @@ async def test_publish_pr_base_ref_param_overrides_repo_default():
 async def test_publish_pr_base_ref_defaults_to_repo_ref_when_unset():
     opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
         {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/x/y/pull/1"}}
-    ]})
+    ], "trace": _STUB_TRACE})
     ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools={"opencode": opencode})
 
     await publish_pr.run(ctx)
@@ -194,9 +200,12 @@ def test_extract_summary_returns_everything_after_the_last_marker():
     assert opencode_change._extract_summary(text) == "Removed the Zone field."
 
 
-def test_extract_summary_falls_back_to_full_text_when_marker_absent():
+def test_extract_summary_returns_none_when_marker_absent():
+    # None (not the full text) is deliberate: the caller treats this as
+    # "issue an enforcement follow-up" rather than silently accepting raw
+    # narration as PR-facing text — see opencode_change.run().
     text = "Just did the thing, no marker here."
-    assert opencode_change._extract_summary(text) == "Just did the thing, no marker here."
+    assert opencode_change._extract_summary(text) is None
 
 
 def test_extract_summary_uses_the_last_marker_if_the_word_appears_earlier():
@@ -212,7 +221,10 @@ async def test_generate_change_returns_only_the_marked_summary_not_raw_narration
     # (narration + tool-use commentary + the real summary all concatenated)
     # became the literal PR title/body via publish_pr.py.
     opencode = AsyncMock(
-        return_value={"text": "Now let's edit models.go.\nDoing the edit now.\nSUMMARY:\nRemoved the Zone field."}
+        return_value={
+            "text": "Now let's edit models.go.\nDoing the edit now.\nSUMMARY:\nRemoved the Zone field.",
+            "trace": _STUB_TRACE,
+        }
     )
     ctx = _ctx(
         results={},
@@ -227,3 +239,40 @@ async def test_generate_change_returns_only_the_marked_summary_not_raw_narration
     result = await opencode_change.run(ctx)
 
     assert result["summary"] == "Removed the Zone field."
+
+
+@pytest.mark.asyncio
+async def test_generate_change_issues_enforcement_followup_when_marker_missing():
+    # Real bug found live (against positron-agent): opencode doesn't always
+    # comply with the marker instruction. Falling back to the raw
+    # narration would silently reintroduce the exact bug the marker exists
+    # to fix — a follow-up call must be made instead.
+    opencode = AsyncMock(
+        side_effect=[
+            {
+                "text": "Now let's edit models.go.\nDoing the edit now.\nAll done, changes look good.",
+                "trace": _STUB_TRACE,
+            },
+            {"text": "Removed the Zone field and hardcoded the component name.", "trace": _STUB_TRACE},
+        ]
+    )
+    ctx = _ctx(
+        results={},
+        tools={
+            "opencode": opencode,
+            "git_diff": AsyncMock(return_value="diff --git a/models.go b/models.go"),
+            "git_changed_files": AsyncMock(return_value=["models.go"]),
+        },
+        capability="generate_change",
+    )
+
+    result = await opencode_change.run(ctx)
+
+    assert result["summary"] == "Removed the Zone field and hardcoded the component name."
+    assert opencode.await_count == 2
+    # The follow-up must continue the same session (it needs to know what
+    # was just changed) — from ctx.results' point of view this capability
+    # hasn't "finished" yet, so the automatic --continue detection alone
+    # would otherwise start a fresh, context-less session.
+    _, followup_kwargs = opencode.await_args_list[1]
+    assert followup_kwargs == {"continue_session": True}
