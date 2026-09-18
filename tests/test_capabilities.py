@@ -6,8 +6,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent.capabilities import clone_repo, opencode_change, publish_pr  # noqa: E402
-from ari_agent.capabilities.base import StepContext  # noqa: E402
+from ari_oncall_agent.capabilities import clone_repo, generate_change as opencode_change, publish_pr  # noqa: E402
+from common.capabilities_base import StepContext  # noqa: E402
 
 # Stub `run_opencode()`'s trace field (tools/opencode_cli.py) — every
 # capability reads `result["trace"]` unconditionally now, so any mocked

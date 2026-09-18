@@ -9,8 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from temporalio.api.common.v1 import Payload  # noqa: E402
 
-from ari_agent.orchestration.payload_codec import EncryptionCodec  # noqa: E402
-from ari_agent.orchestration.temporal_client import _data_converter  # noqa: E402
+from common.orchestration.payload_codec import EncryptionCodec  # noqa: E402
+from common.orchestration.temporal_client import _data_converter  # noqa: E402
 
 
 def _key() -> bytes:

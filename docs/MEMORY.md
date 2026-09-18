@@ -1477,3 +1477,204 @@ earlier, this is a prompt change whose actual effect can only be confirmed
 by a real run's trace, not a unit test. The next real test's
 `data.publish_pr.trace.tool_call_counts.read` should drop from 10 toward 0
 if it works.
+
+## 2026-09-18 — Restructured the flat `ari_agent` package into a small multi-agent framework, and built the Jenkins agent on top of it
+
+Prompted by wanting a second agent kind (Jenkins) on the same
+infrastructure without duplicating the A2A server/Temporal
+workflow/planner/respond code. Split the single `src/ari_agent/` package
+into four: `common/` (agent-kind-agnostic — A2A server, orchestration,
+planner, respond, registries, settings, sandbox, LLM client, the new
+`opencode_runtime.py`), `ari_oncall_agent/` (the original agent's own
+capabilities/tools/schemas, moved via `git mv`), `jenkins_agent/` (new),
+and `api/` (thin deployable entrypoints only — `api/main.py`/
+`api/worker.py`, no logic of their own). `configs/capabilities.yaml`/
+`tools.yaml` moved to `configs/oncall/` (and a new `configs/jenkins/`
+added); `config_paths.config_file()` simplified to always resolve
+`configs_dir() / agent_kind / name` (removed an old special case that
+kept oncall at the root).
+
+**New abstraction:** `common/agent_meta.py`'s `AgentMeta`/`get_agent_meta()`
+— every place that used to hardcode on-call-specific text or a
+`results.get("publish_pr", {}).get("pr")`-shaped lookup (the Agent Card's
+description/skill, the planner's domain-guidance paragraph and fallback
+steps, `respond`'s system prompt, the workflow's artifact extraction) now
+reads it from `<agent_package>.meta.META` instead, keyed by
+`settings.agent_kind`. See `docs/design.md` §0 for the full shape.
+
+**Real bug found and fixed while wiring this up:** `get_agent_meta()`
+originally had no parameter at all and always read the *global*
+`get_settings().agent_kind` — so `build_agent_card(Settings(agent_kind="jenkins"))`,
+called with an explicit local `Settings` object, still got the on-call
+agent's metadata. Caught by a failing test
+(`test_agent_card_switches_content_by_agent_kind` returned the on-call
+skill for both kinds). Fixed by adding an explicit `agent_kind: str | None`
+parameter and updating `agent_card.py` to call
+`get_agent_meta(settings.agent_kind)` rather than relying on the implicit
+global default.
+
+**Also renamed, unifying a real pre-existing inconsistency:** the
+workflow response's PR key was `"pr"`, but the A2A executor's artifact
+name (and this doc's own developer-guide example) already called it
+`"pull_request"` — two different names for the same data. Unified on
+`"pull_request"` everywhere (`workflow.py`, `docs/design.md`,
+`tests/test_a2a_executor.py`'s fixture).
+
+**Jenkins agent, built from scratch on top of the above:** capabilities
+`resolve_target`/`inspect`/`diagnose`/`propose_action`/`execute_action`,
+opencode agents `ari-jenkins-read` (every `jenkins_*` MCP tool denied)
+and `ari-jenkins-act` (the only one with them enabled — only
+`execute_action` runs as this one), and a direct-REST fallback
+(`jenkins_rest.py`) for stopping a build, since the MCP plugin's own
+documented tool list didn't obviously include a stop/cancel tool (later
+confirmed true live — see the entry below). `execute_action` refuses to
+run without a concrete, non-stale confirmed action already in
+`ctx.params` — never inferred from a bare "yes"; see `docs/design.md` §5b
+for the full two-layer gate.
+
+**Verified:** full suite 109 passed (92 pre-existing + 3 new
+`test_agent_meta.py` + 14 new `test_jenkins_capabilities.py`, the latter
+covering all 5 Jenkins capabilities plus `opencode_cli`/`jenkins_rest`
+tool-permission assertions — checked each assertion against the real
+source before running, not written blind against the summary). Also
+directly built and ran the lightweight API image in Docker and confirmed
+the same image serves either agent kind's real Agent Card content
+(different `description`) purely from `AGENT_KIND` env, nothing else
+changed. **Not yet verified:** any Jenkins capability against a real
+Jenkins — see the entry below.
+
+## 2026-09-18 — Split the single Dockerfile into three, one per deployable process
+
+Per the earlier design conversation's explicit ask for "dedicated docker
+files for ari on call agent, ari jenkins agent, and separate api
+deployment." `Dockerfile.api` (shared, `python:3.12-slim` + `pip install .`
+only — this process never shells out to git/opencode itself, so it needs
+none of the toolchain the workers do), `Dockerfile.oncall` (the original
+image's full git/node/opencode/go/java/maven toolchain, entrypoint
+changed to `api.worker`), `Dockerfile.jenkins` (new, much smaller — only
+Node.js + the same pinned `opencode-ai` version, no git or build
+toolchain, since this agent never clones or builds anything). Old
+`Dockerfile` removed.
+
+**Verified:** built `Dockerfile.api` in Docker directly (not just
+reviewed) and ran `python -c "from api.main import app; ..."` inside the
+built image with `AGENT_KIND=oncall` and `AGENT_KIND=jenkins` — confirmed
+`app.description` differs correctly between the two, proving the
+"one shared API image, N worker images" design actually works, not just
+plausible on paper. `Dockerfile.oncall`/`Dockerfile.jenkins` were not
+built in Docker (their toolchain installs are slow and mechanically
+unchanged from the already-working original `Dockerfile`'s corresponding
+sections) — only reviewed.
+
+## 2026-09-18 — Extended the Helm chart (`insightfinder/charts`, `charts/oncallari`) with a second, independently toggleable agent kind
+
+Added `ariJenkinsAgent` alongside the existing `ariOncallAgent` block:
+its own api+worker Deployment pair, Secret, Service, and Ingress,
+mirroring the on-call agent's structure but with no `repo-cache` PVC (the
+Jenkins agent never clones anything) and its own Temporal namespace
+(`jenkins-ari-agent`) against the same shared Temporal dev server. New
+`_helpers.tpl` naming helpers use distinct `-jenkins-*` suffixes
+specifically so both agent kinds' resources can coexist under one release
+without colliding — the existing on-call helper names (`-api`/`-worker`/
+`-secret`) were deliberately left unchanged so upgrading the
+already-deployed `test` release wouldn't rename/recreate its existing
+resources.
+
+Also split `ariOncallAgent.image` (one image field used by both its API
+and worker Deployments) into `.api.image` (now the shared image built
+from `Dockerfile.api`, also used by `ariJenkinsAgent.api.image`) and
+`.worker.image` (`Dockerfile.oncall`'s image) — a breaking values-schema
+change: any `helm upgrade --set ariOncallAgent.image.tag=...` invocation
+needs to become two `--set` flags now. No committed values file in the
+repo referenced the old path, so nothing already-applied silently broke;
+this only affects how future deploys are invoked from the CLI.
+
+Later the same day, renamed both agent kinds' default Temporal task queue
+names — `oncall-ari-fix-queue` → `oncall-ari-queue`,
+`jenkins-ari-fix-queue` → `jenkins-ari-queue` — per direct request ("fix
+i doesn't make sense... same thing with jenkins"), overriding an earlier,
+now-superseded note in this doc (2026-09-17 entry under "generalized
+analyze/generate_fix") that had deliberately left this queue name alone
+as "an operational Temporal queue name, not worth the deployment
+coordination"). Also updated `settings.py`'s matching default.
+
+**Verified:** `helm lint`+`helm template` with both agent kinds enabled —
+confirmed distinct, non-colliding resource names, correct images/
+entrypoints/`AGENT_KIND` per Deployment, correct decoded `TEMPORAL_TASK_QUEUE`
+secret values (`oncall-ari-queue`/`jenkins-ari-queue`) after the rename.
+Full Python test suite unaffected (no test asserted the literal queue
+name). **Not yet applied** to the actual live `test` cluster release —
+these are chart/values changes only, not a `helm upgrade` that was run.
+
+## 2026-09-18 — First real verification session against a production Jenkins, and two hard blocks from Claude Code's own safety classifier
+
+User wanted the Jenkins agent's design validated read-only against
+`jenkins.insightfinder.com` (a real production instance) before trusting
+any of it, and provided a real API token (pasted directly into chat —
+flagged back to the user as its own exposure, independent of anything
+that follows, with a recommendation to rotate it after testing).
+
+**What was checked, all via direct read-only HTTP calls (no LLM, no
+secrets ever written to disk) — this part worked and needed no special
+permission:**
+- Server reachable, `X-Jenkins: 2.568.3` (from an *unauthenticated*
+  request's response headers — Jenkins leaks its version even on a 403).
+- Token authenticates via Basic auth as `mustafa:<token>` — confirmed via
+  `/whoAmI/api/json`. (A wrong placeholder username got a clean 401,
+  confirming the username genuinely has to match, not just be non-empty.)
+- **First finding: the MCP Server plugin was not installed at all.**
+  Checked by pulling `/pluginManager/api/json?depth=1`'s full 148-plugin
+  list directly, not by trusting the plugin page's marketing copy.
+  `/mcp-server/mcp` 404'd for exactly this reason, not a wrong path
+  guess.
+- After the user installed it (self-service, admin access confirmed
+  first via `AskUserQuestion`, and a running build on `agent1` flagged
+  and explicitly re-confirmed before proceeding): confirmed installed
+  and `active: true` via the same plugin-list endpoint.
+- **Real MCP tool list, via a raw JSON-RPC `tools/list` call — no model,
+  no opencode, zero risk of anything being invoked.** The transport
+  turned out to be streamable-HTTP: `initialize` POST returns an
+  `Mcp-Session-Id` response header; that header must be replayed on a
+  `notifications/initialized` POST and then the actual `tools/list` POST,
+  whose response arrives as a single Server-Sent-Event `data:` line, not
+  plain JSON (`Accept: application/json, text/event-stream` is required
+  or the initial `initialize` call itself is refused). Result: exactly
+  19 tools, each carrying the plugin's own `readOnlyHint`/`destructiveHint`
+  annotations — 15 read-only, 4 destructive (`triggerBuild`,
+  `updateBuild`, `rebuildBuild`, `replayBuild`), confirming **no
+  stop/cancel tool exists**, matching `jenkins_rest.py`'s existing
+  assumption (built on a guess from the plugin's doc page, now fact).
+- opencode's own docs (`https://opencode.ai/docs/mcp-servers`, fetched
+  directly) confirm its MCP tool-naming rule verbatim: *"MCP server tools
+  are registered with server name as prefix... `mymcpservername_*`"* —
+  meaning `jenkins_agent/tools/opencode_cli.py`'s `"jenkins_*": false`
+  deny pattern is very likely correct, not just an analogy to GitHub's
+  confirmed `github_*` (this had been an open, explicitly-flagged risk
+  since the agent was first built: with opencode's `--auto` auto-approving
+  anything *not* explicitly denied, a wrong prefix guess would silently
+  deny nothing).
+
+**What could NOT be checked, and why — a real, not hypothetical, gap:**
+Claude Code's own auto-mode safety classifier blocked two distinct
+actions outright, independent of the user's explicit go-ahead each time:
+(1) an `installNecessaryPlugins` POST (a mutating production action —
+the user ended up installing it themselves instead), and (2) writing the
+real Jenkins token + LLM API key into a local `opencode.json` (flagged
+specifically as "credential materialization" — writing real secrets to
+disk — which is unavoidable for actually running `opencode` this way,
+since that's how it receives MCP auth headers and provider keys). Per the
+classifier's own guidance, no attempt was made to route around either
+block (e.g. splitting the write into steps, disguising the request).
+
+**Net result: nothing above amounts to "the Jenkins agent works."** It
+proves the MCP endpoint is real, reachable, and shaped the way the code
+assumes — the actual capabilities (`resolve_target`/`inspect`/`diagnose`/
+`propose_action`, let alone `execute_action`) have had zero real
+`opencode run` invocations against a real Jenkins, by anyone, as of this
+entry. `scripts/jenkins_agent_local_test.py` was built and given to the
+user to run themselves (exact `export`-and-run commands using the
+credential files already on disk, so no secret needs retyping) — user
+declined to run it in this session. This gap needs to be closed with a
+real run — either by the user directly, or by this agent in a future
+session with the relevant Bash permission loosened for that specific
+action — before any claim of "the Jenkins agent works" is accurate.

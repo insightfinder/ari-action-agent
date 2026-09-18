@@ -1,9 +1,71 @@
-# ARI On-Call Agent — Design
+# ARI Agents — Design
 
 Current-state architecture reference. For *why* things ended up this way,
 what's been verified against real infrastructure, and the history of bugs
 found and fixed along the way, see [`docs/MEMORY.md`](MEMORY.md) — that's
 the decision/verification log; this doc is just what's true today.
+
+## 0. One framework, two agent kinds
+
+This started as a single agent (the on-call agent, §1–§6 below) and has
+since been restructured into a small shared framework that any number of
+A2A-protocol agent kinds can sit on top of. Today there are two:
+
+| Agent kind | What it does | Package |
+|---|---|---|
+| `oncall` | Clones a repo, diagnoses a bug/feature request, fixes it, opens a PR | `ari_oncall_agent/` |
+| `jenkins` | Reads/diagnoses a Jenkins job or build, proposes and (once confirmed) executes a change | `jenkins_agent/` |
+
+**Package layout** (`src/`):
+
+- **`common/`** — everything agent-kind-agnostic: the A2A server
+  (`a2a_server/`), the Temporal workflow/activities (`orchestration/`),
+  the planner (`planner.py`), the final-answer synthesizer (`respond.py`),
+  the capability/tool registries, settings, sandbox management, the LLM
+  client, and `opencode_runtime.py` (the generic opencode
+  subprocess/event-parsing/tracing mechanics — see §5). None of this
+  imports from either agent package.
+- **`ari_oncall_agent/`** / **`jenkins_agent/`** — everything specific to
+  one agent kind: its capabilities, its own thin `tools/opencode_cli.py`
+  wrapper (scoped opencode agent definitions + per-request config
+  writing), its `schemas.py`, and its `meta.py` (below).
+- **`api/`** — thin deployable entrypoints only: `api/main.py` (`uvicorn
+  api.main:app`) and `api/worker.py` (`python -m api.worker`). Both just
+  call into `common/`; neither contains agent-kind-specific logic.
+
+**Which agent kind a process runs as** is one setting,
+`settings.agent_kind` (env `AGENT_KIND`, default `"oncall"`). It selects:
+which `configs/<agent_kind>/{capabilities,tools}.yaml` the registries load
+(`common/config_paths.py`), and which agent kind's `meta.py` module
+supplies this process's `AgentMeta` (`common/agent_meta.py`):
+
+```python
+@dataclass
+class AgentMeta:
+    description: str                    # this agent kind's Agent Card description
+    skill: AgentSkill                    # this agent kind's Agent Card skill
+    planner_description: str             # short phrase the planner's prompt uses to describe itself
+    planner_domain_guidance: str         # the domain-specific paragraph in the planner's system prompt
+    planner_fallback_steps: list[dict]   # steps used when the planner's own output is malformed
+    respond_domain_note: str             # what `respond` should cover, beyond the generic framing
+    artifacts: dict[str, str]            # artifact name -> "capability.result_key" to surface on the Task
+```
+
+Every place that used to hardcode on-call-specific wording or a
+`results.get("publish_pr", {}).get("pr")`-style lookup now reads this
+instead — `a2a_server/agent_card.py`, `planner.py`, `respond.py`, and
+`orchestration/workflow.py`'s artifact extraction. Adding a third agent
+kind means a new package + a new `configs/<kind>/` directory + a new
+`meta.py`; nothing in `common/` changes.
+
+**Deployment** is one shared, agent-kind-agnostic API image plus one
+worker image *per agent kind* (§7) — each agent kind's API and worker
+Deployments are independently toggleable in the Helm chart and can scale
+separately.
+
+The rest of this section (§1–§6) describes the on-call agent's own
+pipeline in detail; §5b covers the Jenkins agent's own integration; §7–§8
+cover deployment and limitations for both.
 
 ## 1. What this is
 
@@ -55,11 +117,12 @@ result, entirely via standard A2A mechanics:
 | Caller gets | Final `Task`, inline | `Task` (submitted) immediately | `Task` (submitted) immediately |
 | Completion | Same call blocks until terminal state | Caller calls `tasks/get` | The SDK POSTs progressive updates to a registered `pushNotificationConfig` |
 
-All three run the exact same `AriOnCallWorkflow` via the exact same
-`AriAgentExecutor.execute()` (`a2a_server/executor.py`) — there is no
-second code path. `context.task_id` (the A2A Task ID) **is** the Temporal
-workflow ID, one identifier end to end; Temporal's own workflow history is
-the audit trail.
+All three run the exact same `AriAgentWorkflow` (agent-kind-agnostic — see
+§0) via the exact same `AriAgentExecutor.execute()`
+(`common/a2a_server/executor.py`) — there is no second code path.
+`context.task_id` (the A2A Task ID) **is** the Temporal workflow ID, one
+identifier end to end; Temporal's own workflow history is the audit
+trail.
 
 **Transports**: JSON-RPC (`POST /`) and REST/HTTP+JSON
 (`POST /message:send`, `GET /tasks/{id}`, etc.), both served from the same
@@ -96,7 +159,7 @@ stateless service.
    task/context).
 2. Enqueues the initial `Task` object (state `SUBMITTED`) — this is what
    lets a non-blocking caller's response return immediately.
-3. Starts `AriOnCallWorkflow` via the Temporal client, with the A2A task ID
+3. Starts `AriAgentWorkflow` via the Temporal client, with the A2A task ID
    as the workflow ID.
 4. Awaits the workflow's result (this can take minutes; that's fine —
    it's one of many concurrent asyncio tasks in the API process, and it's
@@ -113,21 +176,29 @@ flow) — `respond` (§4) always gives a definitive answer instead.
 
 ## 3. Core abstractions
 
-| Abstraction | What it is | Where |
-|---|---|---|
-| **Request** | `RequestConfig` — repo, llm, system_prompt override, options. Self-contained, immutable. | `api/schemas.py` |
-| **Plan** | Ordered list of `Step`s (capability + params), produced per-request by the planner. | `models/plan.py`, `planning/planner.py` |
-| **Capability** | One pipeline step's behavior (`clone_repo`, `analyze`, `generate_change`, `verify`, `publish_pr`, `respond`). Declared in `configs/capabilities.yaml` (description, tools, retry, on_failure); implemented as `run(ctx) -> dict` in `capabilities/`. | `capabilities/` |
-| **Tool** | A concrete callable a capability may use (`git_clone`, `opencode`, `repo_cache`, `llm_complete`, ...). Declared in `configs/tools.yaml`; implemented in `tools/`. | `tools/` |
+| Abstraction | What it is | Where (on-call) | Where (Jenkins) |
+|---|---|---|---|
+| **Request** | Config model — this agent kind's own connection info, `llm`, options. Self-contained, immutable. | `ari_oncall_agent/schemas.py` (`RepoConfig`, `LLMConfig`, `RequestConfig`) | `jenkins_agent/schemas.py` (`JenkinsConfig`, `JenkinsAuthConfig`) |
+| **Plan** | Ordered list of `Step`s (capability + params), produced per-request by the planner. | `common/models/plan.py`, `common/planner.py` (shared) | same |
+| **Capability** | One pipeline step's behavior. Declared in `configs/<agent_kind>/capabilities.yaml` (description, tools, retry, on_failure); implemented as `run(ctx) -> dict`. | `clone_repo`, `analyze`, `generate_change`, `verify`, `publish_pr` in `ari_oncall_agent/capabilities/` | `resolve_target`, `inspect`, `diagnose`, `propose_action`, `execute_action` in `jenkins_agent/capabilities/` |
+| **Tool** | A concrete callable a capability may use. Declared in `configs/<agent_kind>/tools.yaml`. | `git_clone`, `opencode`, `repo_cache`, ... in `ari_oncall_agent/tools/` | `opencode`, `jenkins_stop_build`, ... in `jenkins_agent/tools/` |
 
-Adding a capability or tool = new module + new YAML entry. No changes to
-`orchestration/workflow.py`, `orchestration/activities.py`, or the API
-layer — this is the extensibility seam: new purposes later are new
-capabilities/tools/catalog entries, not a rewrite.
+Both agent kinds share the same `respond` capability (`common/respond.py`,
+`internal: true` in both YAMLs) — it's 100% mechanically generic once its
+system prompt is filled from `AgentMeta.description`/`respond_domain_note`
+(§0).
+
+Adding a capability or tool = new module + new YAML entry under that
+agent kind's `configs/<agent_kind>/`. No changes to
+`common/orchestration/workflow.py`, `common/orchestration/activities.py`,
+or the API layer — this is the extensibility seam: new purposes later are
+new capabilities/tools/catalog entries, not a rewrite. Adding a whole new
+*agent kind* is the same shape one level up (§0): a new package, a new
+`configs/<kind>/`, a new `meta.py` — `common/` itself never changes.
 
 ## 4. Planning, execution, and the response
 
-1. The `plan_task` activity calls `planning/planner.py`, which sends the
+1. The `plan_task` activity calls `common/planner.py`, which sends the
    prompt + `capabilities.registry.catalog()` (names, descriptions, tools)
    to the request's own LLM and gets back an ordered step list. It honors
    `config.options` (e.g. `skip_tests`) and dynamic branch names in the
@@ -156,7 +227,12 @@ capabilities/tools/catalog entries, not a rewrite.
 5. A final `respond` capability **always** runs after the loop above,
    regardless of what the planner chose or whether the pipeline gave up.
 
-**Response shape.** `AriOnCallWorkflow.run()` returns one plain dict:
+**Response shape.** `AriAgentWorkflow.run()` returns one plain dict. Which
+top-level keys appear besides `request_id`/`status`/`message`/`data` is
+driven entirely by that agent kind's `AgentMeta.artifacts` mapping (§0) —
+`common/orchestration/workflow.py`'s `_artifacts()` walks it and pulls
+each named artifact out of the matching capability's result if present.
+For the on-call agent:
 
 ```json
 {
@@ -164,24 +240,32 @@ capabilities/tools/catalog entries, not a rewrite.
   "status": "completed",
   "message": "Fixed the WaitGroup Add/Wait race in discoverScan.go and added CLI flags for subnet/port range; verify passed; opened PR #1.",
   "root_cause": { "summary": "...", "evidence": [...] },
-  "pr": { "url": "...", "branch": "ari/change-..." },
+  "pull_request": { "url": "...", "branch": "ari/change-..." },
   "data": { "...": "raw per-capability results, for programmatic callers" }
 }
 ```
 
-`status`: `completed | failed | no_action | needs_approval` (the last one
-reserved — no policy/approval gate exists yet). `a2a_server/executor.py`
-maps this onto the real A2A wire shape: `message` becomes the completed
-`Task`'s final `Message`, `root_cause`/`pr` become named `Artifact`s, and
-`status` maps onto `TaskState` (`completed`/`no_action` →
-`TASK_STATE_COMPLETED`, `failed` → `TASK_STATE_FAILED`, `needs_approval` →
-`TASK_STATE_INPUT_REQUIRED`, unused today).
+(`pull_request` — not `pr` — is the actual key; an earlier version of
+this doc and the workflow disagreed on this, one real inconsistency this
+restructuring unified, see `docs/MEMORY.md`.) The Jenkins agent instead
+surfaces `pending_action` (from `propose_action`) and `action_result`
+(from `execute_action`) when present.
 
-`message` is never a template. It comes from `respond`
-(`capabilities/respond.py`) — an `internal: true` capability (excluded
-from the planner's catalog, so the planner never picks it itself) that
-`workflow.py` calls directly and unconditionally after the planner-chosen
-steps finish or give up. It uses the request's own LLM over the prompt,
+`status`: `completed | failed | no_action | needs_approval` (the last one
+reserved — no policy/approval gate exists yet). `common/a2a_server/
+executor.py` maps this onto the real A2A wire shape: `message` becomes
+the completed `Task`'s final `Message`, every `AgentMeta.artifacts` key
+present in the result becomes a named `Artifact`, and `status` maps onto
+`TaskState` (`completed`/`no_action` → `TASK_STATE_COMPLETED`, `failed` →
+`TASK_STATE_FAILED`, `needs_approval` → `TASK_STATE_INPUT_REQUIRED`,
+unused today).
+
+`message` is never a template. It comes from `respond` (`common/
+respond.py`, shared by every agent kind — §3) — an `internal: true`
+capability (excluded from the planner's catalog, so the planner never
+picks it itself) that `workflow.py` calls directly and unconditionally
+after the planner-chosen steps finish or give up. It uses the request's
+own LLM over the prompt,
 conversation history, and whatever step results exist:
 
 - **No steps ran** (a plain question, or a turn already answered by
@@ -197,11 +281,17 @@ conversation history, and whatever step results exist:
   retries, a templated one-liner is used as a last resort — the request
   must never come back with no message at all.
 
-## 5. opencode + GitHub MCP integration
+## 5. opencode + GitHub MCP integration (on-call agent)
 
 opencode does all the actual analysis/editing/test-running *and* the
 GitHub PR operations — the latter via opencode's own built-in MCP client
 pointed at the public GitHub MCP server, not a custom Python MCP client.
+The subprocess/event-parsing/tracing mechanics described below (process
+invocation, `--format json` NDJSON parsing, `_build_trace`) live in
+`common/opencode_runtime.py` and are shared verbatim with the Jenkins
+agent (§5b) — only the scoped agent definitions and per-request config
+(`write_config`) are agent-kind-specific, in each agent's own thin
+`tools/opencode_cli.py`.
 
 - **Per-request `opencode.json`**, written into the cloned repo right
   after clone and torn down with the rest of the sandbox:
@@ -229,7 +319,7 @@ pointed at the public GitHub MCP server, not a custom Python MCP client.
   `--auto` (auto-approve anything not explicitly denied) is a backstop;
   agent permission blocks only ever use `allow`/`deny`, never `ask`, since
   nothing is present to answer a prompt.
-- **Output parsing** (`tools/opencode_cli.py:_parse_events`) reads
+- **Output parsing** (`common/opencode_runtime.py:_parse_events`) reads
   `--format json`'s NDJSON event stream: each line's `part.type` is
   `"text"` or `"tool"` (tool parts carry `tool`/`callID`/
   `state.{status,input,output,error}`); a fatal error arrives as a
@@ -246,9 +336,90 @@ is constructed per call since the key is per-request, never global.
 Unrelated to opencode's own LLM calls, which it manages itself via
 `provider.apiKey` in the per-request `opencode.json`.
 
-## 6. Repo caching & dynamic branches
+## 5b. opencode + Jenkins MCP integration (Jenkins agent)
 
-Two related requirements: many requests target the same repo over time
+The Jenkins agent has no repo of its own and clones nothing — every real
+action against a target Jenkins goes through opencode's built-in MCP
+client pointed at *that Jenkins's own* [MCP Server
+plugin](https://plugins.jenkins.io/mcp-server/) (`jenkins_agent/
+tools/opencode_cli.py:write_config`, mirroring the on-call agent's GitHub
+MCP wiring in §5). Jenkins connection details (base URL, auth, CA bundle)
+are **not** deployment config — they travel per-request in the `jenkins`
+`DataPart`, exactly like the on-call agent's `repo` block (see
+`docs/DEVELOPER_GUIDE.md`).
+
+**Capabilities**: `resolve_target` (turns the prompt into a concrete
+job/build) → `inspect` (status/history/queue questions) or `diagnose`
+(failure analysis, same `SUMMARY:`-marker + enforcement-retry pattern as
+the on-call agent's `generate_change`) → `propose_action` (resolves a
+requested change into a `pending_action`, never executes) → `execute_action`
+(the only capability allowed to actually trigger or stop a build).
+
+**The confirm-before-execute gate is enforced twice, independently:**
+
+1. **Structurally, in opencode's own permission scoping.** Every
+   capability except `execute_action` runs as the `ari-jenkins-read`
+   opencode agent, which has every `jenkins_*` MCP tool denied outright —
+   a mutating call is refused by opencode itself regardless of what the
+   model attempts. Only `execute_action` runs as `ari-jenkins-act`, the
+   one agent with `jenkins_*` allowed.
+2. **Structurally, in `execute_action.py`'s own code.** It refuses to run
+   at all unless `ctx.params` already carries a concrete, non-stale
+   (< 30 minutes old) confirmed `action`/`job`/`parameters` — never
+   inferred from a bare "yes". Carrying a prior `propose_action`'s exact
+   `pending_action` fields into a later confirmation turn's params is the
+   planner's job (its domain guidance says so explicitly); if there's
+   nothing concrete to confirm, `execute_action` should never have been
+   scheduled, and it fails loudly rather than guessing.
+
+Stopping a build goes through a **direct REST call**
+(`jenkins_agent/tools/jenkins_rest.py`), not opencode+MCP — confirmed live
+against a real Jenkins (below) that the plugin's tool list has no
+stop/cancel tool at all, so this isn't a workaround for an untested edge
+case, it's the only way to stop a build. Triggering goes through
+opencode+MCP. Mutations are never auto-retried by the engine (`configs/
+jenkins/capabilities.yaml`'s `retry.max_attempts: 1` for `execute_action`)
+— a timed-out trigger may have already succeeded, and a duplicate build
+is worse than surfacing the timeout.
+
+**Verified live** against a real Jenkins instance (2026-09-18, Jenkins
+2.568.3, MCP Server plugin 0.203.v12a_6f2a_01d72 — see `docs/MEMORY.md`
+for the full session): the plugin's real MCP endpoint
+(`{base_url}/mcp-server/mcp`) is a streamable-HTTP JSON-RPC transport
+(`initialize` → `Mcp-Session-Id` response header → `notifications/
+initialized` → `tools/list`, the latter returned as a single SSE `data:`
+event, not plain JSON). It exposes exactly 19 tools, each carrying the
+plugin's own `readOnlyHint`/`destructiveHint` annotations: 15 read-only
+(`getJob`, `getJobs`, `getBuild`, `getBuildLog`, `searchBuildLog`,
+`getQueueItem`, `getTestResults`, `whoAmI`, `getStatus`, `getJobScm`,
+`getBuildScm`, `getBuildChangeSets`, `findJobsWithScmUrl`,
+`getFlakyFailures`, `getReplayScripts`) and exactly 4 destructive
+(`triggerBuild`, `updateBuild`, `rebuildBuild`, `replayBuild`) — confirming
+there is genuinely no stop/cancel tool. Separately, opencode's own docs
+were checked directly and confirm its MCP tool-naming rule verbatim:
+*"MCP server tools are registered with server name as prefix... use
+`mymcpservername_*`"* — so this codebase's `"jenkins_*": false` deny
+pattern for `ari-jenkins-read` matches real behavior, not just an analogy
+to GitHub's `github_*` (the previous state of this doc's caveat).
+
+**Not yet verified live**, because it requires an actual `opencode run`
+against a real Jenkins with real credentials, which the same session
+could not complete (Claude Code's own safety classifier blocks writing
+real secrets into `opencode.json`, and running it manually was deferred
+by the operator): that the `jenkins_*` deny pattern is actually *applied*
+at runtime by this specific opencode version against this specific MCP
+server (docs confirm the rule; never observed in a live log), and
+correctness of any capability's actual output (`resolve_target`/
+`inspect`/`diagnose`/`propose_action`) against a real job. `execute_action`
+has had zero real runs of any kind. See `scripts/jenkins_agent_local_test.py`
+for the harness built to close this gap — it deliberately only wires the
+four read-only capabilities.
+
+## 6. Repo caching & dynamic branches (on-call agent)
+
+On-call-agent-specific — the Jenkins agent has no repo of its own, so
+none of this applies to it (§5b). Two related requirements: many requests
+target the same repo over time
 (repeat incidents against the same service), so re-cloning from the
 remote every time wastes time/bandwidth/disk; and a single prompt can name
 *different* branches for "where to work from" and "what to open the PR
@@ -291,38 +462,83 @@ branches and sets these params.
 `repo.url` can also be a local filesystem path, not just a network
 remote — git supports this natively.
 
-## 7. Deployment image
+## 7. Deployment images
 
-One `Dockerfile`, two entrypoints (`uvicorn ari_agent.main:app` for the
-API, `python -m ari_agent.orchestration.worker` for the worker) — same
-image, same dependencies, since capabilities/tools/planner are shared
-code.
+Three dedicated Dockerfiles at the repo root, not one dual-entrypoint
+image — chosen so each process only carries the toolchain it actually
+needs, and so the two agent kinds' worker images can differ completely
+without bloating either:
 
-Built on `python:3.12-slim`, plus:
+- **`Dockerfile.api`** — the FastAPI/A2A process (`uvicorn api.main:app`).
+  Agent-kind-agnostic and shared by both agent kinds' API Deployments
+  (which agent kind's card/skill it serves is pure runtime config —
+  `AGENT_KIND`/`AGENT_NAME`/`AGENT_PUBLIC_URL`, verified live: the same
+  built image returns a different `description` depending only on
+  `AGENT_KIND`). Just `python:3.12-slim` + `pip install .` — this process
+  never shells out to git/opencode/a build toolchain itself, only the
+  worker does.
+- **`Dockerfile.oncall`** — the on-call agent's worker (`python -m
+  api.worker`, `AGENT_KIND=oncall`). Carries everything §5's opencode
+  integration and `verify` need:
+  - **`git`, `curl`, `ca-certificates`** — `clone_repo` and friends shell
+    out to `git` directly. `git config --system --add safe.directory '*'`
+    is also set at build time, since cloning a directory owned by a
+    different user than the container process (e.g. a bind-mounted host
+    path) otherwise hits git's "detected dubious ownership" refusal —
+    this must be real git config, not a per-command `-c` override.
+  - **Node.js 22 + `opencode-ai`** pinned to an exact version — floating
+    to `latest` would silently invalidate the behavior this agent's
+    opencode integration (§5) was built and verified against; bump the
+    pin deliberately and re-verify.
+  - **`golang-go` + `openjdk-21-jdk-headless` + `maven`** — needed for
+    `verify` to build/test *target* repos written in Go or Java, not for
+    ARI itself. A deliberate, bounded bet: Go/Java/Node/Python are the
+    languages this agent has actually been exercised against. Not full
+    multi-language coverage — a target repo needing Rust, .NET, etc. will
+    clone/analyze/fix fine (opencode doesn't need the target's own
+    toolchain for that) but `verify` will fail with "command not found,"
+    correctly surfaced as a real failure rather than silently succeeding.
+    Extend this list as real requests need more languages, or revisit
+    with a per-request build sandbox (Docker-outside-of-Docker or an
+    external build service) if the language spread outgrows "just add it
+    to the image."
+- **`Dockerfile.jenkins`** — the Jenkins agent's worker (`python -m
+  api.worker`, `AGENT_KIND=jenkins`). Deliberately much smaller: only
+  Node.js 22 + the same pinned `opencode-ai` version, no git and none of
+  the build toolchain above — this agent never clones or builds anything
+  (§5b), so none of that is needed.
 
-- **`git`, `curl`, `ca-certificates`** — `clone_repo` and friends shell
-  out to `git` directly. `git config --system --add safe.directory '*'`
-  is also set at build time, since cloning a directory owned by a
-  different user than the container process (e.g. a bind-mounted host
-  path) otherwise hits git's "detected dubious ownership" refusal — this
-  must be real git config, not a per-command `-c` override.
-- **Node.js 22 + `opencode-ai`** pinned to an exact version — floating to
-  `latest` would silently invalidate the behavior this agent's opencode
-  integration (§5) was built and verified against; bump the pin
-  deliberately and re-verify.
-- **`golang-go` + `openjdk-21-jdk-headless` + `maven`** — needed for
-  `verify` to build/test *target* repos written in Go or Java, not for
-  ARI itself. A deliberate, bounded bet: Go/Java/Node/Python are the
-  languages this agent has actually been exercised against. Not full
-  multi-language coverage — a target repo needing Rust, .NET, etc. will
-  clone/analyze/fix fine (opencode doesn't need the target's own toolchain
-  for that) but `verify` will fail with "command not found," correctly
-  surfaced as a real failure rather than silently succeeding. Extend this
-  list as real requests need more languages, or revisit with a
-  per-request build sandbox (Docker-outside-of-Docker or an external build
-  service) if the language spread outgrows "just add it to the image."
+**Helm chart** (`insightfinder/charts`, `charts/oncallari`): each agent
+kind is an independently toggleable block (`ariOncallAgent.enabled`,
+`ariJenkinsAgent.enabled`) with its own api+worker Deployment pair, own
+Secret, Service, and Ingress, and its own Temporal namespace/task queue
+(`oncall-ari-agent`/`oncall-ari-queue` and `jenkins-ari-agent`/
+`jenkins-ari-queue` respectively) against one shared Temporal dev server.
+Both agent kinds' API Deployments reference the same `Dockerfile.api`
+image (different `.api.image` value in the chart only because the chart
+allows pinning them independently, not because the image differs); each
+agent kind's worker Deployment references its own dedicated worker image.
+This chart currently only supports "Mode A": a fully separate API+worker
+Deployment pair per agent kind. A single shared API process serving
+multiple agent kinds behind one Deployment ("Mode B") would need
+`api/main.py` itself to mount multiple agent kinds' A2A apps under path
+prefixes in one process — not implemented, so there's no chart toggle for
+it yet.
 
 ## 8. Known limitations
+
+**Resolved since earlier versions of this doc** (kept here only as a
+pointer — see `docs/MEMORY.md` for what was actually wrong and how each
+was fixed): secrets in Temporal's event history are no longer plaintext
+(field-level `EncryptionCodec` masks `api_key`/`pat`/`ssh_key` values
+only, leaving the rest of the payload readable in the Temporal UI by
+design); a failed capability no longer skips `cleanup_workspace`/
+`respond`; `publish_pr`'s PR title/body quality bug (twice — the second
+fix detects-and-retries instead of falling back to raw narration);
+`publish_pr`'s real ~200s redundant-re-read bottleneck (found via the
+tracing below, not a guess).
+
+**Still open, on-call agent:**
 
 - **gRPC transport** not implemented — needs its own server process/port
   and `grpcio`/`grpcio-tools` dependencies. Deferred, not abandoned.
@@ -333,14 +549,34 @@ Built on `python:3.12-slim`, plus:
   `BasePushNotificationSender`'s concern, not audited here.
 - **No repo-cache eviction/GC** — fine for a bounded set of well-known
   repos.
-- **Secrets in Temporal's event history are not encrypted.** Temporal
-  persists activity/workflow *inputs* as plain base64 in its event
-  history, decodable via the Temporal UI/API. Since `RequestConfig` (LLM
-  key, repo PAT) is passed as workflow input, every secret in a request is
-  currently readable by anyone with Temporal UI/API access to the
-  namespace. Needs a Temporal **Payload Codec** (encrypting data
-  converter) before any non-local deployment — a real gap, not
-  hypothetical.
 - Concurrency/volume expectations are not yet established — informs
   worker replica count and Temporal task-queue sizing.
 - Git providers beyond GitHub/GitLab are untested.
+
+**Still open, Jenkins agent** (see §5b for what *is* verified):
+
+- **No jenkins_agent capability has completed a real end-to-end run** —
+  everything verified so far is at the raw MCP-protocol/plugin level, not
+  through an actual `opencode run`. `execute_action` in particular has
+  never run at all, against anything.
+- **`JenkinsConfig.allow_mutations`** (`jenkins_agent/schemas.py`) is
+  design intent only — nothing in code enforces it today. The only real
+  enforcement is the two-layer gate in §5b (opencode's own tool
+  permissions, plus `execute_action`'s own confirmed-action check); a
+  request-level "force read-only regardless of what the token could do"
+  switch doesn't exist yet.
+- **No Jenkins-side RBAC recommendation is enforced by this codebase** —
+  the design assumes a caller *may* supply a restricted, read-only
+  service-account token, but nothing here requires or checks that. A
+  token belonging to a full-access account gets exactly the same
+  treatment; Jenkins's own permissions are the only backstop in that
+  case, not anything in this agent.
+- **TLS/CA-bundle env var handling for opencode's Node MCP client**
+  (`NODE_EXTRA_CA_CERTS`/`NODE_TLS_REJECT_UNAUTHORIZED` in `tls_env()`) is
+  Node's own documented mechanism but has never been exercised against a
+  real self-signed/private-CA Jenkins.
+- **A single Jenkins request travels over plain HTTP** if `jenkins.
+  base_url` is `http://` (as the one real instance checked so far is) —
+  the Basic-auth header goes over the wire unencrypted in that case. Not
+  a code gap to fix here; a deployment/network concern for whoever
+  configures `base_url`.

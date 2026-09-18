@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from a2a.types import Message, Part, Role, Task, TaskState, TaskStatus  # noqa: E402
 
-from ari_agent.a2a_server.executor import (  # noqa: E402
+from common.a2a_server.executor import (  # noqa: E402
     _dict_to_part,
     _extract_config,
     _extract_history,
@@ -96,7 +96,7 @@ async def test_publish_result_completed_with_pr_and_root_cause():
         "status": "completed",
         "message": "Opened PR #1",
         "root_cause": {"summary": "npe", "evidence": []},
-        "pr": {"url": "https://github.com/x/y/pull/1", "branch": "ari/fix-1"},
+        "pull_request": {"url": "https://github.com/x/y/pull/1", "branch": "ari/fix-1"},
     }
 
     await _publish_result(updater, result)

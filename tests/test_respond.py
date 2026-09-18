@@ -6,9 +6,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent.capabilities import respond  # noqa: E402
-from ari_agent.capabilities.base import StepContext  # noqa: E402
-from ari_agent.capabilities.registry import catalog  # noqa: E402
+from common import respond  # noqa: E402
+from common.capabilities_base import StepContext  # noqa: E402
+from common.capabilities_registry import catalog  # noqa: E402
 
 
 def _ctx(prompt, results, params, history=None, tools=None):
@@ -96,5 +96,5 @@ def test_system_prompt_forbids_dangling_follow_up_questions():
     # this agent doesn't implement a paused "waiting on you" task state.
     # This rule must stay in the prompt regardless of how the caller is
     # waiting for the result (blocking, polling, or a webhook).
-    assert "NEVER end with a question" in respond._SYSTEM_PROMPT
-    assert "plain recommendation" in respond._SYSTEM_PROMPT
+    assert "NEVER end with a question" in respond._SYSTEM_PROMPT_TEMPLATE
+    assert "plain recommendation" in respond._SYSTEM_PROMPT_TEMPLATE

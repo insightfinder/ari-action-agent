@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent.tools.git_ops import changed_files, default_branch, diff  # noqa: E402
+from ari_oncall_agent.tools.git_ops import changed_files, default_branch, diff  # noqa: E402
 
 
 def _run(*args, cwd):

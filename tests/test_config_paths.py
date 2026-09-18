@@ -16,14 +16,16 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent import config_paths  # noqa: E402
+from common import config_paths  # noqa: E402
 
 
 def test_finds_the_repos_own_configs_from_the_source_tree():
     # No override, no cwd games: the checkout this test runs from must resolve.
+    # Each agent kind lives under its own subdirectory (configs/<kind>/) —
+    # "oncall" here, the default.
     found = config_paths.configs_dir()
-    assert (found / "capabilities.yaml").is_file()
-    assert (found / "tools.yaml").is_file()
+    assert (found / "oncall" / "capabilities.yaml").is_file()
+    assert (found / "oncall" / "tools.yaml").is_file()
 
 
 def test_env_override_wins_over_everything_else(tmp_path, monkeypatch):
@@ -37,7 +39,7 @@ def test_env_override_is_ignored_when_it_does_not_exist(tmp_path, monkeypatch):
     # through is what keeps a misconfigured deployment bootable.
     monkeypatch.setenv("ARI_CONFIGS_DIR", str(tmp_path / "nope"))
     assert config_paths.configs_dir() != tmp_path / "nope"
-    assert (config_paths.configs_dir() / "capabilities.yaml").is_file()
+    assert (config_paths.configs_dir() / "oncall" / "capabilities.yaml").is_file()
 
 
 def test_falls_back_to_the_working_directory(tmp_path, monkeypatch):
@@ -70,4 +72,9 @@ def test_error_names_every_location_it_tried(monkeypatch):
 
 
 def test_config_file_joins_onto_the_resolved_directory():
-    assert config_paths.config_file("tools.yaml") == config_paths.configs_dir() / "tools.yaml"
+    # Defaults to settings.agent_kind ("oncall" unless AGENT_KIND is set).
+    assert config_paths.config_file("tools.yaml") == config_paths.configs_dir() / "oncall" / "tools.yaml"
+
+
+def test_config_file_resolves_under_an_explicit_agent_kind():
+    assert config_paths.config_file("tools.yaml", agent_kind="jenkins") == config_paths.configs_dir() / "jenkins" / "tools.yaml"

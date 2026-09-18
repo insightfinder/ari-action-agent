@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent.llm import client as llm_client  # noqa: E402
+from common.llm import client as llm_client  # noqa: E402
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,26 @@
-# Developer Guide — calling the ARI On-Call Agent over A2A
+# Developer Guide — calling the ARI agents over A2A
 
-This agent is a genuine [A2A (Agent2Agent) protocol](https://a2a-protocol.org)
-server, built on the official [`a2a-sdk`](https://pypi.org/project/a2a-sdk/)
-(a Linux Foundation project). It serves both the **JSON-RPC** and
-**REST/HTTP+JSON** transports the spec defines. (gRPC is a deliberate,
-separate follow-up — see `docs/design.md` §6.) Everything below is verified
-against a real running instance, not just read off the spec — exact request/
-response bodies are copied from real captured traffic, not hand-written.
+There are two agent kinds on this codebase today, each its own A2A server
+deployment with its own base URL and Agent Card: the **on-call agent**
+(§1–§8 below — clones a repo, fixes it, opens a PR) and the **Jenkins
+agent** (§9 — reads/diagnoses a Jenkins job or build, proposes and, once
+confirmed, executes a change). Both are genuine
+[A2A (Agent2Agent) protocol](https://a2a-protocol.org) servers, built on
+the official [`a2a-sdk`](https://pypi.org/project/a2a-sdk/) (a Linux
+Foundation project), serving both the **JSON-RPC** and **REST/HTTP+JSON**
+transports the spec defines (gRPC is a deliberate, separate follow-up —
+see `docs/design.md` §2), and everything about §1–§8 (discovery, auth,
+`message/send`, the three response patterns, cancellation, errors)
+applies identically to the Jenkins agent — only the Agent Card content
+and the config `DataPart` shape differ, which §9 covers.
+
+Everything below for the on-call agent is verified against a real running
+instance, not just read off the spec — exact request/response bodies are
+copied from real captured traffic, not hand-written. The Jenkins agent's
+own MCP integration has been verified at the protocol level against a
+real production Jenkins (see `docs/MEMORY.md`, 2026-09-18) but **not yet
+through an actual end-to-end A2A call** — §9's examples are illustrative
+of the intended shape, not captured live traffic.
 
 If you already have an A2A client library, you can likely skip straight to
 [§5 Config `DataPart` shape](#5-this-agents-config-datapart-shape) — that's
@@ -283,4 +297,117 @@ pip install httpx
 OPENAI_API_KEY=sk-... python docs/examples/sample_client.py chat
 OPENAI_API_KEY=sk-... GITHUB_PAT=ghp_... python docs/examples/sample_client.py task-poll
 OPENAI_API_KEY=sk-... GITHUB_PAT=ghp_... python docs/examples/sample_client.py task-webhook
+```
+
+The Jenkins agent has its own sibling example,
+[`docs/examples/jenkins_sample_client.py`](examples/jenkins_sample_client.py)
+— see §9.
+
+## 9. The Jenkins agent
+
+A separate deployment, own base URL, own Agent Card (`skills[0].id ==
+"jenkins_read_diagnose_act"`) — but the same `message/send` operation and
+the same three response patterns as §3. Only the config `DataPart` shape
+differs.
+
+### Config `DataPart` shape
+
+```jsonc
+{
+  "jenkins": {
+    "base_url": "https://jenkins.example.com",
+    "auth": {
+      "type": "api_token",        // or "bearer", "basic"
+      "user": "svc-ari-jenkins",  // required for api_token/basic
+      "token": "..."
+    },
+    "verify_tls": true,
+    "ca_bundle": null,             // optional — PEM content (not a path), for a private/internal CA
+    "allow_mutations": true        // design intent only today — not yet enforced in code, see docs/design.md §8
+  },
+  "llm": {
+    "provider": "anthropic",
+    "api_key": "sk-ant-...",
+    "model": "claude-sonnet-5"
+  }
+}
+```
+
+Jenkins connection details are per-request, exactly like the on-call
+agent's `repo` block — never deployment-level config. This is deliberate:
+this agent stores no credentials between requests.
+
+### Reading vs. diagnosing vs. changing something
+
+A plain status/history question ("how's the checkout-service deploy
+job doing?") runs `resolve_target` → `inspect` and answers directly — no
+confirmation needed, nothing mutates. A failure question ("why has the
+nightly build been red since Tuesday?") runs `resolve_target` →
+`diagnose` instead, and the final message includes the diagnosed cause
+with evidence (failing step, first real error line), not just a
+pass/fail restatement.
+
+A requested **change** ("deploy checkout-service to staging", "stop that
+build") never executes on the first turn. It runs `resolve_target` →
+`propose_action`, which resolves the job and every parameter but calls
+nothing mutating (`propose_action`'s opencode agent has every mutating
+Jenkins tool denied outright — see `docs/design.md` §5b), and the
+completed Task carries a `pending_action` artifact:
+
+```json
+{
+  "artifacts": [
+    {
+      "name": "pending_action",
+      "parts": [{ "data": {
+        "id": "b2c1...",
+        "action": "trigger_build",
+        "job": "deploy/checkout-service",
+        "parameters": { "ENV": "staging" },
+        "reasoning": "ENV defaults to \"production\"; user asked for staging explicitly",
+        "jenkins_url": "https://jenkins.example.com",
+        "created_at": "2026-09-18T22:00:00+00:00"
+      }}]
+    }
+  ]
+}
+```
+
+...and the response message asks for confirmation as a plain statement,
+never a dangling question (this agent doesn't implement
+`TASK_STATE_INPUT_REQUIRED` any more than the on-call agent does — see
+§3's note on that).
+
+**To confirm it**, send a follow-up `message/send` in the *same*
+`context_id`, with a plain "yes, go ahead"-style prompt. There is nothing
+automatic about this: the caller (or whatever sits between the caller and
+this agent) is responsible for carrying the exact `pending_action` fields
+from the prior turn's history into this turn — the planner reads
+conversation history and, when it sees a clear confirmation responding to
+a specific prior proposal, schedules `execute_action` with those exact
+`action`/`job`/`parameters` as that step's params. A bare "yes" with no
+matching proposal in history does nothing — `execute_action` refuses to
+run without a concrete confirmed action already in its params (`docs/
+design.md` §5b), and a confirmation more than 30 minutes after the
+proposal is rejected as stale rather than acted on.
+
+Once genuinely confirmed, `execute_action` runs and the completed Task
+carries an `action_result` artifact instead. Stopping a build goes
+through a direct REST call under the hood, not opencode — see
+`docs/design.md` §5b for why (no stop/cancel tool exists in the real
+plugin, confirmed live).
+
+### Sample client
+
+[`docs/examples/jenkins_sample_client.py`](examples/jenkins_sample_client.py)
+demonstrates the read/diagnose/propose flow (agent-card, a status
+question, a failure diagnosis, and a change proposal) — deliberately does
+**not** include a mode that confirms and executes an action, consistent
+with this codebase's general posture of never wiring an automatic
+confirm-and-mutate path in example/test code.
+
+```bash
+pip install httpx
+JENKINS_BASE_URL=https://jenkins.example.com JENKINS_USER=... JENKINS_TOKEN=... \
+  ANTHROPIC_API_KEY=sk-ant-... python docs/examples/jenkins_sample_client.py propose
 ```

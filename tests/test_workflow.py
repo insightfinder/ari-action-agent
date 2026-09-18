@@ -5,7 +5,7 @@ from temporalio.exceptions import ActivityError, ApplicationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent.orchestration.workflow import _activity_failure_detail, _fallback_message  # noqa: E402
+from common.orchestration.workflow import _activity_failure_detail, _fallback_message  # noqa: E402
 
 
 def _activity_error(cause) -> ActivityError:

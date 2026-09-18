@@ -1,0 +1,53 @@
+# Declarative tool registry — the concrete callables capabilities are
+# allowed to invoke. A capability only gets the tools listed under it in
+# capabilities.yaml; this file just resolves a tool name to an implementation.
+#
+# Adding a tool = write the function + add an entry here + list its name
+# under the relevant capability's `tools:` in capabilities.yaml.
+#
+# Note: GitHub PR operations are NOT a separate tool here. opencode itself
+# is configured (per-request, see tools/opencode_cli.py:write_config) with
+# the GitHub MCP server, and only the `ari-publish` opencode agent has
+# those MCP tools enabled. `publish_pr` calls the same `opencode` tool as
+# every other opencode-backed capability — see configs/capabilities.yaml.
+
+tools:
+  git_clone:
+    module: ari_oncall_agent.tools.git_ops
+    function: clone
+
+  git_diff:
+    module: ari_oncall_agent.tools.git_ops
+    function: diff
+
+  git_changed_files:
+    module: ari_oncall_agent.tools.git_ops
+    function: changed_files
+
+  git_set_origin:
+    module: ari_oncall_agent.tools.git_ops
+    function: set_origin
+
+  git_default_branch:
+    module: ari_oncall_agent.tools.git_ops
+    function: default_branch
+
+  repo_cache:
+    module: ari_oncall_agent.tools.repo_cache
+    function: ensure_cache
+
+  repo_cache_and_clone:
+    module: ari_oncall_agent.tools.repo_cache
+    function: ensure_cache_and_clone
+
+  opencode_config:
+    module: ari_oncall_agent.tools.opencode_cli
+    function: write_config
+
+  opencode:
+    module: ari_oncall_agent.tools.opencode_cli
+    function: run_opencode
+
+  llm_complete:
+    module: common.llm.client
+    function: complete
