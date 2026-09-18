@@ -115,3 +115,41 @@ def test_write_config_git_excludes_itself(tmp_path):
     write_config(str(tmp_path), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, {"url": "https://github.com/x/y"})
     exclude = (tmp_path / ".git" / "info" / "exclude").read_text()
     assert "opencode.json" in exclude
+
+
+def test_every_agent_disables_the_task_delegation_tool():
+    # Real bug, not theoretical: opencode's built-in "task" tool lets an
+    # agent delegate to a subagent that runs OUTSIDE the delegating
+    # agent's own `permission` block. A reproduction of ari-change used it
+    # to hand off "commit and open a PR" to a general-purpose subagent
+    # that then ran `gh pr create` — a command ari-change's own bash
+    # permission would have denied outright — and it dominated wall-clock
+    # time (4 delegated calls were ~68% of a ~400s run). Every agent must
+    # disable it explicitly, not rely on a single global default.
+    for name, definition in _AGENT_DEFS.items():
+        assert definition.get("tools", {}).get("task") is False, f"{name} must disable the task tool"
+
+
+def test_write_config_disables_task_tool_globally_too(tmp_path):
+    path = write_config(
+        str(tmp_path), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, {"url": "https://github.com/x/y"}
+    )
+    cfg = json.loads(Path(path).read_text())
+    assert cfg["tools"]["task"] is False
+
+
+def test_ari_analyze_and_ari_change_cannot_commit_or_push():
+    # Only ari-publish should be able to mutate git state (commit/push/
+    # branch) — analyze is read-only by design, and change's job is
+    # editing files, not staging/committing them (that's publish_pr's
+    # instruction to ari-publish: "Stage and commit exactly these files").
+    for name in ("ari-analyze", "ari-change"):
+        bash_perms = _AGENT_DEFS[name]["permission"]["bash"]
+        assert "git *" not in bash_perms, f"{name} must not have blanket git access"
+        assert bash_perms["*"] == "deny"
+        # Only read-only git subcommands may be allowed.
+        for pattern, mode in bash_perms.items():
+            if pattern == "*":
+                continue
+            assert mode == "allow"
+            assert pattern.split()[1].rstrip("*") in {"diff", "status", "log", "show", "blame"}

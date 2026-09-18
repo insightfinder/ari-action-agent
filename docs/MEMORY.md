@@ -1205,3 +1205,106 @@ passed.
 **Not yet redeployed** — both fixes are only in the source tree; needs a
 new image build + rollout, same as everything else pending from this
 session.
+
+## 2026-09-17 — Why a small change took 16 minutes: opencode's `task` tool bypassed permissions entirely
+
+User's question after PR #984: this was a trivial 3-file field-removal, why
+did the pipeline take ~16 minutes (worker logs showed `generate_change`
+alone ran 23:38:24 → 23:47:38, over 9 minutes)? Asked directly to
+investigate by calling opencode itself, not just read code and guess.
+
+**Method:** installed the exact pinned `opencode-ai@1.18.31`, shallow-cloned
+`insightfinder/InsightAgent` to a scratch directory, wrote a real
+`opencode.json` via the actual `write_config()` (not hand-written), and ran
+`ari-change` with the exact instruction `opencode_change.py` would have
+generated, capturing the full NDJSON event stream with per-event
+timestamps — a real trace, not speculation.
+
+**First hypothesis (wrong): monorepo search overhead.** The repo is a
+158-top-level-directory, 670MB monorepo — a plausible reason for slow
+exploration. Ruled out by the actual trace: only 17 direct tool calls (8
+reads, 5 edits, 3 greps, 1 glob), every one correctly scoped to
+`ruckus-agent/`. No wasted monorepo-wide flailing.
+
+**Actual root cause: opencode's built-in `task` tool.** 4 calls to it
+accounted for **~272 of 401 seconds — 68% of the entire run**. Each `task`
+call delegates a sub-goal to a fresh subagent, and inspecting what was
+actually delegated revealed something far more serious than slowness:
+the 2nd and 3rd delegated tasks were literally "check git status / gh auth
+status" and then "**create a branch, commit, and open a pull request**" —
+work that is supposed to be `ari-publish`'s exclusive job. The delegated
+subagent successfully ran `git branch`, `git commit`, and `gh pr create` —
+commands `ari-change`'s own declared `permission.bash` (`{"git *":
+"allow", "*": "deny"}`) should have denied for `gh` outright, and which
+`ari-change` should never be attempting regardless (per
+`capabilities/publish_pr.py`'s own instruction: "Stage and commit exactly
+these files" is stated as *publish's* job).
+
+**This is a real permission-bypass, not just a performance bug.**
+`task`-delegated subagents run with their own permissions, not the
+delegating agent's `permission` block. Confirmed two independent gaps:
+1. The delegated subagent could do things (`gh pr create`) that
+   `ari-change`'s own declared bash permission explicitly would not have
+   allowed — the delegation itself is an escape hatch around whatever
+   scoping an agent is given.
+2. Independent of delegation, `ari-change`'s own bash permission
+   (`"git *": "allow"`) already directly permitted `git commit`/`git
+   push`/`git branch` — commands it was never supposed to need, since
+   `generate_change` never intended to touch git state itself. `git *`
+   also matches destructive commands (`git reset --hard`, `git clean
+   -fdx`) that a code-editing agent has no legitimate reason to run.
+
+**Real incident during the reproduction, disclosed here in full:** the
+scratch clone's `origin` was still the real
+`https://github.com/insightfinder/InsightAgent.git` URL (from `git clone`),
+and this machine has a separately pre-authenticated `gh` CLI session
+(account `neyaadeez`, `repo` scope) — ambient credentials unrelated to
+anything this agent's own request-scoped PAT mechanism controls. The
+delegated subagent's `git push` and `gh pr create` succeeded for real,
+opening **PR #985** on the actual repo as a pure side effect of a local
+diagnostic exercise. Caught immediately by checking `gh pr list` right
+after the reproduction finished; closed the PR and deleted the pushed
+branch (`git push origin --delete ...`) within minutes. No lasting effect,
+but a sharp reminder: any local reproduction against a real repo URL can
+execute for real if ambient host credentials (git credential helpers, a
+logged-in `gh` CLI) are present, regardless of what's explicitly configured
+in the test's own `opencode.json`. The re-verification run afterward used
+an isolated local bare repo as `origin` specifically to make this
+impossible to repeat.
+
+**Fix, in `tools/opencode_cli.py`:**
+- New `_no_delegation_tools()` → `{"task": False}`, applied explicitly on
+  *every* agent's own `tools` block (not just relying on the global
+  default, in case per-agent config replaces rather than merges with it) —
+  `ari-analyze`, `ari-change`, `ari-verify`, and even `ari-publish` (which
+  should do its own git/MCP calls directly, not hand them to an
+  unrestricted subagent). Also added to the top-level `config["tools"]`
+  default for defense in depth.
+- New `_READ_ONLY_GIT_BASH` (`git diff*`/`git status*`/`git log*`/`git
+  show*`/`git blame*` allowed, everything else denied) replaces the old
+  blanket `"git *": "allow"` for `ari-analyze` and `ari-change` — read-only
+  git inspection only; committing/pushing/branching stays exclusive to
+  `ari-publish`, which keeps its own broad `git *` since that actually is
+  its job.
+
+**Verified, with a real before/after comparison, not just unit tests:**
+reran the identical reproduction (same instruction, same repo, isolated
+local `origin` this time) with the fixed `opencode.json` (generated via the
+real `write_config()`, not hand-written) — **401.6s → 186.0s, a 54%
+reduction**, **zero `task` calls**, and the agent made no attempt at all to
+commit, push, or open a PR (correctly staying in its lane now that the
+permission is actually gone, not just discouraged by instruction wording).
+17 tool calls became 32 (14 reads, 9 greps, 8 edits, 1 glob) — more direct
+calls, but each one fast (a few seconds) instead of 4 giant 13–143s
+delegated subagent loops. New tests in `tests/test_opencode_cli.py`: every
+agent disables `task` (and the global default does too); `ari-analyze`/
+`ari-change` have no blanket git access and only the specific read-only
+subcommands are allowed. Full suite: 85 passed.
+
+**Not yet redeployed** — needs a new image build + rollout, same as
+everything else pending. Worth calling out on its own once deployed: this
+is the fix most likely to change real-world behavior beyond "the same
+thing but faster" — it closes an actual capability `ari-change` had
+(committing/pushing to the real authenticated repo, and via delegation,
+running arbitrary commands outside its declared permissions) that nothing
+in this project's design ever intended it to have.
