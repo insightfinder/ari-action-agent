@@ -1438,3 +1438,42 @@ inspection calls before pushing, similar in spirit to what was found in
 
 **Not yet redeployed** — needs a new image build + rollout, same as
 everything else pending.
+
+## 2026-09-18 — The trace paid off immediately: `publish_pr`'s real bottleneck was redundant reads, not GitHub API latency
+
+Deployed the tracing (`2609180054-test`) and reran the same kind of
+request. Real result, pulled straight from Temporal's `ActivityTaskCompleted`
+payload for `publish_pr` (`temporal workflow show --output json`, no
+reproduction needed):
+
+```json
+{"trace": {"elapsed_s": 249.45, "tool_call_total": 14,
+  "tool_call_counts": {"github_create_branch": 1, "github_push_files": 1,
+    "github_create_pull_request": 1, "github_get_me": 1, "read": 10},
+  "slowest_gaps": [{"tool": "github_push_files", "at_s": 219.71, "preceded_by_gap_s": 203.01}, ...]}}
+```
+
+**203 of 249 seconds was one gap, immediately before `github_push_files`.**
+The real GitHub MCP calls (`create_branch` → `push_files` →
+`create_pull_request`) only took ~46s combined — legitimate API latency
+was never the bottleneck. The 10 `read` calls are the tell: `generate_change`
+had changed exactly 10 files, and `ari-publish` read every single one of
+them again before pushing, despite already being given the full diff and
+summary in its instruction. This is the exact question asked the day
+before ("why is publish_pr slow") — answered directly from a real trace
+with zero reproduction, exactly the point of building the tracing.
+
+**Fix:** `publish_pr.py`'s instruction now states explicitly: "The change
+is already made and verified — do not re-read, re-inspect, or re-diff
+these files yourself; the summary and file list given here are already
+everything you need." — a direct, targeted instruction addressing the
+specific redundant behavior the trace revealed, not a guess.
+
+**Verified:** full suite still 89 passed (existing instruction-content
+assertions — "against staging"/"do not ask for the repository" etc. — all
+still hold; only new text was added, nothing removed). **Not yet
+re-verified live** — same as the `generate_change` efficiency-prompt tweak
+earlier, this is a prompt change whose actual effect can only be confirmed
+by a real run's trace, not a unit test. The next real test's
+`data.publish_pr.trace.tool_call_counts.read` should drop from 10 toward 0
+if it works.

@@ -62,9 +62,12 @@ async def run(ctx: StepContext) -> dict:
     instruction = ctx.params.get("instruction") or (
         f"Repository: {_repo_slug(repo_url)} ({repo_url}).\n\n"
         f"{files_clause}"
-        f"Push the committed changes to a new branch (e.g. ari/change-<short-slug>) and open a "
-        f"pull request in that repository against {base_ref} "
-        f"using the github MCP tools — do not ask for the repository, it is given above. "
+        f"The change is already made and verified — do not re-read, re-inspect, or "
+        f"re-diff these files yourself; the summary and file list given here are "
+        f"already everything you need. Go straight to staging exactly the listed "
+        f"files, committing, pushing to a new branch (e.g. ari/change-<short-slug>), "
+        f"and opening a pull request in that repository against {base_ref} using the "
+        f"github MCP tools — do not ask for the repository, it is given above. "
         f"Title: {title!r}. Body: summarize the change below.\n\n{change.get('summary', '')}"
     )
     result = await opencode(ctx, instruction)
