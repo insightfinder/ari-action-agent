@@ -92,6 +92,28 @@ def _dict_to_part(data: dict) -> Part:
     return Part(data=value)
 
 
+def _find_pending_action(task: Task | None, action_id: str) -> dict | None:
+    """Deterministic, non-LLM lookup for resuming a paused
+    TASK_STATE_INPUT_REQUIRED task: scans this Task's own previously
+    published artifacts (via `_publish_result`'s `updater.add_artifact`
+    below) for one whose data carries this exact id. Real and persisted —
+    verified against the installed a2a-sdk (1.1.2): a second message/send
+    for the same non-terminal task_id re-enters `execute()` with
+    `context.current_task.artifacts` reflecting everything an earlier
+    call on this task published, via `InMemoryTaskStore`. No inference:
+    either the id matches something this agent itself proposed, or it
+    doesn't."""
+    if task is None:
+        return None
+    for artifact in task.artifacts:
+        for part in artifact.parts:
+            if part.HasField("data"):
+                data = json_format.MessageToDict(part.data)
+                if data.get("id") == action_id:
+                    return data
+    return None
+
+
 async def _publish_result(updater: TaskUpdater, result: dict) -> None:
     # Every artifact this agent kind declares (agent_meta.artifacts) that
     # `workflow.py` found present on this run — published under that same
@@ -133,8 +155,39 @@ class AriAgentExecutor(AgentExecutor):
         )
         await updater.start_work()
 
+        # A structured, non-conversational confirmation of a prior
+        # pending_action — e.g. jenkins_agent's trigger_build proposal —
+        # rather than the planner inferring one from a plain-text "yes".
+        # See docs/design.md §5b: resolved deterministically against this
+        # same task's own previously published artifacts, never an LLM.
+        confirm_request = config.pop("confirm_pending_action", None)
+        confirmed_action = None
+        if confirm_request:
+            confirmed_action = _find_pending_action(context.current_task, confirm_request.get("id", ""))
+            if confirmed_action is None:
+                await updater.failed(
+                    message=updater.new_agent_message(
+                        [
+                            Part(
+                                text=(
+                                    f"Could not find a pending action with id "
+                                    f"{confirm_request.get('id')!r} to confirm in this conversation — "
+                                    "it may be stale, already handled, or this isn't the right "
+                                    "conversation. Ask again and I'll propose it fresh."
+                                )
+                            )
+                        ]
+                    )
+                )
+                return
+
         settings = get_settings()
-        workflow_input = {"prompt": prompt, "history": history, "config": config}
+        workflow_input = {
+            "prompt": prompt,
+            "history": history,
+            "config": config,
+            "confirmed_action": confirmed_action,
+        }
 
         try:
             client = await get_temporal_client()

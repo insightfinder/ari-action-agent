@@ -24,7 +24,9 @@ _JENKINS_CONFIG = {
 }
 
 
-def _ctx(capability: str, results: dict, tools: dict, params: dict | None = None) -> StepContext:
+def _ctx(
+    capability: str, results: dict, tools: dict, params: dict | None = None, confirmed: bool = False
+) -> StepContext:
     return StepContext(
         request_id="req-1",
         workspace="/tmp/ws",
@@ -37,6 +39,7 @@ def _ctx(capability: str, results: dict, tools: dict, params: dict | None = None
         params=params or {},
         results=results,
         tools=tools,
+        confirmed=confirmed,
     )
 
 
@@ -130,6 +133,42 @@ async def test_propose_action_extracts_the_proposal_json_into_a_pending_action()
 
 
 @pytest.mark.asyncio
+async def test_propose_action_flags_trigger_build_as_requiring_approval():
+    opencode = AsyncMock(
+        return_value={
+            "text": (
+                "PROPOSAL_JSON:\n"
+                '{"action": "trigger_build", "job": "deploy/checkout-service", "parameters": {}}'
+            ),
+            "trace": _STUB_TRACE,
+        }
+    )
+    ctx = _ctx("propose_action", results={}, tools={"opencode_config": Mock(), "opencode": opencode})
+
+    result = await propose_action.run(ctx)
+
+    assert result["requires_approval"] is True
+
+
+@pytest.mark.asyncio
+async def test_propose_action_does_not_flag_stop_build_as_requiring_approval():
+    opencode = AsyncMock(
+        return_value={
+            "text": (
+                "PROPOSAL_JSON:\n"
+                '{"action": "stop_build", "job": "deploy/checkout-service", "build_number": 42}'
+            ),
+            "trace": _STUB_TRACE,
+        }
+    )
+    ctx = _ctx("propose_action", results={}, tools={"opencode_config": Mock(), "opencode": opencode})
+
+    result = await propose_action.run(ctx)
+
+    assert result["requires_approval"] is False
+
+
+@pytest.mark.asyncio
 async def test_propose_action_raises_clearly_when_no_proposal_json_found():
     opencode = AsyncMock(return_value={"text": "I couldn't figure out which job you mean.", "trace": _STUB_TRACE})
     ctx = _ctx("propose_action", results={}, tools={"opencode_config": Mock(), "opencode": opencode})
@@ -171,6 +210,7 @@ async def test_execute_action_triggers_via_opencode_with_exact_confirmed_paramet
         results={},
         tools={"opencode_config": Mock(), "opencode": opencode},
         params={"action": "trigger_build", "job": "deploy/checkout-service", "parameters": {"ENV": "staging"}},
+        confirmed=True,
     )
 
     result = await execute_action.run(ctx)
@@ -179,6 +219,45 @@ async def test_execute_action_triggers_via_opencode_with_exact_confirmed_paramet
     assert "deploy/checkout-service" in instruction
     assert "ENV" in instruction and "staging" in instruction
     assert result["result"]["action"] == "trigger_build"
+
+
+@pytest.mark.asyncio
+async def test_execute_action_refuses_trigger_build_without_the_structural_confirmed_flag():
+    # The hard gate: even fully well-formed params (as if the planner had
+    # somehow reconstructed them from a conversational "yes") must not be
+    # enough on their own -- ctx.confirmed is what execute_action actually
+    # checks, and the planner's own JSON output has no way to set it.
+    opencode = AsyncMock(return_value={"text": "triggered", "trace": _STUB_TRACE})
+    ctx = _ctx(
+        "execute_action",
+        results={},
+        tools={"opencode_config": Mock(), "opencode": opencode},
+        params={"action": "trigger_build", "job": "deploy/checkout-service", "parameters": {"ENV": "staging"}},
+        confirmed=False,
+    )
+
+    with pytest.raises(RuntimeError, match="requires the structured confirm_pending_action"):
+        await execute_action.run(ctx)
+    opencode.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_action_stop_build_is_unaffected_by_the_confirmed_flag():
+    # "all other actions should be fine" -- stop_build must keep working
+    # exactly as before regardless of ctx.confirmed.
+    stop_build = AsyncMock()
+    ctx = _ctx(
+        "execute_action",
+        results={},
+        tools={"jenkins_stop_build": stop_build},
+        params={"action": "stop_build", "job": "deploy/checkout-service", "build_number": 42},
+        confirmed=False,
+    )
+
+    result = await execute_action.run(ctx)
+
+    stop_build.assert_awaited_once_with(_JENKINS_CONFIG, "deploy/checkout-service", 42)
+    assert result["result"]["action"] == "stop_build"
 
 
 @pytest.mark.asyncio

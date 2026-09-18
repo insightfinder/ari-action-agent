@@ -6,6 +6,7 @@ pure so it can safely run in Temporal's workflow sandbox.
 import structlog
 from temporalio import activity
 
+from common.agent_meta import get_agent_meta
 from common.capabilities_base import StepContext
 from common.capabilities_registry import get_capability, run_capability
 from common.planner import create_plan
@@ -29,7 +30,36 @@ async def cleanup_workspace(request_id: str) -> None:
 async def plan_task(payload: dict) -> dict:
     """Produces the step plan and enriches each step with its capability's
     retry/on_failure policy from the capability registry, so `workflow.py`
-    never has to load the registry itself (keeps it sandbox-safe)."""
+    never has to load the registry itself (keeps it sandbox-safe).
+
+    A `confirmed_action` in the payload (set by a2a_server/executor.py
+    once it's resolved a structured confirm_pending_action against a
+    paused task's own artifacts — see docs/design.md §5b) bypasses the
+    LLM planner entirely: no `create_plan()` call, no model in the loop
+    for this decision at all. The resulting step's `confirmed: True` is
+    what execute_action.py's trigger_build gate actually checks — the
+    normal branch below always sets `confirmed: False`, and the LLM's own
+    JSON output has no way to set this field itself (it only ever
+    populates a step's `params`, never a sibling top-level key)."""
+    confirmed_action = payload.get("confirmed_action")
+    if confirmed_action:
+        capability_name = get_agent_meta().confirm_capability
+        if not capability_name:
+            raise RuntimeError("plan_task: confirmed_action given but this agent kind has no confirm_capability")
+        spec = get_capability(capability_name)
+        return {
+            "steps": [
+                {
+                    "capability": capability_name,
+                    "params": confirmed_action,
+                    "retry": {"max_attempts": spec.retry.max_attempts, "backoff_seconds": spec.retry.backoff_seconds},
+                    "on_failure": spec.on_failure.model_dump() if spec.on_failure else None,
+                    "confirmed": True,
+                }
+            ],
+            "rationale": "resuming a confirmed pending action",
+        }
+
     plan = await create_plan(payload["prompt"], payload["config"], payload.get("history", []))
     enriched_steps = []
     for step in plan.steps:
@@ -41,6 +71,7 @@ async def plan_task(payload: dict) -> dict:
                 "params": step.params,
                 "retry": {"max_attempts": spec.retry.max_attempts, "backoff_seconds": spec.retry.backoff_seconds},
                 "on_failure": on_failure.model_dump() if on_failure else None,
+                "confirmed": False,
             }
         )
     return {"steps": enriched_steps, "rationale": plan.rationale}
@@ -57,6 +88,7 @@ async def execute_step(payload: dict) -> dict:
         params=payload["params"],
         results=payload["results"],
         history=payload.get("history", []),
+        confirmed=payload.get("confirmed", False),
     )
     logger.info("execute_step", request_id=ctx.request_id, capability=payload["capability"])
     return await run_capability(payload["capability"], ctx)

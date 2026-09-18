@@ -28,6 +28,13 @@ class StepContext:
     results: dict[str, Any]  # prior steps' outputs, keyed by capability name
     history: list[dict[str, Any]] = field(default_factory=list)  # chat turns, [] for task requests
     tools: dict[str, Callable] = field(default_factory=dict)
+    # True only when this step came from orchestration/activities.py's
+    # plan_task bypass branch (a resolved, structured confirm_pending_action
+    # from a2a_server/executor.py) — never from the LLM planner, which only
+    # ever populates `params`, not this field. execute_action.py's
+    # trigger_build gate checks this, not anything in `params`, so it can't
+    # be spoofed by a planner's own JSON output.
+    confirmed: bool = False
 
     def tool(self, name: str) -> Callable:
         return self.tools[name]

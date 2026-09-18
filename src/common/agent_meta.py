@@ -46,6 +46,14 @@ class AgentMeta:
     # string, not a tuple, so an agent package can declare it as plain
     # data with no imports needed.
     artifacts: dict[str, str] = field(default_factory=dict)
+    # Which capability a resolved `confirmed_action` (a2a_server/
+    # executor.py's structured, non-LLM resume of a paused
+    # TASK_STATE_INPUT_REQUIRED task) should run — orchestration/
+    # activities.py's plan_task reads this to build a one-step plan
+    # directly, bypassing the LLM planner entirely for that turn. None
+    # for an agent kind that never pauses for human-in-the-loop
+    # confirmation (e.g. oncall).
+    confirm_capability: str | None = None
 
 
 def _agent_package(agent_kind: str) -> str:

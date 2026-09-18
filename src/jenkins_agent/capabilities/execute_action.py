@@ -66,6 +66,20 @@ async def run(ctx: StepContext) -> dict:
     confirmed = _require_confirmed_action(ctx)
     jenkins = ctx.config["jenkins"]
 
+    if confirmed["action"] == "trigger_build" and not ctx.confirmed:
+        # The hard gate: trigger_build may only run via a2a_server/
+        # executor.py's structured confirm_pending_action resume (which
+        # sets StepContext.confirmed via orchestration/activities.py's
+        # plan_task bypass branch), never via the planner's own inferred
+        # "yes, go ahead" scheduling of this step. ctx.confirmed is not
+        # reachable from ctx.params, so nothing in the planner's own JSON
+        # output can set it — see docs/design.md §5b.
+        raise RuntimeError(
+            "execute_action: trigger_build requires the structured confirm_pending_action "
+            "flow (a follow-up message/send confirming this task's pending_action id), not "
+            "a conversational reply. Propose it again and confirm via that flow."
+        )
+
     if confirmed["action"] == "stop_build":
         if confirmed["build_number"] is None:
             raise RuntimeError("execute_action: a confirmed stop_build requires a build_number")

@@ -64,4 +64,9 @@ instruction on its own; if there's nothing concrete to confirm, ask via \
         "pending_action": "propose_action.pending_action",
         "action_result": "execute_action.result",
     },
+    # trigger_build is the only action gated behind the hard
+    # TASK_STATE_INPUT_REQUIRED confirm flow (see propose_action.py's
+    # requires_approval and execute_action.py's ctx.confirmed check) —
+    # both resolve through this same capability once confirmed.
+    confirm_capability="execute_action",
 )

@@ -58,6 +58,9 @@ def _fallback_message(status: str, results: dict[str, Any], failure_reason: str 
         if artifacts:
             return "Completed: " + ", ".join(f"{k}: {v}" for k, v in artifacts.items())
         return "Completed."
+    if status == "needs_approval":
+        artifacts = _artifacts(results)
+        return "Awaiting confirmation before proceeding: " + ", ".join(f"{k}: {v}" for k, v in artifacts.items())
     return "No action was needed for this request."
 
 
@@ -119,7 +122,12 @@ class AriAgentWorkflow:
             try:
                 plan = await workflow.execute_activity(
                     "plan_task",
-                    {"prompt": request["prompt"], "config": config, "history": history},
+                    {
+                        "prompt": request["prompt"],
+                        "config": config,
+                        "history": history,
+                        "confirmed_action": request.get("confirmed_action"),
+                    },
                     start_to_close_timeout=timedelta(minutes=2),
                     retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=5)),
                 )
@@ -158,6 +166,7 @@ class AriAgentWorkflow:
                         "capability": capability,
                         "params": step.get("params", {}),
                         "results": results,
+                        "confirmed": step.get("confirmed", False),
                     },
                     start_to_close_timeout=timedelta(minutes=20),
                     retry_policy=RetryPolicy(
@@ -172,6 +181,17 @@ class AriAgentWorkflow:
                 break
 
             results[capability] = step_result
+
+            # A step can request a hard human-in-the-loop pause (e.g.
+            # jenkins_agent's propose_action for a trigger_build) — this
+            # ends the run here as a genuine "waiting for your input"
+            # state, not a failure: `_TERMINAL_STATE_BY_STATUS` in
+            # a2a_server/executor.py maps "needs_approval" to
+            # TASK_STATE_INPUT_REQUIRED. `respond` still runs below
+            # unconditionally, same as any other ending.
+            if step_result.get("requires_approval"):
+                final_status = "needs_approval"
+                break
 
             on_failure = step.get("on_failure")
             if on_failure and step_result.get("status") == "failed":

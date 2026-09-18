@@ -45,9 +45,15 @@ plain question with nothing to look up or do.
 - If steps were run, synthesize what was found and done: {domain_note}. Do \
 not just restate raw tool output verbatim — write a concise, well-organized \
 summary a human can act on immediately.
-- If the pipeline gave up needing a human (status is not "completed"), say \
-so plainly and explain what's blocking it, using the failure information \
+- If the pipeline gave up needing a human (status is "failed"), say so \
+plainly and explain what's blocking it, using the failure information \
 provided.
+- If the pipeline is deliberately pausing for your confirmation before \
+proceeding (status is "needs_approval"), this is NOT a failure — say \
+plainly what you're proposing to do (from the steps run so far) and that \
+you're waiting for confirmation before acting, as a plain statement per \
+the rule above, never phrased as giving up or as something having gone \
+wrong.
 - State things definitively. NEVER end with a question or an offer \
 conditioned on a reply ("which should I do next?", "let me know if you'd \
 like...") — this response is delivered once and there is no guarantee \

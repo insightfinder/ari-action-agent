@@ -79,4 +79,10 @@ async def run(ctx: StepContext) -> dict:
         "jenkins_url": ctx.config["jenkins"]["base_url"],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    return {"pending_action": pending_action, "trace": result["trace"]}
+    # trigger_build is the one action guarded by the hard
+    # TASK_STATE_INPUT_REQUIRED confirm flow (see docs/design.md §5b) —
+    # orchestration/workflow.py's step loop turns this into a genuine A2A
+    # pause, never a conversational "yes". stop_build keeps the existing
+    # softer flow unchanged.
+    requires_approval = pending_action["action"] == "trigger_build"
+    return {"pending_action": pending_action, "requires_approval": requires_approval, "trace": result["trace"]}
