@@ -1,0 +1,29 @@
+# Local dev only. Temporal itself is NOT started here — it's hosted
+# externally; point TEMPORAL_HOST in .env at it (or at host.docker.internal
+# if you're running a local Temporal dev server for testing).
+services:
+  api:
+    build: .
+    command: ["uvicorn", "ari_agent.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./src:/app/src
+      - ./configs:/app/configs
+      - sandbox:/var/lib/ari-agent/sandbox
+      - repo-cache:/var/lib/ari-agent/repo-cache
+
+  worker:
+    build: .
+    command: ["python", "-m", "ari_agent.orchestration.worker"]
+    env_file: .env
+    volumes:
+      - ./src:/app/src
+      - ./configs:/app/configs
+      - sandbox:/var/lib/ari-agent/sandbox
+      - repo-cache:/var/lib/ari-agent/repo-cache
+
+volumes:
+  sandbox:
+  repo-cache:

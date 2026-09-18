@@ -1,0 +1,117 @@
+# Declarative capability registry.
+#
+# The planner reads `description`/`tools` to decide which capabilities to use
+# and in what order for a given prompt. The executor reads `module` to load
+# the capability's `run(ctx) -> dict` function, and `retry`/`on_failure` to
+# drive Temporal's per-step retry/looping behavior.
+#
+# Adding a capability = write the module + add an entry here. No engine
+# code changes.
+#
+# analyze/generate_change/verify/publish_pr are all backed by opencode, each
+# through its own scoped opencode "agent" (ari-analyze/ari-change/ari-verify/
+# ari-publish — see tools/opencode_cli.py) with only the permissions and
+# MCP tools that step actually needs. Only ari-publish has the GitHub MCP
+# server's tools enabled.
+
+capabilities:
+  clone_repo:
+    module: ari_agent.capabilities.clone_repo
+    description: >
+      Get the target repository ready in an isolated, per-request sandbox
+      workspace: ensure/refresh a shared local mirror cache for this repo
+      (so repeated requests against the same repo don't each pay for a
+      full fresh remote clone), then fast-clone the requested branch from
+      that cache into this request's own working copy, and write that
+      request's opencode.json (LLM key, GitHub MCP server + PAT, scoped
+      agents). Accepts an optional `ref` param (branch to check out) when
+      the prompt names one explicitly, e.g. "check the repo in dev
+      branch" — otherwise falls back to the request's configured default,
+      and if neither is set, to whatever branch the remote itself reports
+      as its default (main/master/whatever it actually is, never assumed).
+      Always the first step of any pipeline that touches a repo.
+    tools: [repo_cache_and_clone, git_set_origin, opencode_config]
+    retry:
+      max_attempts: 3
+      backoff_seconds: 5
+
+  analyze:
+    module: ari_agent.capabilities.opencode_analyze
+    description: >
+      Use opencode (agent: ari-analyze, read-only — cannot edit files) to
+      investigate the repository before editing it: localize the root
+      cause for a bug/issue (stack trace, bug report, flaky test), or scope
+      out exactly what needs to change for a feature/edit/refactor request.
+      Worth skipping when the request already names the exact
+      fields/files/behavior to change and there's genuinely nothing to
+      investigate first.
+    tools: [opencode]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 10
+
+  generate_change:
+    module: ari_agent.capabilities.opencode_change
+    description: >
+      Use opencode (agent: ari-change, can edit files) to make the requested
+      code change — a bug fix, a new feature, a refactor, or a specific
+      edit, whatever the request actually asks for — informed by the
+      analysis output when one ran (or a prior verify failure, when looping
+      back). Diff and the list of changed files are captured via `git
+      diff`/`git diff --name-only`, not trusted from opencode's own report
+      of what it changed — publish_pr uses the file list to scope staging
+      and avoid sweeping in scratch files a later step (e.g. verify) may
+      have left behind.
+    tools: [opencode, git_diff, git_changed_files]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 10
+
+  verify:
+    module: ari_agent.capabilities.verify
+    description: >
+      Use opencode (agent: ari-verify, can run arbitrary build/lint/test
+      commands but cannot edit files) to run the project's test suite
+      against the generated change. Skippable when the request explicitly
+      asks to skip tests/verification.
+    tools: [opencode]
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+    on_failure:
+      goto: generate_change
+      max_attempts: 3
+      then: fail_needs_human
+
+  publish_pr:
+    module: ari_agent.capabilities.publish_pr
+    description: >
+      Use opencode (agent: ari-publish — the only agent with the GitHub
+      MCP server's tools enabled) to push the change branch and open a pull
+      request. Accepts an optional `base_ref` param (the PR's target
+      branch) when the prompt names one explicitly and it differs from
+      the branch clone_repo checked out, e.g. "raise a PR against
+      staging" while working from dev — otherwise defaults to the same
+      branch clone_repo used. Always the last step.
+    tools: [opencode]
+    retry:
+      max_attempts: 3
+      backoff_seconds: 5
+
+  # `internal: true` — never chosen by the planner (excluded from
+  # catalog()), always run directly by orchestration/workflow.py after
+  # whatever plan the planner picked finishes (or gives up). This is what
+  # actually answers the user: a plain question gets a real answer, a full
+  # pipeline run gets a synthesized summary instead of a templated
+  # one-liner. See capabilities/respond.py.
+  respond:
+    module: ari_agent.capabilities.respond
+    description: >
+      Write the final human-facing response — a direct answer when no
+      repo work was needed, or a synthesis of what was found/changed/
+      verified/published when it was.
+    tools: [llm_complete]
+    internal: true
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5

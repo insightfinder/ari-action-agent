@@ -1,0 +1,49 @@
+# LOCAL DEV / TESTING ONLY. This agent's design (see ../../docs/design.md)
+# is that Temporal is hosted externally — this compose file exists purely
+# to stand up a throwaway local Temporal + Web UI to test against, mirroring
+# the same known-good image set/versions already used elsewhere in the
+# monorepo (infra/docker/docker-compose.yaml). Not referenced by the
+# agent's own ../../docker-compose.yaml (api/worker), which points at
+# whatever TEMPORAL_HOST is configured in .env — for local testing, that's
+# this stack's localhost:7233.
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.22
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "temporal workflow list --namespace default --address $(hostname -i | awk '{print $1}'):7233"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  temporal-ui:
+    image: temporalio/ui:2.21.0
+    ports:
+      - "8233:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:8233
+    depends_on:
+      - temporal
