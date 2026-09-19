@@ -1,4 +1,4 @@
-name: Build and Push Docker Image for ARI On-Call Agent
+name: Build and Push Docker Images for ARI Agents
 
 on:
   push:
@@ -10,8 +10,24 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    strategy:
+      # One shared API image (Dockerfile.api — agent-kind-agnostic, see
+      # docs/design.md §7) plus one worker image per agent kind. These
+      # three names must match the Helm chart's own
+      # ariOncallAgent.api.image / .worker.image / ariJenkinsAgent.*
+      # repository values exactly (charts/oncallari/values.yaml) — update
+      # both together if either changes.
+      matrix:
+        include:
+          - dockerfile: Dockerfile.api
+            image: docker.io/insightfinderinc/ari-agent-api
+          - dockerfile: Dockerfile.oncall
+            image: docker.io/insightfinderinc/ari-oncall-agent-worker
+          - dockerfile: Dockerfile.jenkins
+            image: docker.io/insightfinderinc/ari-jenkins-agent-worker
+      fail-fast: false
     env:
-      IMAGE_NAME: docker.io/insightfinderinc/ari-oncall-agent
+      IMAGE_NAME: ${{ matrix.image }}
 
     steps:
       - name: Checkout source
@@ -26,7 +42,7 @@ jobs:
         run: echo "TAG=$(date +'%y%m%d%H%M')-${{ steps.branch.outputs.BRANCH }}" >> $GITHUB_OUTPUT
 
       - name: Print generated tag
-        run: echo "Generated Docker tag:${{ steps.timestamp.outputs.TAG }}"
+        run: echo "Generated Docker tag for ${{ matrix.image }} - ${{ steps.timestamp.outputs.TAG }}"
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -41,7 +57,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
+          file: ./${{ matrix.dockerfile }}
           push: true
           platforms: linux/amd64
           tags: |
