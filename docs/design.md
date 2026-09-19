@@ -170,9 +170,12 @@ stateless service.
 
 Not implemented, deliberately: fine-grained per-capability progress as
 separate status updates (Temporal's own workflow history already has that
-detail — this reports `SUBMITTED → WORKING → one terminal state`), and
+detail — this reports `SUBMITTED → WORKING → one terminal state`).
 `TASK_STATE_INPUT_REQUIRED` (a genuine paused "waiting on your reply"
-flow) — `respond` (§4) always gives a definitive answer instead.
+flow) *is* implemented, but only for one specific case today — the
+Jenkins agent's `trigger_build` confirmation gate (§5b) — not as a
+general mechanism `respond` (§4) can invoke; every other case still
+always gets a definitive answer instead of a pause.
 
 ## 3. Core abstractions
 
@@ -230,9 +233,17 @@ new capabilities/tools/catalog entries, not a rewrite. Adding a whole new
 **Response shape.** `AriAgentWorkflow.run()` returns one plain dict. Which
 top-level keys appear besides `request_id`/`status`/`message`/`data` is
 driven entirely by that agent kind's `AgentMeta.artifacts` mapping (§0) —
-`common/orchestration/workflow.py`'s `_artifacts()` walks it and pulls
-each named artifact out of the matching capability's result if present.
-For the on-call agent:
+resolved via the `resolve_artifacts` **activity**
+(`orchestration/activities.py`), not a plain function called from
+`workflow.py` itself. This split matters, not just style: `AgentMeta`
+transitively imports `a2a.types` (for `AgentSkill`), and pulling that
+into `workflow.py`'s own module chain breaks Temporal's default
+`SandboxedWorkflowRunner` outright — confirmed live, the worker fails to
+even start (`RuntimeError: Failed validating workflow AriAgentWorkflow`)
+if `workflow.py` imports `agent_meta` at module scope. Same reasoning as
+`plan_task` being the one that calls `get_capability()`, never
+`workflow.py` — anything touching the capability/agent-meta registries
+belongs in an activity. For the on-call agent:
 
 ```json
 {
@@ -355,7 +366,9 @@ the on-call agent's `generate_change`) → `propose_action` (resolves a
 requested change into a `pending_action`, never executes) → `execute_action`
 (the only capability allowed to actually trigger or stop a build).
 
-**The confirm-before-execute gate is enforced twice, independently:**
+**The confirm-before-execute gate is enforced at least twice,
+independently, for every action — and a third time, specifically for
+`trigger_build`:**
 
 1. **Structurally, in opencode's own permission scoping.** Every
    capability except `execute_action` runs as the `ari-jenkins-read`
@@ -366,11 +379,42 @@ requested change into a `pending_action`, never executes) → `execute_action`
 2. **Structurally, in `execute_action.py`'s own code.** It refuses to run
    at all unless `ctx.params` already carries a concrete, non-stale
    (< 30 minutes old) confirmed `action`/`job`/`parameters` — never
-   inferred from a bare "yes". Carrying a prior `propose_action`'s exact
-   `pending_action` fields into a later confirmation turn's params is the
-   planner's job (its domain guidance says so explicitly); if there's
-   nothing concrete to confirm, `execute_action` should never have been
-   scheduled, and it fails loudly rather than guessing.
+   inferred from a bare "yes". For `stop_build`, carrying a prior
+   `propose_action`'s exact `pending_action` fields into a later
+   confirmation turn's params is the planner's job (its domain guidance
+   says so explicitly) — a conversational "yes, go ahead" is enough, same
+   as it always was; if there's nothing concrete to confirm,
+   `execute_action` should never have been scheduled, and it fails loudly
+   rather than guessing.
+3. **For `trigger_build` only — a hard, protocol-level gate, not an LLM's
+   inference.** `propose_action` flags a `trigger_build` proposal with
+   `requires_approval: true`; `orchestration/workflow.py`'s step loop
+   turns that into `status: "needs_approval"`, which
+   `a2a_server/executor.py` maps onto the real A2A `TASK_STATE_
+   INPUT_REQUIRED` (this is what the caller sees — a genuine paused
+   "waiting for your input" task, not a completed one). Confirming
+   requires a follow-up `message/send` on the *same* `task_id` carrying a
+   structured `confirm_pending_action: {"id": "..."}` field — not a plain
+   "yes". `executor.py` resolves that id deterministically against this
+   task's own previously published `pending_action` artifact (real,
+   persisted across turns in `a2a-sdk`'s `InMemoryTaskStore` — verified
+   directly against the installed SDK, not assumed from the spec — so no
+   LLM ever reconstructs the action/job/parameters from chat text for
+   this one action). This resolved `confirmed_action` bypasses the LLM
+   planner entirely (`orchestration/activities.py`'s `plan_task` builds a
+   one-step plan directly) and sets a `StepContext.confirmed` flag that
+   `execute_action.py` checks for `trigger_build` specifically — a flag
+   the planner's own JSON output structurally cannot set, since it only
+   ever populates a step's `params` (a plain `dict`), never a sibling
+   field on the step itself (`common/models/plan.py`'s `Step` schema has
+   no such field, and pydantic drops anything extra). Without this,
+   layers 1–2 alone would not have stopped the *existing* planner from
+   still independently scheduling an unconfirmed `trigger_build` from a
+   misread "yes" — layer 3 is what actually makes this a hard gate rather
+   than a second path alongside the soft one. See
+   [`docs/INPUT_REQUIRED_INTEGRATION.md`](INPUT_REQUIRED_INTEGRATION.md)
+   for the caller-side contract — what's actually sent over the wire and
+   exactly what a caller needs to send back.
 
 Stopping a build goes through a **direct REST call**
 (`jenkins_agent/tools/jenkins_rest.py`), not opencode+MCP — confirmed live
@@ -414,6 +458,15 @@ correctness of any capability's actual output (`resolve_target`/
 has had zero real runs of any kind. See `scripts/jenkins_agent_local_test.py`
 for the harness built to close this gap — it deliberately only wires the
 four read-only capabilities.
+
+Also not yet verified live: the `trigger_build` confirm gate's actual
+pause → follow-up `message/send` → resume round-trip through a real
+deployed API process and Temporal worker. Every piece of it was verified
+directly against source (the installed `a2a-sdk`'s artifact-continuation
+behavior, `Step`'s pydantic schema dropping unknown fields) rather than
+assumed, and the full unit-test suite covers every new code path in
+isolation — but no real HTTP round-trip against a live instance has
+exercised it end to end yet.
 
 ## 6. Repo caching & dynamic branches (on-call agent)
 

@@ -26,6 +26,31 @@ async def cleanup_workspace(request_id: str) -> None:
     _cleanup_workspace(request_id)
 
 
+@activity.defn(name="resolve_artifacts")
+async def resolve_artifacts(results: dict) -> dict:
+    """This agent kind's own declared artifacts (agent_meta.artifacts,
+    e.g. oncall's "root_cause": "analyze.root_cause"), resolved against
+    this run's actual results — only the ones present and truthy.
+
+    Lives here, not in workflow.py, because get_agent_meta() transitively
+    imports a2a.types (for AgentSkill) — pulling that into the workflow's
+    own module chain breaks Temporal's default SandboxedWorkflowRunner:
+    confirmed live against a real Temporal dev server that constructing
+    a Worker for AriAgentWorkflow raises "Failed validating workflow
+    AriAgentWorkflow" (a sniffio/anyio restricted-import failure several
+    layers down) the moment workflow.py imports anything from
+    common.agent_meta at module scope. Activities run outside the
+    sandbox — same reasoning as plan_task being the one that calls
+    get_capability(), not workflow.py itself."""
+    found = {}
+    for name, dotted in get_agent_meta().artifacts.items():
+        capability, key = dotted.split(".", 1)
+        value = results.get(capability, {}).get(key)
+        if value:
+            found[name] = value
+    return found
+
+
 @activity.defn(name="plan_task")
 async def plan_task(payload: dict) -> dict:
     """Produces the step plan and enriches each step with its capability's

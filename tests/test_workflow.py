@@ -5,7 +5,11 @@ from temporalio.exceptions import ActivityError, ApplicationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from common.orchestration.workflow import _activity_failure_detail, _fallback_message  # noqa: E402
+from common.orchestration.workflow import (  # noqa: E402
+    _activity_failure_detail,
+    _build_response,
+    _fallback_message,
+)
 
 
 def _activity_error(cause) -> ActivityError:
@@ -45,3 +49,28 @@ def test_fallback_message_states_the_failure_reason_when_respond_itself_failed()
     message = _fallback_message("failed", {}, "publish_pr failed: 403 Resource not accessible by personal access token")
 
     assert "403 Resource not accessible by personal access token" in message
+
+
+def test_fallback_message_lists_resolved_artifacts_when_completed():
+    # artifacts is precomputed by the resolve_artifacts activity (not
+    # results) -- see workflow.py's own comment on why that split exists.
+    message = _fallback_message("completed", {"pull_request": {"url": "https://x/pull/1"}}, None)
+
+    assert "pull_request" in message and "https://x/pull/1" in message
+
+
+def test_fallback_message_states_awaiting_confirmation_not_failure_for_needs_approval():
+    # A deliberate pause is not a failure -- must not read like one even
+    # in this rare last-resort templated path.
+    message = _fallback_message("needs_approval", {"pending_action": {"id": "abc"}}, None)
+
+    assert "Awaiting confirmation" in message
+    assert "gave up" not in message.lower()
+
+
+def test_build_response_includes_resolved_artifacts_at_the_top_level():
+    response = _build_response("req-1", "completed", {"pull_request": {"url": "https://x/pull/1"}}, {"publish_pr": {"pr": {}}}, "done")
+
+    assert response["pull_request"] == {"url": "https://x/pull/1"}
+    assert response["data"] == {"publish_pr": {"pr": {}}}
+    assert response["status"] == "completed"

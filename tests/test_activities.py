@@ -60,6 +60,21 @@ async def test_plan_task_normal_branch_marks_every_planner_step_unconfirmed(jenk
 
 
 @pytest.mark.asyncio
+async def test_resolve_artifacts_resolves_declared_artifacts_from_results(jenkins_agent_kind):
+    # jenkins' own agent_meta.artifacts: {"pending_action": "propose_action.pending_action", ...}
+    results = {"propose_action": {"pending_action": {"id": "abc"}, "trace": {}}}
+
+    found = await activities.resolve_artifacts(results)
+
+    assert found == {"pending_action": {"id": "abc"}}
+
+
+@pytest.mark.asyncio
+async def test_resolve_artifacts_omits_artifacts_whose_capability_never_ran(jenkins_agent_kind):
+    assert await activities.resolve_artifacts({}) == {}
+
+
+@pytest.mark.asyncio
 async def test_plan_task_raises_clearly_when_agent_kind_has_no_confirm_capability(monkeypatch):
     # oncall's AgentMeta.confirm_capability is None (it never pauses for
     # human-in-the-loop confirmation) -- a confirmed_action reaching

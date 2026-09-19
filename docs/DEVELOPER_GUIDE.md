@@ -351,8 +351,8 @@ A requested **change** ("deploy checkout-service to staging", "stop that
 build") never executes on the first turn. It runs `resolve_target` →
 `propose_action`, which resolves the job and every parameter but calls
 nothing mutating (`propose_action`'s opencode agent has every mutating
-Jenkins tool denied outright — see `docs/design.md` §5b), and the
-completed Task carries a `pending_action` artifact:
+Jenkins tool denied outright — see `docs/design.md` §5b), and the Task
+carries a `pending_action` artifact:
 
 ```json
 {
@@ -373,29 +373,40 @@ completed Task carries a `pending_action` artifact:
 }
 ```
 
-...and the response message asks for confirmation as a plain statement,
-never a dangling question (this agent doesn't implement
-`TASK_STATE_INPUT_REQUIRED` any more than the on-call agent does — see
-§3's note on that).
+**How you confirm it differs by action** (see `docs/design.md` §5b for
+the full three-layer gate):
 
-**To confirm it**, send a follow-up `message/send` in the *same*
-`context_id`, with a plain "yes, go ahead"-style prompt. There is nothing
-automatic about this: the caller (or whatever sits between the caller and
-this agent) is responsible for carrying the exact `pending_action` fields
-from the prior turn's history into this turn — the planner reads
-conversation history and, when it sees a clear confirmation responding to
-a specific prior proposal, schedules `execute_action` with those exact
-`action`/`job`/`parameters` as that step's params. A bare "yes" with no
-matching proposal in history does nothing — `execute_action` refuses to
-run without a concrete confirmed action already in its params (`docs/
-design.md` §5b), and a confirmation more than 30 minutes after the
-proposal is rejected as stale rather than acted on.
+- **`trigger_build`** — a hard gate, not a chat reply. The Task's status
+  is genuinely `TASK_STATE_INPUT_REQUIRED` (not `COMPLETED`) — this agent
+  *does* implement that state for this one action, unlike the on-call
+  agent (§3). See
+  [`docs/INPUT_REQUIRED_INTEGRATION.md`](INPUT_REQUIRED_INTEGRATION.md)
+  for the full integration contract (detecting it across all three
+  response patterns, edge cases, a runnable snippet); summary: send a
+  follow-up `message/send` on the **same `task_id`** whose config
+  `DataPart` carries a structured field instead of free text:
+  ```json
+  { "confirm_pending_action": { "id": "b2c1..." } }
+  ```
+  This id must match a `pending_action` artifact already on that exact
+  task — the server resolves it deterministically from the task's own
+  history, never from an LLM's reading of a "yes." A wrong/stale/unknown
+  id fails clearly rather than silently doing nothing. There is no
+  free-text way to confirm a `trigger_build` — a plain "yes, go ahead" on
+  its own does not execute it.
+- **`stop_build`** — unchanged, conversational. Send a follow-up
+  `message/send` in the same `context_id` with a plain "yes, go ahead"
+  reply; the planner reads history and, recognizing a confirmation of a
+  specific prior proposal, schedules `execute_action` with those exact
+  fields itself. A bare "yes" with no matching proposal in history does
+  nothing, and a confirmation more than 30 minutes after the proposal is
+  rejected as stale either way.
 
-Once genuinely confirmed, `execute_action` runs and the completed Task
-carries an `action_result` artifact instead. Stopping a build goes
-through a direct REST call under the hood, not opencode — see
-`docs/design.md` §5b for why (no stop/cancel tool exists in the real
-plugin, confirmed live).
+Once genuinely confirmed, `execute_action` runs and the Task's status
+returns to a normal terminal state, carrying an `action_result` artifact
+instead. Stopping a build goes through a direct REST call under the hood,
+not opencode — see `docs/design.md` §5b for why (no stop/cancel tool
+exists in the real plugin, confirmed live).
 
 ### Sample client
 

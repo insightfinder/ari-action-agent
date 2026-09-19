@@ -16,6 +16,7 @@ from .activities import (
     execute_step,
     plan_task,
     prepare_workspace,
+    resolve_artifacts,
 )
 from .temporal_client import get_temporal_client
 from .workflow import AriAgentWorkflow
@@ -31,7 +32,7 @@ async def main() -> None:
         client,
         task_queue=settings.temporal_task_queue,
         workflows=[AriAgentWorkflow],
-        activities=[prepare_workspace, plan_task, execute_step, cleanup_workspace],
+        activities=[prepare_workspace, plan_task, execute_step, cleanup_workspace, resolve_artifacts],
     )
     logger.info("worker_starting", task_queue=settings.temporal_task_queue, namespace=settings.temporal_namespace)
     await worker.run()

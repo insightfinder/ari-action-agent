@@ -19,8 +19,6 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError
 
-from common.agent_meta import get_agent_meta
-
 
 def _activity_failure_detail(exc: ActivityError) -> str:
     """The full message from whatever exception a capability raised (e.g.
@@ -34,42 +32,32 @@ def _activity_failure_detail(exc: ActivityError) -> str:
     return str(cause) if cause is not None else str(exc)
 
 
-def _artifacts(results: dict[str, Any]) -> dict[str, Any]:
-    """This agent kind's own declared artifacts (agent_meta.artifacts,
-    e.g. oncall's "root_cause": "analyze.root_cause"), resolved against
-    this run's actual results — only the ones present and truthy."""
-    found = {}
-    for name, dotted in get_agent_meta().artifacts.items():
-        capability, key = dotted.split(".", 1)
-        value = results.get(capability, {}).get(key)
-        if value:
-            found[name] = value
-    return found
-
-
-def _fallback_message(status: str, results: dict[str, Any], failure_reason: str | None) -> str:
+def _fallback_message(status: str, artifacts: dict[str, Any], failure_reason: str | None) -> str:
     """Only used if the `respond` step itself fails after retries — a
     templated last resort so a request always gets *some* message back,
-    never an exception surfaced to the caller."""
+    never an exception surfaced to the caller. `artifacts` is precomputed
+    by the `resolve_artifacts` activity (see orchestration/activities.py)
+    — this function takes the resolved dict directly rather than calling
+    get_agent_meta() itself, since that transitively imports a2a.types
+    and would break Temporal's workflow-sandbox import restrictions if
+    called from here (confirmed live — see that activity's docstring)."""
     if status == "failed":
         return f"Gave up after exhausting retries: {failure_reason}"
     if status == "completed":
-        artifacts = _artifacts(results)
         if artifacts:
             return "Completed: " + ", ".join(f"{k}: {v}" for k, v in artifacts.items())
         return "Completed."
     if status == "needs_approval":
-        artifacts = _artifacts(results)
         return "Awaiting confirmation before proceeding: " + ", ".join(f"{k}: {v}" for k, v in artifacts.items())
     return "No action was needed for this request."
 
 
-def _build_response(request_id: str, status: str, results: dict[str, Any], message: str) -> dict:
+def _build_response(request_id: str, status: str, artifacts: dict[str, Any], results: dict[str, Any], message: str) -> dict:
     return {
         "request_id": request_id,
         "status": status,
         "message": message,
-        **_artifacts(results),
+        **artifacts,
         "data": results,
     }
 
@@ -226,6 +214,25 @@ class AriAgentWorkflow:
             # back empty-handed.
             pass
 
+        # This agent kind's own declared artifacts (agent_meta.artifacts),
+        # resolved against this run's actual results. An activity, not a
+        # plain function called from here directly — get_agent_meta()
+        # transitively imports a2a.types, which breaks Temporal's
+        # workflow-sandbox import restrictions if pulled into this
+        # module's own import chain (confirmed live: the default
+        # SandboxedWorkflowRunner refuses to even construct a Worker for
+        # this workflow otherwise). Same reasoning as why plan_task, not
+        # workflow.py, is the one that calls get_capability().
+        try:
+            artifacts = await workflow.execute_activity(
+                "resolve_artifacts",
+                results,
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=2)),
+            )
+        except ActivityError:
+            artifacts = {}
+
         # Guaranteed final step, called directly rather than appended to
         # `steps` — appending it would let the fail_needs_human `break`
         # above skip it (see capabilities/respond.py). Runs regardless of
@@ -251,6 +258,6 @@ class AriAgentWorkflow:
             )
             message = respond_result["message"]
         except ActivityError:
-            message = _fallback_message(final_status, results, failure_reason)
+            message = _fallback_message(final_status, artifacts, failure_reason)
 
-        return _build_response(request_id, final_status, results, message)
+        return _build_response(request_id, final_status, artifacts, results, message)

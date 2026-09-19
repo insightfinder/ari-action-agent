@@ -1678,3 +1678,158 @@ declined to run it in this session. This gap needs to be closed with a
 real run — either by the user directly, or by this agent in a future
 session with the relevant Bash permission loosened for that specific
 action — before any claim of "the Jenkins agent works" is accurate.
+
+## 2026-09-18 — Added a hard human-in-the-loop gate for `trigger_build`, guarding only that action
+
+Brainstormed several ways to get a genuine human checkpoint before any
+Jenkins-mutating call (conversational confirm, A2A's `TASK_STATE_
+INPUT_REQUIRED`, a signed/structured confirm token, a dedicated confirm
+path never reachable by planning, out-of-band chat-platform approval,
+pushing the gate into a Jenkins pipeline's own `input` step, risk-tiered
+auto-approval) before implementing anything, per explicit instruction to
+gather ideas first. User picked `TASK_STATE_INPUT_REQUIRED` as "the best
+fit," scoped tightly: **guard `trigger_build` only — `stop_build` (and
+anything else `execute_action` might handle later) keeps today's
+conversational confirm flow unchanged.**
+
+Before designing against it, read the actual installed `a2a-sdk` (1.1.2)
+source rather than assuming spec behavior (dispatched an Explore agent
+specifically for this) and confirmed: a second `message/send` for an
+existing non-terminal `task_id` re-enters `AriAgentExecutor.execute()`
+with `context.current_task.artifacts` reliably carrying back exactly
+what an earlier turn published via `TaskUpdater.add_artifact` —
+persisted in `InMemoryTaskStore`, real and deterministic, no LLM needed
+to recover it. `TASK_STATE_INPUT_REQUIRED` isn't in the SDK's
+`TERMINAL_TASK_STATES`, so a paused task accepts a follow-up normally.
+This meant the whole mechanism needed **zero Temporal-level pause/signal
+machinery** — each conversational turn already starts an independent
+Temporal workflow execution reusing the same workflow ID (today's
+existing pattern for "yes, go ahead"); only the A2A layer needed new
+logic. Also found, while designing: `_TERMINAL_STATE_BY_STATUS["needs_
+approval"]` already mapped to `TASK_STATE_INPUT_REQUIRED` in `executor.py`
+— dead code from the original design, apparently intended for exactly
+this, never wired up until now.
+
+**The real design risk, caught before implementing, not after:** simply
+adding a new structured confirm path does nothing on its own to stop the
+*existing* LLM planner from independently deciding to schedule
+`execute_action` with a `trigger_build` action reconstructed from chat
+text — which would leave the old soft path alive for the exact action
+meant to be guarded. Closed this by verifying `common/models/plan.py`'s
+`Step` is a plain pydantic `BaseModel` with pydantic v2's default
+`extra="ignore"` — the planner's LLM-generated JSON can only ever
+populate `Step.params` (a free `dict`), never a new top-level field on
+`Step` itself. A `StepContext.confirmed` flag was added that lives
+*outside* `params` entirely, set only by the new deterministic bypass
+branch in `orchestration/activities.py`'s `plan_task` — structurally
+unspoofable by anything the LLM's JSON can contain, not just "checked by
+convention." `execute_action.py` refuses an unconfirmed `trigger_build`
+by checking this flag, never anything in `ctx.params`.
+
+**What changed** (three independent pieces, matching `docs/design.md`
+§5b's now-updated three-layer description):
+- Pausing: `propose_action.py` flags `requires_approval` for
+  `trigger_build`; `workflow.py`'s step loop turns that into `status:
+  "needs_approval"` → the pre-existing `TASK_STATE_INPUT_REQUIRED`
+  mapping. `respond.py`'s system prompt got one new bullet distinguishing
+  "paused for confirmation" from "gave up," since the generic "pipeline
+  gave up" framing read wrong for a deliberate pause.
+- Resuming: a follow-up `message/send`'s config carries
+  `confirm_pending_action: {"id": "..."}`; `executor.py`'s new
+  `_find_pending_action` resolves it against `context.current_task
+  .artifacts`; `AgentMeta.confirm_capability` (new field, `"execute_
+  action"` for jenkins, `None` for oncall) tells `plan_task`'s new bypass
+  branch which capability to run with the resolved data, skipping the
+  LLM planner for that turn entirely.
+- The unspoofable gate: `StepContext.confirmed`, threaded through
+  `execute_step`'s payload from `plan_task`'s bypass branch only.
+
+**Verified:** full suite 119 passed (109 pre-existing + 10 new — the gate
+itself and the `requires_approval` flag in `tests/test_jenkins_
+capabilities.py`, `_find_pending_action` in `tests/test_a2a_executor.py`,
+and `plan_task`'s two branches in a new `tests/test_activities.py`, which
+had no test file at all before this — a real coverage gap closed, not
+just new-feature tests). Confirmed via `git diff --stat` that only the
+nine files named in the plan changed, nothing else. **Not yet verified**:
+the actual pause → follow-up → resume round-trip through a real deployed
+API process and Temporal worker — every piece was verified against
+source/unit tests, not a live HTTP round-trip, and this doc says so
+plainly rather than implying otherwise.
+
+## 2026-09-18 — Asked "why is there no decline signal," which led to finding a real worker-crashing bug unrelated to the question
+
+Wrote `docs/INPUT_REQUIRED_INTEGRATION.md` claiming there was no decline
+mechanism for a paused `trigger_build` proposal. Asked directly why —
+the honest answer was that decline was simply never designed, since the
+whole brainstorm and plan were scoped around hardening *confirm* only.
+But A2A already has a general-purpose verb for exactly this,
+`POST /tasks/{id}:cancel` (already implemented, already documented in
+`docs/DEVELOPER_GUIDE.md` §6) — so the real question became whether that
+already works for a task that's paused rather than still actively
+running.
+
+**Verified against a real local Temporal dev server** (Docker,
+`temporalio/temporal:1.9.1 server start-dev`, not simulated) rather than
+reasoning from documentation, because the hypothesis going in
+(`executor.py`'s `cancel()` unconditionally calls `handle.cancel()` on
+the Temporal workflow, which has *already completed* by the time a task
+reaches `needs_approval` — surely that raises?) turned out to be **wrong**:
+cancelling an already-completed Temporal workflow execution succeeds
+silently, no error. Confirmed this twice — once with a raw
+`temporalio.client` call, once running the actual
+`AriAgentExecutor.cancel()` method against a genuinely completed
+`needs_approval` workflow run, both producing a clean
+`TASK_STATE_CANCELED` with no exception. **No code change was needed for
+this — `/tasks/{id}:cancel` already works as the decline mechanism.**
+Also checked, for completeness: cancelling a `task_id` that was *never
+started at all* does raise (`RPCError: workflow not found`) — a real,
+pre-existing (not new) asymmetry worth documenting, not fixing, since a
+real decline always targets an id that actually came from a paused task.
+
+**What the attempt to verify this DID find, before any of the above
+could even be tested: a genuine, severe, pre-existing bug, unrelated to
+decline.** Standing up a real sandboxed Temporal `Worker` for
+`AriAgentWorkflow` (the default configuration — what
+`common/orchestration/worker.py` actually uses in production) failed
+outright: `RuntimeError: Failed validating workflow AriAgentWorkflow`,
+several layers down a `sniffio`/`anyio` restricted-import failure.
+Root-caused by bisecting with `UnsandboxedWorkflowRunner` (confirmed the
+same workflow runs fine unsandboxed — a sandbox-compatibility issue, not
+a logic bug) then with a minimal reproduction: `workflow.py`'s own
+`from common.agent_meta import get_agent_meta` (added during the earlier
+multi-agent restructuring, for `_artifacts()`) transitively imports
+`a2a.types` for `AgentSkill` — pulling the a2a-sdk's async HTTP stack
+into the *workflow's own sandboxed module chain*, which Temporal's
+default `SandboxedWorkflowRunner` cannot tolerate. This is exactly the
+kind of import `workflow.py`'s own docstring already warned against
+("no filesystem, HTTP, subprocess, or registry lookups here") — the
+`agent_meta` restructuring violated its own stated rule, and nothing
+caught it because every verification since that restructuring (full
+test suite, a lightweight API-only Docker smoke test) never actually
+started a real sandboxed `Worker`. **With the default worker
+configuration, both agent kinds' workers would have crashed on startup
+before processing a single request** — this would have been caught the
+moment anyone actually deployed the restructured worker image, not
+before.
+
+**Fix:** moved artifact resolution out of `workflow.py` entirely into a
+new `resolve_artifacts` activity (`orchestration/activities.py`) —
+exactly the same shape as `plan_task` already being the one that calls
+`get_capability()`, never `workflow.py` itself. `workflow.py` no longer
+imports `common.agent_meta` at all. `_fallback_message`/`_build_response`
+now take a precomputed `artifacts` dict instead of calling `_artifacts()`
+(deleted) themselves. Registered the new activity in
+`common/orchestration/worker.py`.
+
+**Verified:** full suite 124 passed (119 + 5 new — `resolve_artifacts`'s
+two branches in `tests/test_activities.py`, and `_fallback_message`'s
+`needs_approval`/`completed` branches plus `_build_response` in
+`tests/test_workflow.py`, none of which had real coverage before). Then,
+critically, re-ran the exact same real-Temporal-server reproduction that
+originally caught this: the default `SandboxedWorkflowRunner` now
+constructs a `Worker` for `AriAgentWorkflow` successfully, and a full
+real run through `prepare_workspace → plan_task → execute_step →
+cleanup_workspace → resolve_artifacts → respond` against the local
+Temporal server completes correctly with `status: "needs_approval"` and
+a populated `pending_action` artifact — not just unit-tested in
+isolation.
