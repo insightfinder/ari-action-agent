@@ -130,19 +130,26 @@ class AriAgentWorkflow:
             step = steps[i]
             capability = step["capability"]
             retry = step.get("retry") or {}
+            on_failure = step.get("on_failure")
 
             # A capability can fail two ways: a "soft" failure it reports
             # itself (e.g. verify's {"status": "failed", ...}, handled by
             # the on_failure retry-loop below), or a raised exception (e.g.
             # publish_pr's RuntimeError when no PR came back, run_opencode's
-            # RuntimeError on a non-zero exit, git_ops.clone's RuntimeError)
-            # that Temporal retries at the activity level and then re-raises
-            # as ActivityError once exhausted. That second case has no
-            # `on_failure` policy to catch it, so it must be caught here —
-            # otherwise it escapes `run()` entirely, skipping both
-            # `cleanup_workspace` and `respond` below and leaving the caller
-            # with nothing but the SDK's generic "workflow execution failed",
-            # no explanation of what actually went wrong.
+            # RuntimeError on a non-zero exit, git_ops.clone's RuntimeError,
+            # an activity timing out, or Temporal cancelling it because the
+            # caller gave up waiting) that Temporal retries at the activity
+            # level and then re-raises as ActivityError once exhausted.
+            # Confirmed live: `verify` (no `on_failure` policy before this
+            # fix would have skipped it) routinely got killed this way —
+            # its build/test run outlasted callers that cancel after
+            # ~8-10 minutes — and every single one of those runs aborted
+            # the *entire* pipeline instead of looping back to
+            # generate_change like a normal reported test failure already
+            # does. When the step has an `on_failure` policy, a raised
+            # exception is now folded into the same soft-failure shape and
+            # handled by the identical retry loop below; only a step with
+            # no `on_failure` policy still aborts the pipeline outright.
             try:
                 step_result = await workflow.execute_activity(
                     "execute_step",
@@ -156,7 +163,7 @@ class AriAgentWorkflow:
                         "results": results,
                         "confirmed": step.get("confirmed", False),
                     },
-                    start_to_close_timeout=timedelta(minutes=20),
+                    start_to_close_timeout=timedelta(seconds=step.get("timeout_seconds") or 1200),
                     retry_policy=RetryPolicy(
                         maximum_attempts=retry.get("max_attempts", 1),
                         backoff_coefficient=2.0,
@@ -164,9 +171,11 @@ class AriAgentWorkflow:
                     ),
                 )
             except ActivityError as exc:
-                final_status = "failed"
-                failure_reason = f"{capability} failed: {_activity_failure_detail(exc)}"
-                break
+                if not on_failure:
+                    final_status = "failed"
+                    failure_reason = f"{capability} failed: {_activity_failure_detail(exc)}"
+                    break
+                step_result = {"status": "failed", "failure": _activity_failure_detail(exc)}
 
             results[capability] = step_result
 
@@ -181,7 +190,6 @@ class AriAgentWorkflow:
                 final_status = "needs_approval"
                 break
 
-            on_failure = step.get("on_failure")
             if on_failure and step_result.get("status") == "failed":
                 attempts = loop_attempts.get(capability, 0) + 1
                 loop_attempts[capability] = attempts

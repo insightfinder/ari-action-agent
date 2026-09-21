@@ -57,6 +57,44 @@ class Settings(BaseSettings):
     # per-request by cleanup_workspace, this must survive across requests.
     repo_cache_root: str = "/var/lib/ari-agent/repo-cache"
 
+    # Caps how many activities (clone/analyze/verify/... steps, across all
+    # in-flight requests) this worker process runs at once. Temporal's SDK
+    # default is 100 — fine for cheap activities, but each opencode-backed
+    # step here can spawn a Node process plus, for `verify`, a real
+    # go/maven/npm build inside a container sized at 2 CPU / 2Gi (see the
+    # Helm chart's ariOncallAgent.worker.resources). Left uncapped, enough
+    # concurrent requests landing on one worker pile up enough simultaneous
+    # subprocesses to blow that limit — confirmed live via repeated
+    # OOMKilled restarts. This default is deliberately conservative for
+    # that container size; raise it only alongside more CPU/memory.
+    max_concurrent_activities: int = 3
+
+    # Shared, persistent HOME for `verify`'s build/test subprocesses only
+    # (mvn/go/npm, invoked via opencode's bash tool) — separate from
+    # opencode's own per-request XDG_* isolation (see opencode_runtime.py),
+    # so build-tool dependency caches (~/.m2, Go's module+build cache,
+    # ~/.npm) stay warm across requests instead of a cold download every
+    # single verify run. Confirmed live this was previously unbounded: no
+    # cache anywhere meant every verify paid full dependency-resolution
+    # cost every time, which was the dominant cost behind verify routinely
+    # exceeding callers' patience timeouts (see capabilities.yaml's
+    # verify.timeout_seconds). These tools are themselves designed for
+    # concurrent access to one shared cache (content/coordinate-addressed
+    # storage) — see max_concurrent_activities above for why concurrency
+    # here is bounded anyway.
+    build_cache_root: str = "/var/lib/ari-agent/build-cache"
+
+    # Shared LRU-eviction thresholds for both repo_cache_root and
+    # build_cache_root (see common/cache_gc.py) — both PVCs are small
+    # (5Gi) relative to what they cache, so eviction isn't an edge case
+    # here, it's expected to run regularly. Below `low_water` fraction
+    # free, evict least-recently-used entries until back above
+    # `high_water`. Same pair for both caches on purpose: no reason for
+    # ops to reason about two independent knobs for what's the same
+    # policy on two differently-shaped caches.
+    cache_evict_low_water: float = 0.15
+    cache_evict_high_water: float = 0.30
+
     opencode_bin: str = "opencode"
 
     github_mcp_server_url: str = "https://api.githubcopilot.com/mcp/"

@@ -75,6 +75,32 @@ async def test_resolve_artifacts_omits_artifacts_whose_capability_never_ran(jenk
 
 
 @pytest.mark.asyncio
+async def test_plan_task_attaches_verifys_timeout_seconds_from_the_capability_registry(monkeypatch):
+    # workflow.py reads step["timeout_seconds"] to bound verify's own
+    # activity — plan_task is what has to actually put it there, from
+    # configs/oncall/capabilities.yaml's verify.timeout_seconds. Regression
+    # coverage for the live incident: with no bound here, a hung verify ran
+    # unbounded (workflow.py's 20-minute default) until an external
+    # caller's own patience timeout killed it instead.
+    monkeypatch.setenv("AGENT_KIND", "oncall")
+    get_settings.cache_clear()
+    get_agent_meta.cache_clear()
+    capabilities_registry._load_specs.cache_clear()
+    try:
+        create_plan = AsyncMock(return_value=Plan(steps=[Step(capability="verify", params={})], rationale="r"))
+        monkeypatch.setattr(activities, "create_plan", create_plan)
+
+        result = await activities.plan_task({"prompt": "run tests", "config": {}, "history": []})
+
+        assert result["steps"][0]["timeout_seconds"] == 480  # configs/oncall/capabilities.yaml
+        assert result["steps"][0]["on_failure"]["goto"] == "generate_change"
+    finally:
+        get_settings.cache_clear()
+        get_agent_meta.cache_clear()
+        capabilities_registry._load_specs.cache_clear()
+
+
+@pytest.mark.asyncio
 async def test_plan_task_raises_clearly_when_agent_kind_has_no_confirm_capability(monkeypatch):
     # oncall's AgentMeta.confirm_capability is None (it never pauses for
     # human-in-the-loop confirmation) -- a confirmed_action reaching

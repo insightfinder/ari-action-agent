@@ -12,6 +12,7 @@ from typing import Any
 
 from common.opencode_runtime import merge_traces, run_opencode as _run_opencode  # noqa: F401  (re-exported)
 from common.settings import get_settings
+from .build_cache import reserve_build_cache_home
 
 # Mirrors configs/capabilities.yaml's capability→agent mapping. Kept here
 # (not just in the YAML) because it's opencode-specific wiring, not a fact
@@ -178,4 +179,21 @@ async def run_opencode(ctx, instruction: str, *, continue_session: bool | None =
         result = await ctx.tool("opencode")(ctx, "<instruction>")
     """
     agent = CAPABILITY_AGENTS[ctx.capability]
+
+    if ctx.capability == "verify":
+        # Only verify's bash commands (mvn/go/npm, run via opencode's bash
+        # tool, which inherits this process's env) benefit from a real
+        # dependency cache — see build_cache.py/settings.build_cache_root.
+        # Scoped to this one capability, not every opencode call:
+        # analyze/generate_change/publish_pr have no business sharing
+        # state through $HOME, and opencode's own state is already
+        # isolated separately per request (see opencode_runtime.
+        # run_opencode's XDG_* handling). Held for the duration of the
+        # call so eviction (build_cache.py) can never delete anything out
+        # from under an in-flight build.
+        async with reserve_build_cache_home() as build_cache_root:
+            return await _run_opencode(
+                ctx, instruction, agent, continue_session=continue_session, extra_env={"HOME": build_cache_root}
+            )
+
     return await _run_opencode(ctx, instruction, agent, continue_session=continue_session)

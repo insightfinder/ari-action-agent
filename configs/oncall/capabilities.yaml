@@ -78,6 +78,19 @@ capabilities:
     retry:
       max_attempts: 1
       backoff_seconds: 0
+    # Shorter than workflow.py's 20-minute default on purpose. Confirmed
+    # live (Temporal history, 2026-09-21): with no bound here, a
+    # slow/hung build routinely ran past callers' own ~8-10 minute
+    # patience timeout, which cancelled the activity out from under this
+    # pipeline every single time — wasting that whole window before
+    # falling back, on every real request in a 48h sample. Timing out
+    # here first (well inside that window) makes the failure deterministic
+    # and lets the on_failure loop below retry with a fresh attempt
+    # instead of racing an external cancel. Paired with a persistent
+    # build-tool dependency cache (settings.build_cache_root) so repeat
+    # attempts against the same repo aren't paying a cold-dependency-
+    # download tax every time either.
+    timeout_seconds: 480
     on_failure:
       goto: generate_change
       max_attempts: 3

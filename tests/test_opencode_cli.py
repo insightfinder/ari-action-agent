@@ -1,12 +1,19 @@
 import json
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import ari_oncall_agent.tools.opencode_cli as opencode_cli  # noqa: E402
 from ari_oncall_agent.tools.opencode_cli import (  # noqa: E402
     _AGENT_DEFS,
     CAPABILITY_AGENTS,
+    run_opencode,
     write_config,
 )
 
@@ -69,6 +76,50 @@ def test_write_config_disables_task_tool_globally_too(tmp_path):
     )
     cfg = json.loads(Path(path).read_text())
     assert cfg["tools"]["task"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_opencode_points_verify_at_the_shared_build_cache_home(monkeypatch):
+    # verify's bash commands (mvn/go/npm) need a persistent, shared HOME
+    # so their dependency caches survive across requests — see
+    # build_cache.py/settings.build_cache_root. Regression coverage for
+    # the live finding that verify had zero dependency caching, making it
+    # slow enough to routinely outlast callers' own patience timeouts.
+    @asynccontextmanager
+    async def fake_reserve_build_cache_home():
+        yield "/fake/build-cache"
+
+    monkeypatch.setattr(opencode_cli, "reserve_build_cache_home", fake_reserve_build_cache_home)
+    fake_run_opencode = AsyncMock(return_value={"text": "ok", "trace": {}})
+    monkeypatch.setattr(opencode_cli, "_run_opencode", fake_run_opencode)
+
+    ctx = SimpleNamespace(capability="verify")
+    await run_opencode(ctx, "run the test suite")
+
+    fake_run_opencode.assert_awaited_once()
+    _, kwargs = fake_run_opencode.await_args
+    assert kwargs["extra_env"] == {"HOME": "/fake/build-cache"}
+
+
+@pytest.mark.asyncio
+async def test_run_opencode_leaves_home_untouched_for_other_capabilities(monkeypatch):
+    # Only verify shells out to build tooling — analyze/generate_change/
+    # publish_pr have no business sharing state through a real $HOME (and
+    # opencode's own state is isolated separately, per-request, in
+    # opencode_runtime.py). The build-cache reservation (with its own
+    # eviction sweep + lock acquisition) must not even be entered for them.
+    def fail_if_called():
+        raise AssertionError("reserve_build_cache_home must not be used outside verify")
+
+    monkeypatch.setattr(opencode_cli, "reserve_build_cache_home", fail_if_called)
+    fake_run_opencode = AsyncMock(return_value={"text": "ok", "trace": {}})
+    monkeypatch.setattr(opencode_cli, "_run_opencode", fake_run_opencode)
+
+    ctx = SimpleNamespace(capability="analyze")
+    await run_opencode(ctx, "investigate")
+
+    _, kwargs = fake_run_opencode.await_args
+    assert kwargs.get("extra_env") is None
 
 
 def test_ari_analyze_and_ari_change_cannot_commit_or_push():

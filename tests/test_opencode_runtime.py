@@ -1,10 +1,14 @@
 import json
+import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from common.opencode_runtime import _build_trace, _parse_events, merge_traces  # noqa: E402
+from common.capabilities_base import StepContext  # noqa: E402
+from common.opencode_runtime import _build_trace, _parse_events, merge_traces, run_opencode  # noqa: E402
 
 # Captured verbatim (minus the huge nested responseHeaders blob) from a live
 # `opencode run --format json` invocation against a real opencode v1.18.31
@@ -122,3 +126,93 @@ def test_merge_traces_combines_elapsed_counts_and_top_gaps():
     assert merged["tool_call_counts"] == {"read": 3, "edit": 1}
     assert merged["tool_call_total"] == 4
     assert merged["slowest_gaps"][0]["preceded_by_gap_s"] == 3.0
+
+
+def _ctx(workspace: str) -> StepContext:
+    return StepContext(
+        request_id="req-1",
+        workspace=workspace,
+        prompt="fix the bug",
+        config={"llm": {"provider": "anthropic", "api_key": "sk-x", "model": "claude-x"}},
+        capability="analyze",
+        params={},
+        results={},
+    )
+
+
+class _FakeProcess:
+    returncode = 0
+
+    async def communicate(self):
+        return b"", b""
+
+
+@pytest.mark.asyncio
+async def test_run_opencode_isolates_xdg_state_per_request_workspace(tmp_path, monkeypatch):
+    # Regression test for the live "database is locked" failure: two
+    # concurrent requests' opencode subprocesses must never share
+    # XDG_DATA_HOME (and therefore never share opencode's own local
+    # session/auth SQLite state), see the comment in
+    # opencode_runtime.run_opencode. Real $HOME is deliberately left alone
+    # so verify's build-tool dependency caches (~/.m2, ~/go, ~/.npm) stay
+    # shared/warm across requests.
+    captured_env = {}
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured_env.update(kwargs["env"])
+        return _FakeProcess()
+
+    monkeypatch.setattr("common.opencode_runtime.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+    workspace = tmp_path / "req-1-workspace"
+    workspace.mkdir()
+    ctx = _ctx(str(workspace))
+
+    await run_opencode(ctx, "investigate", "ari-analyze")
+
+    expected_state_dir = str(workspace / ".opencode-state")
+    assert "HOME" not in captured_env or captured_env["HOME"] == os.environ.get("HOME")
+    assert captured_env["XDG_DATA_HOME"] == str(Path(expected_state_dir) / "data")
+    assert captured_env["XDG_CONFIG_HOME"] == str(Path(expected_state_dir) / "config")
+    assert Path(expected_state_dir).is_dir()
+
+
+@pytest.mark.asyncio
+async def test_run_opencode_state_isolation_differs_across_requests(tmp_path, monkeypatch):
+    captured_envs = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured_envs.append(kwargs["env"])
+        return _FakeProcess()
+
+    monkeypatch.setattr("common.opencode_runtime.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+    ws_a = tmp_path / "request-a"
+    ws_b = tmp_path / "request-b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+
+    await run_opencode(_ctx(str(ws_a)), "investigate", "ari-analyze")
+    await run_opencode(_ctx(str(ws_b)), "investigate", "ari-analyze")
+
+    assert captured_envs[0]["XDG_DATA_HOME"] != captured_envs[1]["XDG_DATA_HOME"]
+
+
+@pytest.mark.asyncio
+async def test_run_opencode_extra_env_overrides_state_isolation_defaults(tmp_path, monkeypatch):
+    captured_env = {}
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured_env.update(kwargs["env"])
+        return _FakeProcess()
+
+    monkeypatch.setattr("common.opencode_runtime.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+    workspace = tmp_path / "req-1-workspace"
+    workspace.mkdir()
+
+    await run_opencode(
+        _ctx(str(workspace)), "investigate", "ari-analyze", extra_env={"XDG_DATA_HOME": "/custom/data"}
+    )
+
+    assert captured_env["XDG_DATA_HOME"] == "/custom/data"

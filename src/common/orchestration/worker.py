@@ -33,8 +33,17 @@ async def main() -> None:
         task_queue=settings.temporal_task_queue,
         workflows=[AriAgentWorkflow],
         activities=[prepare_workspace, plan_task, execute_step, cleanup_workspace, resolve_artifacts],
+        # See settings.max_concurrent_activities — bounds concurrent
+        # opencode/git/build subprocesses to what this pod's own CPU/memory
+        # limits can actually sustain, instead of the SDK's default of 100.
+        max_concurrent_activities=settings.max_concurrent_activities,
     )
-    logger.info("worker_starting", task_queue=settings.temporal_task_queue, namespace=settings.temporal_namespace)
+    logger.info(
+        "worker_starting",
+        task_queue=settings.temporal_task_queue,
+        namespace=settings.temporal_namespace,
+        max_concurrent_activities=settings.max_concurrent_activities,
+    )
     await worker.run()
 
 

@@ -34,7 +34,9 @@ def source_repo(tmp_path):
 @pytest.fixture(autouse=True)
 def cache_root(tmp_path, monkeypatch):
     root = tmp_path / "cache-root"
-    fake_settings = SimpleNamespace(repo_cache_root=str(root))
+    fake_settings = SimpleNamespace(
+        repo_cache_root=str(root), cache_evict_low_water=0.15, cache_evict_high_water=0.30
+    )
     monkeypatch.setattr(repo_cache, "get_settings", lambda: fake_settings)
     return root
 
@@ -200,6 +202,25 @@ async def test_ensure_cache_and_clone_never_lets_a_refresh_run_while_another_req
         "clone_start",
         "clone_end",
     ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_cache_runs_an_eviction_sweep_before_touching_its_own_lock(source_repo, cache_root, monkeypatch):
+    # Regression coverage for the LRU-eviction wiring itself: both entry
+    # points must sweep *other* repos' mirrors for space before doing
+    # their own work, not just rely on cache_gc.py's own unit tests.
+    calls = []
+    real_evict = repo_cache.evict_lru_entries_if_low_on_space
+
+    def recording_evict(cache_root_, **kwargs):
+        calls.append(cache_root_)
+        return real_evict(cache_root_, **kwargs)
+
+    monkeypatch.setattr(repo_cache, "evict_lru_entries_if_low_on_space", recording_evict)
+
+    await repo_cache.ensure_cache({"url": str(source_repo)})
+
+    assert calls == [str(cache_root)]
 
 
 def test_authed_url_only_transforms_when_pat_present():

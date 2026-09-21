@@ -79,6 +79,7 @@ async def plan_task(payload: dict) -> dict:
                     "params": confirmed_action,
                     "retry": {"max_attempts": spec.retry.max_attempts, "backoff_seconds": spec.retry.backoff_seconds},
                     "on_failure": spec.on_failure.model_dump() if spec.on_failure else None,
+                    "timeout_seconds": spec.timeout_seconds,
                     "confirmed": True,
                 }
             ],
@@ -96,6 +97,7 @@ async def plan_task(payload: dict) -> dict:
                 "params": step.params,
                 "retry": {"max_attempts": spec.retry.max_attempts, "backoff_seconds": spec.retry.backoff_seconds},
                 "on_failure": on_failure.model_dump() if on_failure else None,
+                "timeout_seconds": spec.timeout_seconds,
                 "confirmed": False,
             }
         )

@@ -35,9 +35,12 @@ Scope/limits, documented rather than silently assumed:
   window rather than letting reads and writes interleave — a deliberate
   correctness-over-throughput trade-off; requests against *different*
   repos are unaffected (they use different lock keys).
-- No eviction/GC — the cache root grows with the number of distinct repos
-  ever requested. Fine for a bounded set of well-known repos; revisit if
-  that stops being true.
+- LRU eviction (`common/cache_gc.py`, called from `ensure_cache`/
+  `ensure_cache_and_clone` before this repo's own lock is taken): when the
+  PVC backing this cache root is low on free space, the least-recently-used
+  *other* repos' mirrors are deleted first, skipping any currently locked
+  (in-flight fetch/clone). Opportunistic, not a guarantee — a sweep that
+  finds every other entry busy evicts nothing that round.
 - Never persists a caller's credential to disk: the initial mirror clone
   and every later fetch pass a one-off authenticated URL on the command
   line (never stored), and the cache's persisted `origin` remote is
@@ -56,6 +59,7 @@ import subprocess
 import tempfile
 from contextlib import asynccontextmanager
 
+from common.cache_gc import evict_lru_entries_if_low_on_space
 from common.settings import get_settings
 from .git_ops import authed_url
 from .git_ops import clone as git_clone
@@ -142,6 +146,23 @@ async def _locked_cache_dir(url: str):
             lock_file.close()
 
 
+async def _evict_if_needed(cache_root: str) -> None:
+    """Opportunistic LRU sweep of *other* repos' mirrors, run before this
+    repo's own lock is taken — see common/cache_gc.py. The PVC backing
+    `cache_root` is deliberately small (5Gi) relative to what a growing
+    set of distinct repos can cache, so this isn't an edge case, it's
+    expected to run regularly. A repo it can't evict (busy right now, or
+    genuinely nothing to free) just means this call proceeds to clone/fetch
+    on whatever space remains, same as before this existed."""
+    settings = get_settings()
+    await asyncio.to_thread(
+        evict_lru_entries_if_low_on_space,
+        cache_root,
+        low_water=settings.cache_evict_low_water,
+        high_water=settings.cache_evict_high_water,
+    )
+
+
 async def ensure_cache(repo_config: dict) -> str:
     """Ensures a local mirror cache for `repo_config['url']` exists and is
     freshly fetched, then returns the cache directory path. Safe to call
@@ -154,8 +175,10 @@ async def ensure_cache(repo_config: dict) -> str:
     after (i.e. `clone_repo`) should use `ensure_cache_and_clone` instead,
     which holds the lock across both steps.
     """
+    cache_root = get_settings().repo_cache_root
+    await _evict_if_needed(cache_root)
     async with _locked_cache_dir(repo_config["url"]):
-        return await asyncio.to_thread(_sync_refresh_cache, repo_config, get_settings().repo_cache_root)
+        return await asyncio.to_thread(_sync_refresh_cache, repo_config, cache_root)
 
 
 async def ensure_cache_and_clone(repo_config: dict, ref: str | None, workspace: str) -> tuple[str, str]:
@@ -169,8 +192,10 @@ async def ensure_cache_and_clone(repo_config: dict, ref: str | None, workspace: 
     and the clone see a consistent cache state. Returns
     `(cloned_path, resolved_ref)`.
     """
+    cache_root = get_settings().repo_cache_root
+    await _evict_if_needed(cache_root)
     async with _locked_cache_dir(repo_config["url"]):
-        cache_dir = await asyncio.to_thread(_sync_refresh_cache, repo_config, get_settings().repo_cache_root)
+        cache_dir = await asyncio.to_thread(_sync_refresh_cache, repo_config, cache_root)
         resolved_ref = ref or await git_default_branch(cache_dir)
         cloned_path = await git_clone({"url": cache_dir, "ref": resolved_ref}, workspace)
         return cloned_path, resolved_ref

@@ -244,7 +244,37 @@ async def run_opencode(
         cmd.append("--continue")
     cmd.append(instruction)
 
-    env = {**os.environ, **extra_env} if extra_env else None
+    # opencode keeps its own local session/auth state under XDG_DATA_HOME
+    # (default ~/.local/share/opencode/...), one shared SQLite file
+    # regardless of --dir. Without per-request isolation, two capabilities
+    # from *different* requests that happen to call opencode concurrently
+    # in this same worker process collide on that file — confirmed live as
+    # `RuntimeError: opencode (...) failed (exit 1): ... database is
+    # locked`, costing a full activity retry (~30-40s) or an outright
+    # failure. Only the XDG_* dirs are isolated per request, deliberately
+    # NOT the real $HOME: `verify` shells out to the target repo's own
+    # build tooling (mvn/go/npm) via opencode's bash tool, which inherits
+    # this same env — those tools cache dependencies under the real
+    # $HOME (~/.m2, ~/go, ~/.npm), and overriding HOME too would silently
+    # force a cold dependency download on every single request, on top of
+    # opencode's own state. Isolating XDG_DATA_HOME alone still fully fixes
+    # the lock contention (that's the only thing opencode itself reads/
+    # writes there) while leaving those build caches shared and warm across
+    # requests on this pod. Cleaned up for free by cleanup_workspace tearing
+    # down the workspace — nothing new to garbage-collect. Auth/model
+    # config isn't affected either way: opencode reads that from the
+    # per-request opencode.json in --dir (write_config), never from
+    # anything under HOME/XDG_DATA_HOME.
+    opencode_state_dir = os.path.join(ctx.workspace, ".opencode-state")
+    os.makedirs(opencode_state_dir, exist_ok=True)
+    base_env = {
+        **os.environ,
+        "XDG_DATA_HOME": os.path.join(opencode_state_dir, "data"),
+        "XDG_CONFIG_HOME": os.path.join(opencode_state_dir, "config"),
+        "XDG_CACHE_HOME": os.path.join(opencode_state_dir, "cache"),
+        "XDG_STATE_HOME": os.path.join(opencode_state_dir, "state"),
+    }
+    env = {**base_env, **extra_env} if extra_env else base_env
 
     start = time.monotonic()
     proc = await asyncio.create_subprocess_exec(

@@ -32,6 +32,14 @@ class CapabilitySpec:
     tools: list[str] = field(default_factory=list)
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     on_failure: Optional[OnFailure] = None
+    # Per-capability override for the activity's start_to_close_timeout —
+    # None means workflow.py's own default (20 minutes). `verify` sets this
+    # much shorter (see capabilities.yaml): confirmed live that without a
+    # capability-specific bound, a hung/slow verify run just sat there
+    # until an external caller's own patience timeout cancelled it,
+    # wasting 8-10+ minutes before the pipeline could even start its
+    # normal on_failure retry loop.
+    timeout_seconds: Optional[int] = None
     # Internal capabilities (e.g. "respond") are run directly by the
     # workflow, never chosen by the planner — excluded from catalog() so
     # the planner's system prompt doesn't see them as an optional step.
@@ -56,6 +64,7 @@ def _load_specs() -> dict[str, CapabilitySpec]:
             tools=entry.get("tools", []),
             retry=retry,
             on_failure=on_failure,
+            timeout_seconds=entry.get("timeout_seconds"),
             internal=entry.get("internal", False),
         )
     return specs
