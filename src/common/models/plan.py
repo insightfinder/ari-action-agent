@@ -25,3 +25,12 @@ class Step(BaseModel):
 class Plan(BaseModel):
     steps: list[Step]
     rationale: str = ""
+    # Oncall-specific escape hatch (unused/always-false for other agent
+    # kinds): the planner sets this to true ONLY when the request
+    # explicitly says not to open a PR — see ari_oncall_agent/meta.py's
+    # default_step_policy, which otherwise always appends "publish_pr"
+    # whenever "generate_change" ran and the planner's own step list
+    # didn't already include it. A field the planner explicitly sets,
+    # not inferred from step-list absence alone: that alone can't
+    # distinguish "the model forgot" from "the user declined."
+    skip_publish_pr: bool = False

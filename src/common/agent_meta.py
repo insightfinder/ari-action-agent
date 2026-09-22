@@ -14,9 +14,11 @@ shared code, not oncall's code with a jenkins branch bolted on.
 import importlib
 from dataclasses import dataclass, field
 from functools import lru_cache
+from typing import Callable, Optional
 
 from a2a.types import AgentSkill
 
+from .models.plan import Plan, Step
 from .settings import get_settings
 
 # The only place this module knows a specific agent kind's name maps to a
@@ -54,6 +56,18 @@ class AgentMeta:
     # for an agent kind that never pauses for human-in-the-loop
     # confirmation (e.g. oncall).
     confirm_capability: str | None = None
+    # Optional per-agent-kind policy applied to the LLM planner's raw step
+    # list right after it comes back (orchestration/activities.py's
+    # plan_task, an activity — safe to call this from here; never
+    # imported by workflow.py itself, see the sandbox-import warning
+    # above `_AGENT_PACKAGES`). Exists because prompt guidance alone isn't
+    # reliable enough for "always do X by default" policies — confirmed
+    # live (docs/MEMORY.md): a smaller/cheaper planner model inconsistently
+    # included oncall's own "publish_pr" step for the same kind of request
+    # across separate runs, purely from wording in its own system prompt.
+    # None for an agent kind with no such default-step policy (e.g.
+    # jenkins).
+    default_step_policy: Optional[Callable[[Plan, dict], list[Step]]] = None
 
 
 def _agent_package(agent_kind: str) -> str:

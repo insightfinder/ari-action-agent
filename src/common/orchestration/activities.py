@@ -87,8 +87,13 @@ async def plan_task(payload: dict) -> dict:
         }
 
     plan = await create_plan(payload["prompt"], payload["config"], payload.get("history", []))
+    steps = plan.steps
+    default_step_policy = get_agent_meta().default_step_policy
+    if default_step_policy:
+        steps = default_step_policy(plan, payload["config"].get("options", {}))
+
     enriched_steps = []
-    for step in plan.steps:
+    for step in steps:
         spec = get_capability(step.capability)
         on_failure = step.on_failure or spec.on_failure
         enriched_steps.append(

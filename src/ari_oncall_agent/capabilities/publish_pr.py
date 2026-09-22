@@ -118,6 +118,16 @@ async def _publish_via_opencode(
 
 
 async def run(ctx: StepContext) -> dict:
+    # Belt-and-suspenders alongside meta.py's default_step_policy (which
+    # normally wouldn't even schedule this step when skip_pr is set) — in
+    # case the planner includes it anyway despite an explicit opt-out.
+    if ctx.config.get("options", {}).get("skip_pr"):
+        return {"status": "skipped"}
+
+    # Fails fast and clearly if the planner's step list omitted clone_repo
+    # — see StepContext.require_cloned_repo's own docstring.
+    repo_dir = ctx.require_cloned_repo()
+
     git_add = ctx.tool("git_add")
     git_commit = ctx.tool("git_commit")
     git_push = ctx.tool("git_push")
@@ -128,7 +138,14 @@ async def run(ctx: StepContext) -> dict:
     if not changed_files:
         raise RuntimeError("publish_pr: generate_change reported no changed files to publish")
 
-    title = ctx.params.get("title") or f"ARI: {(change.get('summary') or ctx.prompt)[:72]}"
+    # `change["title"]` is generate_change's own purpose-built title (a
+    # short, complete phrase, never a truncated slice of the body) —
+    # guaranteed present whenever changed_files is (see that capability's
+    # own fallback). Confirmed live as a real bug this replaced: title and
+    # body used to come from the exact same summary text at two different
+    # lengths, so the title read as a sentence cut off mid-word (e.g.
+    # insightfinder/insightfinder-mcp-server#55).
+    title = ctx.params.get("title") or f"ARI: {change.get('title') or 'automated change'}"
     body = change.get("summary") or ctx.prompt
     repo = ctx.config["repo"]
     # Same fallback chain either way: the planner can override the PR's
@@ -154,9 +171,9 @@ async def run(ctx: StepContext) -> dict:
         )
 
     try:
-        await git_add(ctx.repo_dir, changed_files)
-        await git_commit(ctx.repo_dir, title, body)
-        await git_push(ctx.repo_dir, repo, branch)
+        await git_add(repo_dir, changed_files)
+        await git_commit(repo_dir, title, body)
+        await git_push(repo_dir, repo, branch)
         pr = await create_pr(repo, _repo_slug(repo["url"]), title, body, branch, base_ref)
         return {"pr": pr}
     except Exception as exc:

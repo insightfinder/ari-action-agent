@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import ari_oncall_agent.protected_branches as protected_branches_module  # noqa: E402
 import ari_oncall_agent.tools.opencode_cli as opencode_cli  # noqa: E402
 from ari_oncall_agent.tools.opencode_cli import (  # noqa: E402
     _AGENT_DEFS,
@@ -17,6 +18,21 @@ from ari_oncall_agent.tools.opencode_cli import (  # noqa: E402
     run_opencode,
     write_config,
 )
+
+
+@pytest.fixture
+def isolated_protected_branches_config(tmp_path, monkeypatch):
+    """Points protected_branches.py's loader at a throwaway config instead
+    of the real configs/oncall/protected_branches.yaml — some tests need
+    to assert on an *unconfigured* repo getting exactly the defaults and
+    nothing more, which would otherwise be at the mercy of whatever an
+    operator has since added to that shared, editable file."""
+    path = tmp_path / "protected_branches.yaml"
+    path.write_text("default_protected_branches: [main, master]\nprotected_branches: {}\n")
+    monkeypatch.setattr(protected_branches_module, "config_file", lambda name: path)
+    protected_branches_module._load.cache_clear()
+    yield
+    protected_branches_module._load.cache_clear()
 
 # From configs/oncall/protected_branches.yaml -- a real configured repo,
 # not a fixture, since these tests exercise the actual blacklist.
@@ -152,10 +168,13 @@ def test_protected_branch_push_denies_covers_common_push_forms():
     assert denies["git push origin master*"] == "deny"
 
 
-def test_protected_branch_push_denies_still_covers_main_and_master_for_an_unconfigured_repo():
-    # No entry under configs/oncall/protected_branches.yaml's
-    # protected_branches: at all -- main/master are still denied by
-    # default (protected_branches.py's default_protected_branches).
+def test_protected_branch_push_denies_still_covers_main_and_master_for_an_unconfigured_repo(
+    isolated_protected_branches_config,
+):
+    # No entry under protected_branches: at all -- main/master are still
+    # denied by default (protected_branches.py's default_protected_branches).
+    # Isolated config so this doesn't depend on whatever an operator has
+    # since added to the real configs/oncall/protected_branches.yaml.
     denies = _protected_branch_push_denies("https://github.com/some-org/unrelated-repo")
 
     assert denies["git push origin main*"] == "deny"
@@ -180,17 +199,17 @@ def test_write_config_adds_protected_branch_denies_for_a_configured_repo(tmp_pat
     assert cfg["agent"]["ari-change"]["permission"]["bash"] == _AGENT_DEFS["ari-change"]["permission"]["bash"]
 
 
-def test_write_config_still_denies_main_and_master_for_a_repo_with_no_own_entry(tmp_path):
+def test_write_config_still_denies_main_and_master_for_a_repo_with_no_own_entry(
+    tmp_path, isolated_protected_branches_config
+):
     # main/master are protected for every repo by default (see
     # protected_branches.py) — a repo with no entry of its own under
     # protected_branches: still must not get the untouched, unpatched
-    # default bash permission.
+    # default bash permission. Isolated config (main/master only, no
+    # per-repo entries) so this doesn't depend on whatever an operator has
+    # since added to the real configs/oncall/protected_branches.yaml.
     (tmp_path / ".git" / "info").mkdir(parents=True)
 
-    # Call once for a repo with its own extra entries first, to guard
-    # against a shared-mutable-dict bug leaking one request's denies into
-    # another's.
-    write_config(str(tmp_path), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, _PROTECTED_REPO)
     path = write_config(
         str(tmp_path), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, {"url": "https://github.com/x/y", "pat": "t"}
     )
@@ -200,9 +219,42 @@ def test_write_config_still_denies_main_and_master_for_a_repo_with_no_own_entry(
     assert publish_bash != _AGENT_DEFS["ari-publish"]["permission"]["bash"]
     assert publish_bash["git push origin main*"] == "deny"
     assert publish_bash["git push origin master*"] == "deny"
-    # This repo has no dev/staging/test entry -- must not inherit them
-    # from the earlier call for _PROTECTED_REPO.
     assert not any("dev" in pattern or "staging" in pattern for pattern in publish_bash)
+
+
+def test_write_config_never_leaks_one_repos_denies_into_anothers(tmp_path, monkeypatch):
+    # A repo with its own extra protected branch, called first, must not
+    # leak those denies into a later call for an unrelated repo (a
+    # shared-mutable-dict bug would do exactly this). Isolated config with
+    # an explicit per-repo entry, so the "no leak" assertion is actually
+    # meaningful rather than trivially true.
+    config_path = tmp_path / "protected_branches.yaml"
+    config_path.write_text(
+        "default_protected_branches: [main, master]\n"
+        "protected_branches:\n"
+        "  https://github.com/insightfinder/InfrastructureCore: [canary]\n"
+    )
+    monkeypatch.setattr(protected_branches_module, "config_file", lambda name: config_path)
+    protected_branches_module._load.cache_clear()
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git" / "info").mkdir(parents=True)
+    try:
+        write_config(
+            str(repo_dir),
+            {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"},
+            {"url": "https://github.com/insightfinder/InfrastructureCore", "pat": "ghp_x"},
+        )
+        path = write_config(
+            str(repo_dir), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, {"url": "https://github.com/x/y", "pat": "t"}
+        )
+
+        cfg = json.loads(Path(path).read_text())
+        publish_bash = cfg["agent"]["ari-publish"]["permission"]["bash"]
+        assert not any("canary" in pattern for pattern in publish_bash)
+        assert publish_bash["git push origin main*"] == "deny"
+    finally:
+        protected_branches_module._load.cache_clear()
 
 
 def test_ari_change_cannot_commit_or_push():

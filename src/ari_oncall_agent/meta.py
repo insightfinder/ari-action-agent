@@ -4,6 +4,32 @@ for what reads this and why it lives here instead of in common/."""
 from a2a.types import AgentSkill
 
 from common.agent_meta import AgentMeta
+from common.models.plan import Plan, Step
+
+
+def _ensure_publish_pr_by_default(plan: Plan, options: dict) -> list[Step]:
+    """Opening a PR is this agent's actual deliverable for any code
+    change — always append "publish_pr" when "generate_change" ran and
+    the planner's own step list didn't already include it, unless the
+    request explicitly opted out (`options.skip_pr`, or the planner set
+    `skip_publish_pr: true` because the request itself said not to open
+    a PR).
+
+    Prompt guidance alone isn't reliable enough for this "by default"
+    policy — confirmed live (docs/MEMORY.md): a smaller/cheaper planner
+    model inconsistently included this same step for the exact same kind
+    of request across separate runs, purely from wording in its own
+    system prompt. This makes it a deterministic guarantee instead of
+    something the LLM has to remember every time — the same lesson as
+    `StepContext.require_cloned_repo` for `clone_repo`, applied to a
+    default-behavior policy instead of a hard technical prerequisite.
+    """
+    if options.get("skip_pr") or plan.skip_publish_pr:
+        return plan.steps
+    names = {step.capability for step in plan.steps}
+    if "generate_change" in names and "publish_pr" not in names:
+        return [*plan.steps, Step(capability="publish_pr")]
+    return plan.steps
 
 META = AgentMeta(
     description=(
@@ -35,6 +61,12 @@ META = AgentMeta(
 ("remove field X, keep it empty", "rename Y to Z", "add a param to this \
 endpoint"), or a bare question. Don't default to treating every repo \
 request as a bug fix:
+- **"clone_repo" MUST be the first step of every plan that includes \
+"generate_change", "verify", or "publish_pr"** — those three all operate \
+on the repo clone_repo produces (via --dir); without it there is no \
+checked-out repo to investigate, edit, test, or publish from at all, and \
+the step will fail. Never schedule "generate_change"/"verify"/"publish_pr" \
+without "clone_repo" appearing earlier in the same step list.
 - "generate_change" both investigates (root cause for a bug, scope for a \
 feature/edit) and edits, in one step — there is no separate investigation \
 step to choose or skip.
@@ -44,6 +76,17 @@ when the request explicitly asks for tests/verification to be run (e.g. \
 an ordinary bug fix/feature/edit request — building/testing an arbitrary \
 target repo is this pipeline's slowest, least predictable step, a real \
 cost only worth paying when actually asked for.
+- "publish_pr" is the OPPOSITE — opt-OUT, part of the default pipeline: \
+whenever "generate_change" runs, a PR gets opened by default, whether or \
+not you include "publish_pr" yourself (a code change that's never shipped \
+isn't useful). Only skip it when the request explicitly says not to open \
+a PR / just wants to see the change / asks to skip the PR (e.g. "just \
+show me the diff, don't open a PR", "no PR needed", "make the change but \
+don't ship it yet") — in that case, and only that case, set the top-level \
+`"skip_publish_pr": true` in your JSON response (a sibling of "steps" and \
+"rationale"), not just leaving "publish_pr" out of the step list (that \
+alone is treated as "you forgot," not "the user declined," and a PR gets \
+opened anyway).
 - Set a step's `instruction` param with wording tailored to what's actually \
 being asked (e.g. "implement this feature: ...", "make this specific edit: \
 ...", "fix this bug: ...") whenever "generate_change"'s generic default \
@@ -73,4 +116,5 @@ the capability already has a sensible default.""",
         "root_cause": "generate_change.root_cause",
         "pull_request": "publish_pr.pr",
     },
+    default_step_policy=_ensure_publish_pr_by_default,
 )

@@ -1,13 +1,39 @@
 from common.opencode_runtime import merge_traces
 from common.capabilities_base import StepContext
 
+_TITLE_MARKER = "TITLE:"
 _SUMMARY_MARKER = "SUMMARY:"
+_MAX_TITLE_LEN = 72
 
 _ENFORCEMENT_INSTRUCTION = (
-    "Reply with ONLY a concise, PR-ready description of what you just changed and why — "
-    "written for someone who did not watch you work. No narration, no 'let's do X' "
-    "commentary, no code, no markdown headers, no tool calls. Just the summary text."
+    "Reply with ONLY two marked sections, nothing else: a line reading exactly 'TITLE:' "
+    "followed on the same line by a short, complete PR title (one finished sentence or "
+    "phrase, e.g. 'Add fetch_all_log_and_metric_projects tool' — never a fragment cut off "
+    "mid-word or mid-sentence, under 70 characters), then a line reading exactly 'SUMMARY:' "
+    "followed by a concise, PR-ready description of what you just changed and why — written "
+    "for someone who did not watch you work. No narration, no 'let's do X' commentary, no "
+    "code, no markdown headers, no tool calls."
 )
+
+
+def _extract_marked_line(text: str, marker: str) -> str | None:
+    """Everything on the same line as the *last* occurrence of `marker`,
+    stopping at the next newline or the start of a `SUMMARY:` section,
+    whichever comes first. A title is always one short line — unlike
+    `_extract_summary` below, this never has to guard against a
+    multi-line blob."""
+    idx = text.rfind(marker)
+    if idx == -1:
+        return None
+    rest = text[idx + len(marker) :]
+    end = len(rest)
+    newline_idx = rest.find("\n")
+    if newline_idx != -1:
+        end = min(end, newline_idx)
+    summary_idx = rest.find(_SUMMARY_MARKER)
+    if summary_idx != -1:
+        end = min(end, summary_idx)
+    return rest[:end].strip()
 
 
 def _extract_summary(text: str) -> str | None:
@@ -41,6 +67,30 @@ def _extract_summary(text: str) -> str | None:
     return text[idx + len(_SUMMARY_MARKER) :].strip()
 
 
+def _safe_title(text: str, max_len: int = _MAX_TITLE_LEN) -> str:
+    """Last-resort title derivation for the rare case opencode never
+    produces a `TITLE:` line even after the enforcement follow-up —
+    confirmed live as a real gap, not theoretical: a PR (insightfinder/
+    insightfinder-mcp-server#55) got the title "ARI: Implemented a new
+    tool, fetch_all_log_and_metric_projects, that aggreg-", a blind
+    72-character slice of the *summary* text cut off mid-word, because
+    there was no separate title at all — title and body were the exact
+    same string at two different lengths. This takes the first sentence
+    of whatever text is available and truncates at a word boundary (never
+    mid-word) with an ellipsis if it's still too long. Never returns
+    empty."""
+    first_line = text.strip().split("\n", 1)[0].strip()
+    for sep in (". ", "! ", "? "):
+        idx = first_line.find(sep)
+        if idx != -1:
+            first_line = first_line[: idx + 1].strip()
+            break
+    if len(first_line) > max_len:
+        truncated = first_line[:max_len].rsplit(" ", 1)[0].rstrip(".,;:")
+        first_line = (truncated or first_line[:max_len]) + "…"
+    return first_line or "automated change"
+
+
 async def run(ctx: StepContext) -> dict:
     """Investigates and edits in one opencode call — there used to be a
     separate `analyze` capability (read-only, its own opencode agent/
@@ -54,6 +104,13 @@ async def run(ctx: StepContext) -> dict:
     SUMMARY-marked text as the change summary — for a single-pass agent
     "what I found and did" is one coherent narrative, not two.
     """
+    # Fails fast and clearly if the planner's step list omitted clone_repo
+    # — confirmed live as a real failure mode (a smaller/cheaper planner
+    # model dropped it), which otherwise surfaces only as opencode's own
+    # opaque crash against an empty, non-git --dir. See
+    # StepContext.require_cloned_repo's own docstring.
+    ctx.require_cloned_repo()
+
     opencode = ctx.tool("opencode")
     git_diff = ctx.tool("git_diff")
 
@@ -75,14 +132,19 @@ async def run(ctx: StepContext) -> dict:
           "already names the exact fields/files/behavior to change, there's nothing to "
           "investigate first — go straight to editing. "
           "Make the smallest change that fully satisfies the request. End your response "
-          "with a line reading exactly 'SUMMARY:' followed by a concise, PR-ready "
-          "description of the root cause (if any) and what changed and why — written "
-          "for someone who did not watch you work, with no step-by-step narration or "
-          "'let's do X' commentary."
+          "with two marked sections: a line reading exactly 'TITLE:' followed on the same "
+          "line by a short, complete PR title (one finished sentence or phrase, e.g. 'Add "
+          "fetch_all_log_and_metric_projects tool' — never a fragment cut off mid-word, "
+          "under 70 characters), then a line reading exactly 'SUMMARY:' followed by a "
+          "concise, PR-ready description of the root cause (if any) and what changed and "
+          "why — written for someone who did not watch you work, with no step-by-step "
+          "narration or 'let's do X' commentary. The title and summary must be different "
+          "text — the title is a short heading, not a truncated copy of the summary."
     )
     result = await opencode(ctx, instruction)
     trace = result["trace"]
     summary = _extract_summary(result["text"])
+    title = _extract_marked_line(result["text"], _TITLE_MARKER)
     if summary is None:
         # opencode didn't end with the required marker — ask again,
         # narrowly, rather than falling back to the raw narration (which
@@ -94,12 +156,16 @@ async def run(ctx: StepContext) -> dict:
         # otherwise start a second, context-less session that has no idea
         # what was just changed.
         followup = await opencode(ctx, _ENFORCEMENT_INSTRUCTION, continue_session=True)
-        summary = followup["text"].strip() or result["text"].strip()
+        summary = _extract_summary(followup["text"]) or followup["text"].strip() or result["text"].strip()
+        title = title or _extract_marked_line(followup["text"], _TITLE_MARKER)
         trace = merge_traces(trace, followup["trace"])
+    if not title:
+        title = _safe_title(summary)
     diff = await git_diff(ctx.repo_dir)
     changed_files = await ctx.tool("git_changed_files")(ctx.repo_dir)
     return {
         "root_cause": {"summary": summary, "evidence": []},
+        "title": title,
         "summary": summary,
         "diff": diff,
         "changed_files": changed_files,

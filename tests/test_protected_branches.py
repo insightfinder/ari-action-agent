@@ -29,15 +29,6 @@ def test_protected_branches_matches_regardless_of_dot_git_suffix_or_scheme():
     assert is_protected("http://github.com/insightfinder/InfrastructureCore", "staging")
 
 
-def test_unconfigured_repo_still_gets_main_and_master_protected_by_default():
-    # No entry at all under protected_branches: -- must still get the
-    # default_protected_branches, not an empty blacklist.
-    assert protected_branches("https://github.com/some-org/unrelated-repo") == {"main", "master"}
-    assert is_protected("https://github.com/some-org/unrelated-repo", "main")
-    assert is_protected("https://github.com/some-org/unrelated-repo", "master")
-    assert not is_protected("https://github.com/some-org/unrelated-repo", "dev")
-
-
 def test_main_and_master_are_protected_by_default_for_the_configured_repo_too():
     assert is_protected("https://github.com/insightfinder/InfrastructureCore", "main")
     assert is_protected("https://github.com/insightfinder/InfrastructureCore", "master")
@@ -73,6 +64,18 @@ def test_default_protected_branches_is_itself_configurable(custom_config):
 
     assert protected_branches("https://github.com/some-org/any-repo") == {"release"}
     assert not is_protected("https://github.com/some-org/any-repo", "main")
+
+
+def test_unconfigured_repo_gets_exactly_the_configured_defaults(custom_config):
+    # No entry at all under protected_branches: -- must still get
+    # default_protected_branches, not an empty blacklist. Uses an isolated
+    # config (not the real configs/oncall/protected_branches.yaml) so this
+    # doesn't depend on that file's current default list.
+    custom_config("default_protected_branches: [main, master]\nprotected_branches: {}\n")
+
+    assert protected_branches("https://github.com/some-org/unrelated-repo") == {"main", "master"}
+    assert is_protected("https://github.com/some-org/unrelated-repo", "main")
+    assert not is_protected("https://github.com/some-org/unrelated-repo", "dev")
 
 
 def test_missing_config_file_still_protects_main_and_master(tmp_path, monkeypatch):

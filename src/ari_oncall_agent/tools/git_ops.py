@@ -82,6 +82,22 @@ async def default_branch(cache_dir: str) -> str:
     return stdout.decode().strip()
 
 
+async def branch_exists(cache_dir: str, branch: str) -> bool:
+    """Whether `branch` actually exists in this `--mirror` cache — checked
+    *before* attempting to clone an explicitly-given `ref`, so a wrong
+    guess (e.g. the planner assuming "main" for a repo whose real default
+    branch is "dev") is caught proactively (no failed clone attempt, no
+    fragile matching on git's own error text) rather than reactively."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+        cwd=cache_dir,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+    return proc.returncode == 0
+
+
 async def set_origin(workdir: str, repo_config: dict) -> None:
     """Re-points `origin` at the real upstream URL (PAT-embedded if
     configured). Used after cloning from the local repo cache — that

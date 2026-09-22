@@ -60,6 +60,31 @@ async def test_plan_task_normal_branch_marks_every_planner_step_unconfirmed(jenk
 
 
 @pytest.mark.asyncio
+async def test_plan_task_applies_oncalls_default_step_policy(monkeypatch):
+    # oncall's own default_step_policy (ari_oncall_agent/meta.py) appends
+    # publish_pr whenever generate_change ran and the planner's own step
+    # list omitted it -- exercised here through the real plan_task
+    # activity, not just the policy function in isolation.
+    monkeypatch.setenv("AGENT_KIND", "oncall")
+    get_settings.cache_clear()
+    get_agent_meta.cache_clear()
+    capabilities_registry._load_specs.cache_clear()
+    try:
+        create_plan = AsyncMock(
+            return_value=Plan(steps=[Step(capability="clone_repo"), Step(capability="generate_change")], rationale="r")
+        )
+        monkeypatch.setattr(activities, "create_plan", create_plan)
+
+        result = await activities.plan_task({"prompt": "fix it", "config": {"options": {}}, "history": []})
+
+        assert [s["capability"] for s in result["steps"]] == ["clone_repo", "generate_change", "publish_pr"]
+    finally:
+        get_settings.cache_clear()
+        get_agent_meta.cache_clear()
+        capabilities_registry._load_specs.cache_clear()
+
+
+@pytest.mark.asyncio
 async def test_resolve_artifacts_resolves_declared_artifacts_from_results(jenkins_agent_kind):
     # jenkins' own agent_meta.artifacts: {"pending_action": "propose_action.pending_action", ...}
     results = {"propose_action": {"pending_action": {"id": "abc"}, "trace": {}}}

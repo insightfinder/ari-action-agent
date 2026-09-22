@@ -215,19 +215,34 @@ new capabilities/tools/catalog entries, not a rewrite. Adding a whole new
    edit/refactor) would fit poorly. Malformed planner output falls back to
    the standard clone→change→publish pipeline (no `verify`, matching the
    opt-in default) rather than failing the request.
-2. `plan_task` enriches each step with its capability's `retry` and
+2. `plan_task` then applies this agent kind's own `default_step_policy`
+   (`common/agent_meta.py`, oncall's own in `ari_oncall_agent/meta.py`) to
+   the raw plan, if it has one — a deterministic, code-level correction
+   for a "by default" behavior that prompt guidance alone can't reliably
+   guarantee. Oncall's: `publish_pr` is opt-*out* (the reverse of
+   `verify`) — always appended when `generate_change` ran and the
+   planner's own step list omitted it, unless `options.skip_pr` or the
+   planner's own `skip_publish_pr: true` (set only when the request
+   itself said not to open a PR) says otherwise. Confirmed live this
+   split was necessary, not just theoretical: a smaller/cheaper planner
+   model inconsistently included `publish_pr` for the exact same kind of
+   request across separate runs, purely from wording in its own system
+   prompt — the same reliability gap `clone_repo` had (§6's
+   `require_cloned_repo`), just for a default-behavior policy instead of
+   a hard technical prerequisite.
+3. `plan_task` enriches each step with its capability's `retry` and
    `on_failure` policy from `configs/capabilities.yaml`, so
    `orchestration/workflow.py` itself never has to read the registry
    (keeps it free of filesystem/import side effects, required for
    Temporal's workflow sandbox).
-3. `workflow.py` walks the steps via the generic `execute_step` activity.
+4. `workflow.py` walks the steps via the generic `execute_step` activity.
    `verify` failing loops back to `generate_change` up to `max_attempts`,
    then the run ends in `fail_needs_human` (`status: "failed"`) rather
    than spinning forever. A step's raised exception (as opposed to a soft
    `{"status": "failed"}` return) is caught the same way, so any hard
    capability failure still reaches `cleanup_workspace` and `respond`
    instead of aborting the workflow with no explanation.
-4. Every step happens against one ephemeral sandbox workspace
+5. Every step happens against one ephemeral sandbox workspace
    (`tools/sandbox.py`, keyed by `request_id`), cleaned up when the
    workflow ends — one request's bad patch/hung test can't affect another.
 5. A final `respond` capability **always** runs after the loop above,
@@ -526,14 +541,41 @@ docs/MEMORY.md for why both `repoCacheRoot` and `buildCacheRoot` are
 deliberately small (5Gi) rather than sized to never fill up.
 
 **Dynamic branches**: `clone_repo` accepts an optional `ref` step param
-(which branch to check out — falls back to `repo.ref`/`"main"`), and
+(which branch to check out — falls back to `repo.ref`, then to the
+remote's own detected default branch when neither is set), and
 `publish_pr` accepts an optional `base_ref` step param (which branch the
 PR targets — falls back to the same default, independently of whatever
 `ref` was). The planner's system prompt reads the prompt for named
 branches and sets these params.
 
+`ensure_cache_and_clone` (`tools/repo_cache.py`) never hardcodes a branch
+name, and never just trusts a given `ref` either: `git_branch_exists`
+checks it against the mirror *before* attempting the clone, and falls
+back to `git_default_branch` (reads the mirror's real `HEAD` symref —
+`main`/`master`/`dev`/anything) whenever `ref` is `None` or doesn't
+actually exist. Confirmed live this second case matters, not just the
+first: the planner guessed `ref="main"` for a repo whose real default
+branch is `"master"`, despite the prompt never naming a branch at all —
+prompt guidance alone isn't reliable enough to prevent that (the same
+lesson as `clone_repo`/`publish_pr` elsewhere in this doc). Checking
+existence up front means exactly one clone attempt either way — no
+failed-then-retried clone, no matching on git's own error text.
+
 `repo.url` can also be a local filesystem path, not just a network
 remote — git supports this natively.
+
+**`StepContext.require_cloned_repo`** (`common/capabilities_base.py`):
+`generate_change`/`verify`/`publish_pr` call this instead of reading
+`repo_dir` directly — it raises immediately and clearly if `clone_repo`
+never actually ran, rather than silently falling back to the empty
+sandbox root (`repo_dir`'s own fallback, correct for a repo-less chat
+prompt or an agent kind with no `clone_repo` capability at all, e.g.
+Jenkins) and only failing three layers down inside opencode with an
+opaque `Unexpected server error`. Confirmed live: a planner using a
+smaller/cheaper model produced a step list that included `generate_change`
+but dropped `clone_repo` — exactly this failure, caught and fixed by
+adding the guard plus sharpening `planner_domain_guidance` to state the
+ordering requirement explicitly.
 
 **Protected branches** (`ari_oncall_agent/protected_branches.py`): a
 configurable blacklist of branches this agent must never push to directly

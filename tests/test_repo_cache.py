@@ -3,6 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -221,6 +222,104 @@ async def test_ensure_cache_runs_an_eviction_sweep_before_touching_its_own_lock(
     await repo_cache.ensure_cache({"url": str(source_repo)})
 
     assert calls == [str(cache_root)]
+
+
+@pytest.fixture
+def master_default_repo(tmp_path):
+    """A repo whose real default branch is "master", not "main" — for
+    testing what happens when an explicitly-given `ref` guesses wrong."""
+    src = tmp_path / "master-source"
+    src.mkdir()
+    _run("init", "-q", "-b", "master", cwd=src)
+    _commit(src, "a.txt", "v1\n", "init")
+    return src
+
+
+@pytest.fixture
+def dev_default_repo(tmp_path):
+    """A repo whose real default branch is "dev" — proves the detection
+    is genuinely dynamic (reads the real HEAD symref), not special-cased
+    to just "main" vs "master"."""
+    src = tmp_path / "dev-source"
+    src.mkdir()
+    _run("init", "-q", "-b", "dev", cwd=src)
+    _commit(src, "a.txt", "v1\n", "init")
+    return src
+
+
+@pytest.mark.asyncio
+async def test_ensure_cache_and_clone_detects_the_real_default_branch_when_the_given_ref_is_wrong(
+    master_default_repo, cache_root, tmp_path
+):
+    # Regression test for a live finding: the planner guessed ref="main"
+    # for a repo whose real default branch is "master", despite the
+    # prompt never naming a branch at all (prompt guidance alone isn't
+    # reliable enough to prevent this). Must not hard-fail — detects and
+    # uses whatever the remote's actual default branch is, checked
+    # *before* attempting the clone (git_branch_exists), not by reacting
+    # to a failed one.
+    ws = tmp_path / "request-1"
+    ws.mkdir()
+
+    path, resolved_ref = await repo_cache.ensure_cache_and_clone({"url": str(master_default_repo)}, "main", str(ws))
+
+    assert resolved_ref == "master"
+    assert (Path(path) / "a.txt").read_text() == "v1\n"
+
+
+@pytest.mark.asyncio
+async def test_ensure_cache_and_clone_detection_is_genuinely_dynamic_not_just_main_or_master(
+    dev_default_repo, cache_root, tmp_path
+):
+    # Same as above, but for a default branch name that's neither "main"
+    # nor "master" -- confirms this isn't special-cased to those two.
+    ws = tmp_path / "request-1"
+    ws.mkdir()
+
+    path, resolved_ref = await repo_cache.ensure_cache_and_clone({"url": str(dev_default_repo)}, "main", str(ws))
+
+    assert resolved_ref == "dev"
+    assert (Path(path) / "a.txt").read_text() == "v1\n"
+
+
+@pytest.mark.asyncio
+async def test_ensure_cache_and_clone_clones_exactly_once_even_when_the_given_ref_is_wrong(
+    master_default_repo, cache_root, tmp_path, monkeypatch
+):
+    # Proactive detection (git_branch_exists, checked before cloning) means
+    # there's never a failed-attempt-then-retry -- exactly one git_clone
+    # call, with the correct branch already resolved going into it.
+    real_clone = repo_cache.git_clone
+    calls = []
+
+    async def counting_clone(repo_config, workspace):
+        calls.append(repo_config["ref"])
+        return await real_clone(repo_config, workspace)
+
+    monkeypatch.setattr(repo_cache, "git_clone", counting_clone)
+
+    await repo_cache.ensure_cache_and_clone({"url": str(master_default_repo)}, "main", str(tmp_path / "ws"))
+
+    assert calls == ["master"]  # never even tried "main"
+
+
+@pytest.mark.asyncio
+async def test_ensure_cache_and_clone_skips_the_default_branch_lookup_when_the_given_ref_is_already_valid(
+    master_default_repo, cache_root, tmp_path, monkeypatch
+):
+    # No need to even ask what the default branch is when the given ref
+    # already exists -- confirms the check is genuinely "does this exist"
+    # (git_branch_exists), not "always look up and compare against the
+    # default".
+    default_branch = AsyncMock(side_effect=AssertionError("should not need the default branch here"))
+    monkeypatch.setattr(repo_cache, "git_default_branch", default_branch)
+
+    path, resolved_ref = await repo_cache.ensure_cache_and_clone(
+        {"url": str(master_default_repo)}, "master", str(tmp_path / "ws")
+    )
+
+    assert resolved_ref == "master"
+    default_branch.assert_not_awaited()
 
 
 def test_authed_url_only_transforms_when_pat_present():

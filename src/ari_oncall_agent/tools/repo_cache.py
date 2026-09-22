@@ -62,6 +62,7 @@ from contextlib import asynccontextmanager
 from common.cache_gc import evict_lru_entries_if_low_on_space
 from common.settings import get_settings
 from .git_ops import authed_url
+from .git_ops import branch_exists as git_branch_exists
 from .git_ops import clone as git_clone
 from .git_ops import default_branch as git_default_branch
 
@@ -186,16 +187,28 @@ async def ensure_cache_and_clone(repo_config: dict, ref: str | None, workspace: 
     `workspace` (matching `git_ops.clone`'s own convention, this creates
     `workspace/repo`), all under one held lock — so a concurrent request's
     cache refresh can never delete/repack a pack file this clone is still
-    reading (see the module docstring for the real failure this fixes). If
-    `ref` is None, resolves the remote's actual default branch from the
-    now-fresh cache before cloning, under the same lock, so the resolution
-    and the clone see a consistent cache state. Returns
-    `(cloned_path, resolved_ref)`.
+    reading (see the module docstring for the real failure this fixes).
+    Returns `(cloned_path, resolved_ref)`.
+
+    Resolves the remote's actual default branch — dynamically, whatever it
+    actually is (`main`/`master`/`dev`/anything), never a hardcoded guess —
+    whenever `ref` is None, *or* whenever `ref` was given but doesn't
+    actually exist on this remote. That second case is confirmed live, not
+    theoretical: the planner's own step params (not this function's own
+    resolution) guessed `ref="main"` for a repo whose real default branch
+    is `"master"`, despite the prompt never naming a branch at all —
+    prompt guidance alone isn't reliable enough to prevent that (same
+    lesson as `clone_repo`/`publish_pr` elsewhere in this codebase).
+    Checked with `git_branch_exists` *before* attempting the clone (not by
+    reacting to a failed one) — one clone attempt either way, and no
+    fragile matching on git's own error text.
     """
     cache_root = get_settings().repo_cache_root
     await _evict_if_needed(cache_root)
     async with _locked_cache_dir(repo_config["url"]):
         cache_dir = await asyncio.to_thread(_sync_refresh_cache, repo_config, cache_root)
-        resolved_ref = ref or await git_default_branch(cache_dir)
+        resolved_ref = ref
+        if resolved_ref is None or not await git_branch_exists(cache_dir, resolved_ref):
+            resolved_ref = await git_default_branch(cache_dir)
         cloned_path = await git_clone({"url": cache_dir, "ref": resolved_ref}, workspace)
         return cloned_path, resolved_ref

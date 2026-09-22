@@ -5,6 +5,10 @@ async def run(ctx: StepContext) -> dict:
     if ctx.config.get("options", {}).get("skip_tests"):
         return {"status": "skipped"}
 
+    # Fails fast and clearly if the planner's step list omitted clone_repo
+    # — see StepContext.require_cloned_repo's own docstring.
+    ctx.require_cloned_repo()
+
     opencode = ctx.tool("opencode")
     instruction = ctx.params.get("instruction") or (
         "Run this project's build/lint/test suite (discover the right commands "

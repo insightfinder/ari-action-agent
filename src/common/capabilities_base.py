@@ -49,6 +49,29 @@ class StepContext:
         never a git checkout) doesn't crash."""
         return self.results.get("clone_repo", {}).get("cloned_path", self.workspace)
 
+    def require_cloned_repo(self) -> str:
+        """`repo_dir`, but for the capabilities that only ever make sense
+        against an actual git checkout (generate_change/verify/publish_pr) —
+        raises clearly if clone_repo never actually ran, instead of silently
+        falling back to the empty workspace root the way `repo_dir` itself
+        does for capabilities that are fine without one (see its own
+        docstring).
+
+        Confirmed live as a real failure mode, not theoretical: a planner
+        using a smaller/cheaper model produced a step list that dropped
+        clone_repo entirely while still including generate_change. With no
+        checked-out repo, opencode ran against an empty, non-git directory
+        and failed with an opaque `Unexpected server error. Check server
+        logs for details.` — no indication anywhere of the actual, simple
+        cause. This turns that into an immediate, actionable error instead.
+        """
+        if "clone_repo" not in self.results:
+            raise RuntimeError(
+                f"{self.capability}: clone_repo must run before this step, but the planner's step list "
+                f"didn't include it — there is no cloned repo to work with."
+            )
+        return self.repo_dir
+
     @property
     def opencode_session_started(self) -> bool:
         """Whether some earlier step in *this* run already opened an

@@ -107,11 +107,15 @@ capabilities:
       commit, and push the change to a new branch, then open a pull
       request via the GitHub REST API; falls back to opencode + the
       GitHub MCP server (agent: ari-publish) if that primary path fails.
-      Accepts an optional `base_ref` param (the PR's target branch) when
-      the prompt names one explicitly and it differs from the branch
-      clone_repo checked out, e.g. "raise a PR against staging" while
-      working from dev — otherwise defaults to the same branch clone_repo
-      used. Always the last step.
+      Opt-out, part of the default pipeline whenever generate_change runs
+      — see meta.py's default_step_policy, which appends this step
+      automatically even if the planner's own step list omits it, unless
+      the request explicitly asked not to open a PR. Accepts an optional
+      `base_ref` param (the PR's target branch) when the prompt names one
+      explicitly and it differs from the branch clone_repo checked out,
+      e.g. "raise a PR against staging" while working from dev —
+      otherwise defaults to the same branch clone_repo used. Always the
+      last step.
     tools: [git_add, git_commit, git_push, github_create_pr, opencode]
     retry:
       max_attempts: 3

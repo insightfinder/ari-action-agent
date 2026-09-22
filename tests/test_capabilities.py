@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_oncall_agent.capabilities import clone_repo, generate_change as opencode_change, publish_pr  # noqa: E402
+from ari_oncall_agent.capabilities import clone_repo, generate_change as opencode_change, publish_pr, verify  # noqa: E402
 from common.capabilities_base import StepContext  # noqa: E402
 
 # Stub `run_opencode()`'s trace field (tools/opencode_cli.py) — every
@@ -16,7 +16,25 @@ from common.capabilities_base import StepContext  # noqa: E402
 _STUB_TRACE = {"elapsed_s": 0.0, "tool_call_counts": {}, "tool_call_total": 0, "slowest_gaps": []}
 
 
-def _ctx(results: dict, tools: dict, params: dict | None = None, capability: str = "publish_pr") -> StepContext:
+_CLONE_REPO_RESULT = {"cloned_path": "/tmp/ws/repo", "ref": "main"}
+
+
+def _ctx(
+    results: dict,
+    tools: dict,
+    params: dict | None = None,
+    capability: str = "publish_pr",
+    include_clone_repo: bool = True,
+) -> StepContext:
+    # generate_change/verify/publish_pr all now hard-require clone_repo to
+    # have run first (StepContext.require_cloned_repo) -- included by
+    # default so every existing test doesn't have to spell this out, same
+    # as before that guard existed. clone_repo's own tests (which
+    # legitimately have no prior clone_repo result) pass
+    # include_clone_repo=False; so does anything specifically testing the
+    # guard itself.
+    if include_clone_repo and capability != "clone_repo" and "clone_repo" not in results:
+        results = {**results, "clone_repo": _CLONE_REPO_RESULT}
     return StepContext(
         request_id="req-1",
         workspace="/tmp/ws",
@@ -95,7 +113,7 @@ async def test_publish_pr_primary_path_stages_commits_pushes_and_opens_pr():
 
     result = await publish_pr.run(ctx)
 
-    tools["git_add"].assert_awaited_once_with("/tmp/ws", ["cart_service.py"])
+    tools["git_add"].assert_awaited_once_with("/tmp/ws/repo", ["cart_service.py"])
     tools["git_commit"].assert_awaited_once()
     tools["git_push"].assert_awaited_once()
     tools["github_create_pr"].assert_awaited_once()
@@ -161,6 +179,22 @@ async def test_publish_pr_raises_when_generate_change_reports_no_changed_files()
         await publish_pr.run(ctx)
 
     tools["git_add"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_pr_skips_when_options_skip_pr_is_set():
+    # Belt-and-suspenders alongside meta.py's default_step_policy (which
+    # normally wouldn't schedule this step at all in that case) -- in case
+    # the planner includes it anyway despite an explicit opt-out.
+    tools = _publish_pr_tools()
+    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
+    ctx.config["options"] = {"skip_pr": True}
+
+    result = await publish_pr.run(ctx)
+
+    assert result == {"status": "skipped"}
+    tools["git_add"].assert_not_awaited()
+    tools["github_create_pr"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -350,6 +384,47 @@ async def test_generate_change_also_returns_root_cause_from_the_same_summary():
 
     assert result["root_cause"] == {"summary": "Zone field was never cleared.", "evidence": []}
     assert result["summary"] == "Zone field was never cleared."
+
+
+@pytest.mark.asyncio
+async def test_generate_change_raises_clearly_when_clone_repo_never_ran():
+    # Regression test for a live failure: a planner (a smaller/cheaper
+    # model) produced a step list with generate_change but no clone_repo.
+    # Must fail immediately and clearly, not hand opencode an empty,
+    # non-git --dir and get an opaque crash three layers down.
+    opencode = AsyncMock()
+    ctx = _ctx(results={}, tools={"opencode": opencode}, capability="generate_change", include_clone_repo=False)
+
+    with pytest.raises(RuntimeError, match="clone_repo must run before this step"):
+        await opencode_change.run(ctx)
+
+    opencode.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_verify_raises_clearly_when_clone_repo_never_ran():
+    opencode = AsyncMock()
+    ctx = _ctx(results={}, tools={"opencode": opencode}, capability="verify", include_clone_repo=False)
+
+    with pytest.raises(RuntimeError, match="clone_repo must run before this step"):
+        await verify.run(ctx)
+
+    opencode.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_pr_raises_clearly_when_clone_repo_never_ran():
+    tools = _publish_pr_tools()
+    ctx = _ctx(
+        results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}},
+        tools=tools,
+        include_clone_repo=False,
+    )
+
+    with pytest.raises(RuntimeError, match="clone_repo must run before this step"):
+        await publish_pr.run(ctx)
+
+    tools["git_add"].assert_not_awaited()
 
 
 @pytest.mark.asyncio

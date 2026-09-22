@@ -7,7 +7,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ari_oncall_agent.tools import git_ops  # noqa: E402
-from ari_oncall_agent.tools.git_ops import changed_files, default_branch, diff  # noqa: E402
+from ari_oncall_agent.tools.git_ops import branch_exists, changed_files, default_branch, diff  # noqa: E402
 
 
 def _run(*args, cwd):
@@ -59,6 +59,17 @@ async def test_default_branch_reports_whatever_head_actually_points_at(tmp_path)
     _run("-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "-q", "-m", "init", cwd=tmp_path)
 
     assert await default_branch(str(tmp_path)) == "trunk"
+
+
+@pytest.mark.asyncio
+async def test_branch_exists_true_for_a_real_branch_false_for_a_made_up_one(tmp_path):
+    _run("init", "-q", "-b", "trunk", cwd=tmp_path)
+    (tmp_path / "a.py").write_text("x = 1\n")
+    _run("add", ".", cwd=tmp_path)
+    _run("-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "-q", "-m", "init", cwd=tmp_path)
+
+    assert await branch_exists(str(tmp_path), "trunk") is True
+    assert await branch_exists(str(tmp_path), "main") is False
 
 
 @pytest.fixture
