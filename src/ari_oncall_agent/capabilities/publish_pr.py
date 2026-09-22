@@ -19,6 +19,7 @@ import re
 from urllib.parse import urlsplit
 
 from common.capabilities_base import StepContext
+from ..protected_branches import is_protected, protected_branches
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _PR_URL_RE = re.compile(r"https://\S*/pull/\d+")
@@ -73,12 +74,26 @@ async def _publish_via_opencode(
         if changed_files
         else ""
     )
+    # Belt-and-suspenders alongside the bash-permission denies
+    # tools/opencode_cli.py adds for these same branches — named here in
+    # plain language too, since an instruction and a permission block
+    # catch different failure modes (see protected_branches.py for why
+    # neither alone is a hard guarantee for this fallback path).
+    protected = protected_branches(repo_url)
+    protected_clause = (
+        f"Never push directly to {', '.join(sorted(protected))} in this repository under any "
+        f"circumstance, no matter what — those branches are off-limits for a direct push. Always push "
+        f"to a new branch instead.\n\n"
+        if protected
+        else ""
+    )
     instruction = (
         f"Repository: {_repo_slug(repo_url)} ({repo_url}).\n\n"
         f"An automated attempt to publish this change directly failed ({primary_error}) and may have "
         f"partially completed. Check `git status`/`git log -3`/`git branch` first to see what's already "
         f"done (staged, committed, and/or pushed) and complete only what's still needed — do not redo "
         f"finished steps.\n\n"
+        f"{protected_clause}"
         f"{files_clause}"
         f"The change is already made and verified — do not re-read, re-inspect, or re-diff these files "
         f"yourself; the summary given here is already everything you need. Get to a state where exactly "
@@ -122,6 +137,21 @@ async def run(ctx: StepContext) -> dict:
     # staging"), falling back to whichever branch clone_repo resolved.
     base_ref = ctx.params.get("base_ref") or ctx.results.get("clone_repo", {}).get("ref") or "main"
     branch = _branch_name(title, ctx.request_id)
+
+    # Hard veto, checked before anything touches the remote — never push
+    # directly to one of this repo's protected branches (see
+    # protected_branches.py). Unreachable in practice today (`branch`
+    # above is always a freshly generated `ari/...` name, never one of
+    # these) — kept as defense-in-depth against a future change letting a
+    # caller-supplied branch name reach this point. A hard stop, not
+    # routed through the opencode fallback below: if the target branch
+    # itself is the problem, a different mechanism must not be allowed to
+    # "work around" that by trying anyway.
+    if is_protected(repo["url"], branch):
+        raise RuntimeError(
+            f"publish_pr: refusing to push protected branch {branch!r} for {repo['url']} — see "
+            f"configs/oncall/protected_branches.yaml"
+        )
 
     try:
         await git_add(ctx.repo_dir, changed_files)

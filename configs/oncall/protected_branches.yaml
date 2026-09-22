@@ -1,0 +1,41 @@
+# Blacklist of branches this agent must never push to directly. Read-only
+# access is always fine — clone, fetch, pull, and opening a PR *against*
+# one of these branches (publish_pr's `base_ref`) are never affected,
+# only a direct push (a write) to the branch itself is blocked.
+#
+# `default_protected_branches` applies to EVERY repo, whether or not it
+# has its own entry below — main/master are almost universally the
+# branch a direct push would be catastrophic to, so they're blocked out
+# of the box rather than requiring an explicit per-repo entry. Set this
+# to `[]` to genuinely disable the default (an explicit empty list, not
+# just omitting the key — omitting it keeps main/master protected).
+default_protected_branches:
+  - main
+  - master
+  - dev
+  - staging
+  - test
+
+# Per-repo branches, ADDED on top of default_protected_branches above,
+# not a replacement for it. Keyed by repo URL; matched by owner/repo
+# slug — case-insensitive, ignoring a trailing `.git` and scheme/host
+# differences — so one entry covers `https://github.com/owner/repo`,
+# `https://github.com/owner/repo.git`, etc. See
+# ari_oncall_agent/protected_branches.py for the loader and both
+# enforcement points (publish_pr.py's own hard veto before any push, and
+# tools/opencode_cli.py's best-effort opencode bash-permission denials for
+# its opencode+GitHub-MCP fallback path).
+#
+# IMPORTANT: the opencode-fallback enforcement is best-effort against an
+# LLM-driven bash tool — it cannot be a hard guarantee (see that module's
+# docstring for why). For a real guarantee, also configure branch
+# protection on the GitHub repo itself (Settings -> Branches -> protect
+# these branches, restrict who/what can push) — that's server-side, can't
+# be bypassed by any client-side git syntax, and is the only thing that
+# also covers the GitHub MCP server's own file-write tools, which this
+# config has no visibility into at all.
+protected_branches:
+  https://github.com/insightfinder/InfrastructureCore:
+    - dev
+    - staging
+    - test

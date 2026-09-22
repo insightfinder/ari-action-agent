@@ -206,6 +206,25 @@ async def test_publish_pr_raises_clearly_when_both_primary_and_fallback_fail():
         await publish_pr.run(ctx)
 
 
+@pytest.mark.asyncio
+async def test_publish_pr_refuses_to_push_a_protected_branch_without_even_trying(monkeypatch):
+    # Hard veto: unreachable in practice today (_branch_name always
+    # generates a fresh ari/... name), but if a protected branch were ever
+    # about to be pushed to, this must refuse outright -- not touch git at
+    # all, and not fall back to opencode either (a different mechanism
+    # must never be allowed to "work around" the veto).
+    monkeypatch.setattr(publish_pr, "is_protected", lambda repo_url, branch: True)
+    tools = _publish_pr_tools()
+    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
+
+    with pytest.raises(RuntimeError, match="refusing to push protected branch"):
+        await publish_pr.run(ctx)
+
+    tools["git_add"].assert_not_awaited()
+    tools["git_push"].assert_not_awaited()
+    tools["opencode"].assert_not_awaited()
+
+
 def _clone_repo_tools(**overrides):
     tools = {
         # (cloned_path, resolved_ref) — ensure_cache_and_clone's actual

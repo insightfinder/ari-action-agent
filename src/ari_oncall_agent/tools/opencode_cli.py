@@ -16,12 +16,14 @@ the more flexible/comprehensive MCP-driven route is still available as a
 safety net rather than removed outright.
 """
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
 
 from common.opencode_runtime import merge_traces, run_opencode as _run_opencode  # noqa: F401  (re-exported)
 from common.settings import get_settings
+from ..protected_branches import protected_branches
 from .build_cache import reserve_build_cache_home
 
 # Mirrors configs/capabilities.yaml's capability→agent mapping. Kept here
@@ -91,13 +93,18 @@ _AGENT_DEFS = {
     # Needs to actually run the project's build/lint/test tooling, which is
     # unpredictable per-repo — broad bash allow is required here. Isolation
     # comes from the ephemeral per-request sandbox, not command whitelisting.
-    # Never edits code — a failure just reports failure, generate_change retries.
+    # Never edits code — a failure just reports failure, generate_change
+    # retries. `git push*` is denied unconditionally (not just for
+    # protected branches — see protected_branches.py): verify has no
+    # legitimate reason to push anything, ever, regardless of which
+    # branch, and its otherwise-broad bash access would silently permit it
+    # without this.
     "ari-verify": {
         "description": "Runs the project's build/lint/test suite and reports pass/fail.",
         "mode": "primary",
         "permission": {
             "edit": "deny",
-            "bash": "allow",
+            "bash": {"git push*": "deny", "*": "allow"},
             "webfetch": "deny",
         },
         "tools": _no_delegation_tools(),
@@ -108,6 +115,10 @@ _AGENT_DEFS = {
     # directly, not hand them to an unrestricted subagent. Only reached as
     # publish_pr's fallback now (see capabilities/publish_pr.py) — the
     # primary path is deterministic and never touches opencode at all.
+    # This module dict is the *default* shape (used as-is when a repo has
+    # no protected branches); write_config() below patches in per-repo
+    # `git push` denials for protected_branches.py's blacklist before
+    # writing the actual opencode.json for a given request.
     "ari-publish": {
         "description": "Pushes the change branch and opens a pull request via the GitHub MCP server.",
         "mode": "primary",
@@ -121,6 +132,34 @@ _AGENT_DEFS = {
 }
 
 
+def _protected_branch_push_denies(repo_url: str) -> dict[str, str]:
+    """opencode bash-permission `deny` entries for the common `git push`
+    forms that would write directly to one of this repo's protected
+    branches (protected_branches.py) — empty for a repo with none.
+
+    Best-effort, not a semantic parse of git syntax: opencode's own
+    permission matching (as used throughout this file) is prefix +
+    trailing-wildcard only, so this covers the common invocation shapes
+    (`git push origin <branch>`, `... HEAD:<branch>`, with `-u`/`--force`/
+    `-f`, `<branch>:<branch>`), not every syntactically possible one —
+    see protected_branches.py's own docstring for why real branch
+    protection on the GitHub repo itself is still the only guarantee."""
+    denies: dict[str, str] = {}
+    for branch in sorted(protected_branches(repo_url)):
+        for prefix in (
+            f"git push origin {branch}",
+            f"git push origin HEAD:{branch}",
+            f"git push -u origin {branch}",
+            f"git push --set-upstream origin {branch}",
+            f"git push -f origin {branch}",
+            f"git push --force origin {branch}",
+            f"git push origin {branch}:{branch}",
+            f"git push origin +{branch}",
+        ):
+            denies[f"{prefix}*"] = "deny"
+    return denies
+
+
 def write_config(workdir: str, llm: dict, repo: dict) -> str:
     """Writes a per-request opencode.json into the cloned repo dir. Called
     once, right after clone, before any opencode invocation. Torn down with
@@ -128,6 +167,15 @@ def write_config(workdir: str, llm: dict, repo: dict) -> str:
     the request.
     """
     settings = get_settings()
+
+    agent_defs = copy.deepcopy(_AGENT_DEFS)
+    protected_denies = _protected_branch_push_denies(repo["url"])
+    if protected_denies:
+        # Denies first so they're the most specific entries ahead of the
+        # blanket `"git *": "allow"` — same specific-before-general
+        # convention `_READ_ONLY_GIT_BASH` above already relies on.
+        publish_bash = agent_defs["ari-publish"]["permission"]["bash"]
+        agent_defs["ari-publish"]["permission"]["bash"] = {**protected_denies, **publish_bash}
 
     config: dict[str, Any] = {
         "$schema": "https://opencode.ai/config.json",
@@ -146,7 +194,7 @@ def write_config(workdir: str, llm: dict, repo: dict) -> str:
         # agent also repeats this explicitly rather than relying on this
         # default alone.
         "tools": {"github_*": False, "task": False},
-        "agent": _AGENT_DEFS,
+        "agent": agent_defs,
     }
 
     if repo.get("pat"):

@@ -519,8 +519,11 @@ afterward, since `git remote -v` would otherwise show the cache path.
 Documented limits: this cache lives on whichever worker host handles the
 request — multiple worker replicas each keep an independent cache unless
 `REPO_CACHE_ROOT` is a shared volume mounted at the same path on every
-replica; there's no eviction/GC (fine for a bounded set of well-known
-repos, revisit if that stops being true).
+replica (the Helm chart's PVC is `ReadWriteOnce` today, matching
+`worker.replicaCount: 1`). LRU eviction (`common/cache_gc.py`) kicks in
+when the backing PVC is low on free space — see the agent's own
+docs/MEMORY.md for why both `repoCacheRoot` and `buildCacheRoot` are
+deliberately small (5Gi) rather than sized to never fill up.
 
 **Dynamic branches**: `clone_repo` accepts an optional `ref` step param
 (which branch to check out — falls back to `repo.ref`/`"main"`), and
@@ -531,6 +534,44 @@ branches and sets these params.
 
 `repo.url` can also be a local filesystem path, not just a network
 remote — git supports this natively.
+
+**Protected branches** (`ari_oncall_agent/protected_branches.py`): a
+configurable blacklist of branches this agent must never push to directly
+(`configs/oncall/protected_branches.yaml` — a per-repo `protected_branches`
+map keyed by repo URL, matched by owner/repo slug so scheme/`.git`-suffix
+differences don't cause a miss; read-only access — clone/fetch/pull, and a
+PR opened *against* one of these branches via `base_ref` — is always
+unaffected, only a direct push to the branch itself is blocked).
+`main`/`master` are protected for *every* repo by default
+(`default_protected_branches` in the same file, itself configurable — an
+explicit `[]` is the only way to turn it off, omitting the key keeps the
+default), added on top of whatever a repo's own entry lists, not a
+replacement for it. Two different enforcement points, because there are
+two different ways `publish_pr` can end up pushing:
+- Its deterministic primary path (`tools/git_ops.py:push`) always targets
+  a freshly generated `ari/<slug>-<request-id>` branch, never an existing
+  one, so a hard veto there (`publish_pr.run`, checked before anything
+  touches git) is unreachable in normal operation — kept as defense-in-
+  depth against a future change letting a caller-supplied branch name
+  reach that point.
+- Its opencode + GitHub MCP **fallback** (`ari-publish`, real `git push`
+  bash access, only reached if the primary path fails) is the one path
+  that actually needs protecting: `tools/opencode_cli.py:write_config`
+  computes explicit bash-permission `deny` entries for the common `git
+  push` forms against each of this repo's protected branches, and the
+  fallback's own instruction names them in plain language too.
+  **Best-effort, not a hard guarantee** — opencode's permission matching
+  is prefix + trailing-wildcard only, so it can't semantically parse
+  every possible git push invocation, and it has no visibility at all
+  into the GitHub MCP server's own tools. Real branch protection
+  configured on the GitHub repo itself (restrict who/what can push) is
+  the only guarantee, and covers the MCP path too — see
+  `protected_branches.py`'s own docstring.
+
+`ari-verify`'s bash permission denies `git push*` unconditionally
+(regardless of branch, not just protected ones) for the same reason —
+verify has no legitimate reason to push anything, ever, and its bash is
+otherwise fully open for arbitrary build tooling.
 
 ## 7. Deployment images
 

@@ -114,6 +114,22 @@ async def test_commit_records_title_and_body(remote_and_clone):
 
 
 @pytest.mark.asyncio
+async def test_commit_always_uses_the_fixed_ari_agent_identity(remote_and_clone):
+    # Never the requester's own identity -- there is no per-request "who
+    # is this" to commit as, only a repo.pat used for push auth (see
+    # authed_url), so every commit is authored as ARI itself regardless of
+    # whose request/PAT it is.
+    _, work = remote_and_clone
+    (work / "a.py").write_text("x = 2\n")
+    await git_ops.add(str(work), ["a.py"])
+
+    await git_ops.commit(str(work), "Fix the thing")
+
+    author = _output("log", "-1", "--pretty=%an <%ae>", cwd=work).strip()
+    assert author == "ARI Agent <support@insightfinder.com>"
+
+
+@pytest.mark.asyncio
 async def test_commit_raises_clearly_when_nothing_is_staged(remote_and_clone):
     _, work = remote_and_clone
     with pytest.raises(RuntimeError, match="git commit failed"):

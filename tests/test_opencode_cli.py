@@ -12,10 +12,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import ari_oncall_agent.tools.opencode_cli as opencode_cli  # noqa: E402
 from ari_oncall_agent.tools.opencode_cli import (  # noqa: E402
     _AGENT_DEFS,
+    _protected_branch_push_denies,
     CAPABILITY_AGENTS,
     run_opencode,
     write_config,
 )
+
+# From configs/oncall/protected_branches.yaml -- a real configured repo,
+# not a fixture, since these tests exercise the actual blacklist.
+_PROTECTED_REPO = {"url": "https://github.com/insightfinder/InfrastructureCore", "pat": "ghp_x"}
 
 
 def test_agent_defs_all_use_primary_mode():
@@ -120,6 +125,84 @@ async def test_run_opencode_leaves_home_untouched_for_other_capabilities(monkeyp
 
     _, kwargs = fake_run_opencode.await_args
     assert kwargs.get("extra_env") is None
+
+
+def test_ari_verify_denies_git_push_unconditionally():
+    # verify has no legitimate reason to push anything, ever, regardless
+    # of branch -- unconditional, not tied to protected_branches.yaml,
+    # since its bash is otherwise fully open for arbitrary build tooling.
+    bash_perms = _AGENT_DEFS["ari-verify"]["permission"]["bash"]
+    assert bash_perms["git push*"] == "deny"
+    assert bash_perms["*"] == "allow"
+
+
+def test_protected_branch_push_denies_covers_common_push_forms():
+    denies = _protected_branch_push_denies(_PROTECTED_REPO["url"])
+
+    assert denies["git push origin dev*"] == "deny"
+    assert denies["git push origin staging*"] == "deny"
+    assert denies["git push origin test*"] == "deny"
+    assert denies["git push origin HEAD:dev*"] == "deny"
+    assert denies["git push --force origin dev*"] == "deny"
+    assert denies["git push origin dev:dev*"] == "deny"
+    # main/master come from default_protected_branches (protected_branches.py)
+    # and apply to every repo -- must be included here too, on top of this
+    # repo's own dev/staging/test entry.
+    assert denies["git push origin main*"] == "deny"
+    assert denies["git push origin master*"] == "deny"
+
+
+def test_protected_branch_push_denies_still_covers_main_and_master_for_an_unconfigured_repo():
+    # No entry under configs/oncall/protected_branches.yaml's
+    # protected_branches: at all -- main/master are still denied by
+    # default (protected_branches.py's default_protected_branches).
+    denies = _protected_branch_push_denies("https://github.com/some-org/unrelated-repo")
+
+    assert denies["git push origin main*"] == "deny"
+    assert denies["git push origin master*"] == "deny"
+    assert not any("dev" in pattern or "staging" in pattern for pattern in denies)
+
+
+def test_write_config_adds_protected_branch_denies_for_a_configured_repo(tmp_path):
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+
+    path = write_config(str(tmp_path), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, _PROTECTED_REPO)
+
+    cfg = json.loads(Path(path).read_text())
+    publish_bash = cfg["agent"]["ari-publish"]["permission"]["bash"]
+    assert publish_bash["git push origin dev*"] == "deny"
+    assert publish_bash["git push origin staging*"] == "deny"
+    assert publish_bash["git push origin test*"] == "deny"
+    # The blanket allow (needed to push a fresh ari/... branch) is still
+    # there -- only the specific protected-branch forms are denied.
+    assert publish_bash["git *"] == "allow"
+    # Every other agent is untouched by this repo-specific patch.
+    assert cfg["agent"]["ari-change"]["permission"]["bash"] == _AGENT_DEFS["ari-change"]["permission"]["bash"]
+
+
+def test_write_config_still_denies_main_and_master_for_a_repo_with_no_own_entry(tmp_path):
+    # main/master are protected for every repo by default (see
+    # protected_branches.py) — a repo with no entry of its own under
+    # protected_branches: still must not get the untouched, unpatched
+    # default bash permission.
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+
+    # Call once for a repo with its own extra entries first, to guard
+    # against a shared-mutable-dict bug leaking one request's denies into
+    # another's.
+    write_config(str(tmp_path), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, _PROTECTED_REPO)
+    path = write_config(
+        str(tmp_path), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, {"url": "https://github.com/x/y", "pat": "t"}
+    )
+
+    cfg = json.loads(Path(path).read_text())
+    publish_bash = cfg["agent"]["ari-publish"]["permission"]["bash"]
+    assert publish_bash != _AGENT_DEFS["ari-publish"]["permission"]["bash"]
+    assert publish_bash["git push origin main*"] == "deny"
+    assert publish_bash["git push origin master*"] == "deny"
+    # This repo has no dev/staging/test entry -- must not inherit them
+    # from the earlier call for _PROTECTED_REPO.
+    assert not any("dev" in pattern or "staging" in pattern for pattern in publish_bash)
 
 
 def test_ari_change_cannot_commit_or_push():

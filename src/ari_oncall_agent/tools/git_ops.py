@@ -139,7 +139,7 @@ async def commit(workdir: str, title: str, body: str = "") -> None:
     individual's, same reasoning as opencode's own agents never being
     asked to impersonate a person."""
     args = [
-        "git", "-c", "user.email=ari-agent@users.noreply.github.com", "-c", "user.name=ARI Agent",
+        "git", "-c", "user.email=support@insightfinder.com", "-c", "user.name=ARI Agent",
         "commit", "-m", title,
     ]
     if body:
