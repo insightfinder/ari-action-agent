@@ -103,9 +103,9 @@ async def test_run_opencode_points_verify_at_the_shared_build_cache_home(monkeyp
 
 @pytest.mark.asyncio
 async def test_run_opencode_leaves_home_untouched_for_other_capabilities(monkeypatch):
-    # Only verify shells out to build tooling — analyze/generate_change/
-    # publish_pr have no business sharing state through a real $HOME (and
-    # opencode's own state is isolated separately, per-request, in
+    # Only verify shells out to build tooling — generate_change/publish_pr
+    # have no business sharing state through a real $HOME (and opencode's
+    # own state is isolated separately, per-request, in
     # opencode_runtime.py). The build-cache reservation (with its own
     # eviction sweep + lock acquisition) must not even be entered for them.
     def fail_if_called():
@@ -115,25 +115,24 @@ async def test_run_opencode_leaves_home_untouched_for_other_capabilities(monkeyp
     fake_run_opencode = AsyncMock(return_value={"text": "ok", "trace": {}})
     monkeypatch.setattr(opencode_cli, "_run_opencode", fake_run_opencode)
 
-    ctx = SimpleNamespace(capability="analyze")
-    await run_opencode(ctx, "investigate")
+    ctx = SimpleNamespace(capability="generate_change")
+    await run_opencode(ctx, "investigate and edit")
 
     _, kwargs = fake_run_opencode.await_args
     assert kwargs.get("extra_env") is None
 
 
-def test_ari_analyze_and_ari_change_cannot_commit_or_push():
+def test_ari_change_cannot_commit_or_push():
     # Only ari-publish should be able to mutate git state (commit/push/
-    # branch) — analyze is read-only by design, and change's job is
-    # editing files, not staging/committing them (that's publish_pr's
-    # instruction to ari-publish: "Stage and commit exactly these files").
-    for name in ("ari-analyze", "ari-change"):
-        bash_perms = _AGENT_DEFS[name]["permission"]["bash"]
-        assert "git *" not in bash_perms, f"{name} must not have blanket git access"
-        assert bash_perms["*"] == "deny"
-        # Only read-only git subcommands may be allowed.
-        for pattern, mode in bash_perms.items():
-            if pattern == "*":
-                continue
-            assert mode == "allow"
-            assert pattern.split()[1].rstrip("*") in {"diff", "status", "log", "show", "blame"}
+    # branch) — ari-change's job is investigating and editing files, not
+    # staging/committing them (that's publish_pr's instruction to
+    # ari-publish: "Stage and commit exactly these files").
+    bash_perms = _AGENT_DEFS["ari-change"]["permission"]["bash"]
+    assert "git *" not in bash_perms, "ari-change must not have blanket git access"
+    assert bash_perms["*"] == "deny"
+    # Only read-only git subcommands may be allowed.
+    for pattern, mode in bash_perms.items():
+        if pattern == "*":
+            continue
+        assert mode == "allow"
+        assert pattern.split()[1].rstrip("*") in {"diff", "status", "log", "show", "blame"}

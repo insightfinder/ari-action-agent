@@ -97,6 +97,11 @@ class Settings(BaseSettings):
 
     opencode_bin: str = "opencode"
 
+    # publish_pr's primary path is deterministic (git + a direct GitHub
+    # REST API call, see capabilities/publish_pr.py) — this MCP server is
+    # kept only as its fallback, still routed through a dedicated opencode
+    # agent (`ari-publish`, tools/opencode_cli.py) when the primary path
+    # fails.
     github_mcp_server_url: str = "https://api.githubcopilot.com/mcp/"
 
     log_level: str = "info"

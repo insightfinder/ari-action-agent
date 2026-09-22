@@ -119,6 +119,69 @@ async def diff(workdir: str) -> str:
     return stdout.decode(errors="replace")
 
 
+async def add(workdir: str, files: list[str]) -> None:
+    """Stages exactly `files` — never `-A`/`.` (see publish_pr.py's own
+    instruction text for why: other steps, e.g. verify, can leave scratch
+    files behind in the working tree that must never end up in a PR)."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "add", "--", *files,
+        cwd=workdir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"git add failed: {stderr.decode(errors='replace')}")
+
+
+async def commit(workdir: str, title: str, body: str = "") -> None:
+    """A fixed, generic author identity — this commit is ARI's, not any
+    individual's, same reasoning as opencode's own agents never being
+    asked to impersonate a person."""
+    args = [
+        "git", "-c", "user.email=ari-agent@users.noreply.github.com", "-c", "user.name=ARI Agent",
+        "commit", "-m", title,
+    ]
+    if body:
+        args += ["-m", body]
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=workdir,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"git commit failed: {stderr.decode(errors='replace')}")
+
+
+async def push(workdir: str, repo_config: dict, branch: str) -> None:
+    """Pushes the current HEAD to a *new* remote branch (`branch`) —
+    `HEAD:refs/heads/<branch>` creates that branch on the remote from
+    whatever's currently checked out locally (e.g. still "main"), without
+    needing to rename or check out a local branch first, and without
+    touching the real main/master on the remote."""
+    url = authed_url(repo_config["url"], repo_config)
+    env = os.environ.copy()
+    if not repo_config.get("pat") and repo_config.get("ssh_key"):
+        key_path = os.path.join(workdir, "deploy_key_push")
+        with open(key_path, "w") as f:
+            f.write(repo_config["ssh_key"])
+        os.chmod(key_path, 0o600)
+        env["GIT_SSH_COMMAND"] = f"ssh -i {key_path} -o StrictHostKeyChecking=no"
+
+    proc = await asyncio.create_subprocess_exec(
+        "git", "push", url, f"HEAD:refs/heads/{branch}",
+        cwd=workdir,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"git push failed: {stderr.decode(errors='replace')}")
+
+
 async def changed_files(workdir: str) -> list[str]:
     """Names of files generate_change actually modified (tracked files only,
     relative to HEAD). Used to scope publish_pr's staging to exactly this —

@@ -70,9 +70,10 @@ cover deployment and limitations for both.
 ## 1. What this is
 
 A standalone agent that takes an incident/prompt plus full repo/LLM
-configuration in a single request, autonomously clones the repo, analyzes
-the problem in an isolated sandbox using [opencode](https://github.com/sst/opencode),
-generates and verifies a fix, and opens a pull request.
+configuration in a single request, autonomously clones the repo,
+investigates and fixes the problem in an isolated sandbox using
+[opencode](https://github.com/sst/opencode), and opens a pull request —
+optionally verifying the fix first when the request asks for it.
 
 Design principles:
 
@@ -183,7 +184,7 @@ always gets a definitive answer instead of a pause.
 |---|---|---|---|
 | **Request** | Config model — this agent kind's own connection info, `llm`, options. Self-contained, immutable. | `ari_oncall_agent/schemas.py` (`RepoConfig`, `LLMConfig`, `RequestConfig`) | `jenkins_agent/schemas.py` (`JenkinsConfig`, `JenkinsAuthConfig`) |
 | **Plan** | Ordered list of `Step`s (capability + params), produced per-request by the planner. | `common/models/plan.py`, `common/planner.py` (shared) | same |
-| **Capability** | One pipeline step's behavior. Declared in `configs/<agent_kind>/capabilities.yaml` (description, tools, retry, on_failure); implemented as `run(ctx) -> dict`. | `clone_repo`, `analyze`, `generate_change`, `verify`, `publish_pr` in `ari_oncall_agent/capabilities/` | `resolve_target`, `inspect`, `diagnose`, `propose_action`, `execute_action` in `jenkins_agent/capabilities/` |
+| **Capability** | One pipeline step's behavior. Declared in `configs/<agent_kind>/capabilities.yaml` (description, tools, retry, on_failure); implemented as `run(ctx) -> dict`. | `clone_repo`, `generate_change`, `verify`, `publish_pr` in `ari_oncall_agent/capabilities/` | `resolve_target`, `inspect`, `diagnose`, `propose_action`, `execute_action` in `jenkins_agent/capabilities/` |
 | **Tool** | A concrete callable a capability may use. Declared in `configs/<agent_kind>/tools.yaml`. | `git_clone`, `opencode`, `repo_cache`, ... in `ari_oncall_agent/tools/` | `opencode`, `jenkins_stop_build`, ... in `jenkins_agent/tools/` |
 
 Both agent kinds share the same `respond` capability (`common/respond.py`,
@@ -206,12 +207,14 @@ new capabilities/tools/catalog entries, not a rewrite. Adding a whole new
    to the request's own LLM and gets back an ordered step list. It honors
    `config.options` (e.g. `skip_tests`) and dynamic branch names in the
    prompt (§6) as explicit directives; it also decides per request whether
-   `analyze` is worth running at all (skippable when the request already
-   names exactly what to change) and can tailor a step's `instruction` when
-   the generic default wording (bug-fix vs. feature vs. edit/refactor)
-   would fit poorly. Malformed planner output falls back to the standard
-   clone→analyze→change→verify→publish pipeline rather than failing the
-   request.
+   `verify` is worth including at all — opt-in, not part of the default
+   pipeline, only included when the request explicitly asks for tests/
+   verification (building/testing an arbitrary target repo is this
+   pipeline's slowest, least predictable step) — and can tailor a step's
+   `instruction` when the generic default wording (bug-fix vs. feature vs.
+   edit/refactor) would fit poorly. Malformed planner output falls back to
+   the standard clone→change→publish pipeline (no `verify`, matching the
+   opt-in default) rather than failing the request.
 2. `plan_task` enriches each step with its capability's `retry` and
    `on_failure` policy from `configs/capabilities.yaml`, so
    `orchestration/workflow.py` itself never has to read the registry
@@ -294,32 +297,45 @@ conversation history, and whatever step results exist:
 
 ## 5. opencode + GitHub MCP integration (on-call agent)
 
-opencode does all the actual analysis/editing/test-running *and* the
-GitHub PR operations — the latter via opencode's own built-in MCP client
-pointed at the public GitHub MCP server, not a custom Python MCP client.
-The subprocess/event-parsing/tracing mechanics described below (process
-invocation, `--format json` NDJSON parsing, `_build_trace`) live in
-`common/opencode_runtime.py` and are shared verbatim with the Jenkins
-agent (§5b) — only the scoped agent definitions and per-request config
-(`write_config`) are agent-kind-specific, in each agent's own thin
-`tools/opencode_cli.py`.
+opencode does the analysis/editing/test-running for `analyze`/
+`generate_change`/`verify`. `publish_pr` is different: its *primary* path
+is plain deterministic Python (git subprocess + a direct GitHub REST API
+call, `tools/git_ops.py`/`tools/github_rest.py`) — no opencode, no LLM,
+no MCP round trip — because everything that step needs (title, body,
+branch name, file list) is already known by the time it runs. Confirmed
+live that routing it through opencode + the GitHub MCP server (the
+original implementation) was the dominant cost of the step: an opencode
+subprocess plus several LLM-mediated tool-call round trips (git add, git
+commit, git push, then the MCP call) for zero actual reasoning.
+`publish_pr` falls back to that original opencode + GitHub MCP flow only
+if the primary path raises — kept deliberately, not removed, as a safety
+net for whatever an unusual repo/auth state might need that a fixed
+git/REST sequence can't adapt to. The subprocess/event-parsing/tracing
+mechanics described below (process invocation, `--format json` NDJSON
+parsing, `_build_trace`) live in `common/opencode_runtime.py` and are
+shared verbatim with the Jenkins agent (§5b) — only the scoped agent
+definitions and per-request config (`write_config`) are agent-kind-
+specific, in each agent's own thin `tools/opencode_cli.py`.
 
 - **Per-request `opencode.json`**, written into the cloned repo right
   after clone and torn down with the rest of the sandbox:
   `provider.<llm.provider>.options.apiKey` (that request's own key, never
   a shared one), and — since GitHub credentials are also per-request —
   `mcp.github` pointed at `https://api.githubcopilot.com/mcp/` with
-  `Authorization: Bearer <repo.pat>` and `oauth: false` (forces PAT auth).
-  Kept out of the repo's own git history via `.git/info/exclude`, not
-  `.gitignore` (which opencode itself could edit).
+  `Authorization: Bearer <repo.pat>` and `oauth: false` (forces PAT auth),
+  used only by `publish_pr`'s fallback (see above). Kept out of the repo's
+  own git history via `.git/info/exclude`, not `.gitignore` (which
+  opencode itself could edit).
 - **Four scoped opencode agents**, each `mode: "primary"` (required for
   `--agent <name>` selection to actually take effect): `ari-analyze`
   (read-only, `edit: deny`), `ari-change` (`edit: allow`, no build tooling),
   `ari-verify` (`edit: deny`, broad `bash: allow` since test/build
   commands are unpredictable per-repo), `ari-publish` (`edit: deny`, the
-  *only* agent with `github_*` MCP tools enabled). `analyze`/
-  `generate_change`/`verify`/`publish_pr` each call `opencode run --agent
-  <name> ...` with only the matching agent.
+  *only* agent with `github_*` MCP tools enabled — reached only as
+  `publish_pr`'s fallback). `analyze`/`generate_change`/`verify` each call
+  `opencode run --agent <name> ...` with only the matching agent on every
+  run; `publish_pr` only calls it (as `ari-publish`) when its primary path
+  fails.
 - **One ephemeral `opencode run` process per capability step**, not a
   long-lived `opencode serve` — a Temporal activity is a self-contained
   unit of work, and Temporal doesn't guarantee two activities for the same
@@ -335,10 +351,11 @@ agent (§5b) — only the scoped agent definitions and per-request config
   `"text"` or `"tool"` (tool parts carry `tool`/`callID`/
   `state.{status,input,output,error}`); a fatal error arrives as a
   top-level `{"type": "error", ...}` event on stdout, not stderr.
-  `publish_pr` reads the PR URL out of the matching GitHub MCP tool call's
-  result, with a regex-over-response-text fallback. `generate_change`
-  captures the diff via plain `git diff HEAD` rather than trusting
-  opencode's own account of what it changed.
+  `publish_pr`'s fallback reads the PR URL out of the matching GitHub MCP
+  tool call's result, with a regex-over-response-text fallback, same as
+  the original implementation. `generate_change` captures the diff via
+  plain `git diff HEAD` rather than trusting opencode's own account of
+  what it changed.
 
 **LLM client** (`llm/client.py`) uses the official SDKs — `openai>=3.14`
 (`AsyncOpenAI`, the Responses API) and `anthropic>=1.6` (`AsyncAnthropic`,

@@ -32,7 +32,35 @@ def _ctx(results: dict, tools: dict, params: dict | None = None, capability: str
     )
 
 
-def test_extract_pr_from_structured_tool_output():
+def _publish_pr_tools(**overrides):
+    tools = {
+        "git_add": AsyncMock(),
+        "git_commit": AsyncMock(),
+        "git_push": AsyncMock(),
+        "github_create_pr": AsyncMock(return_value={"url": "https://github.com/x/y/pull/1", "branch": "ari/x"}),
+        "opencode": AsyncMock(return_value={"text": "not reached", "tool_calls": []}),
+    }
+    tools.update(overrides)
+    return tools
+
+
+def test_repo_slug_strips_dot_git_suffix():
+    assert publish_pr._repo_slug("https://github.com/neyaadeez/go-script") == "neyaadeez/go-script"
+    assert publish_pr._repo_slug("https://github.com/neyaadeez/go-script.git") == "neyaadeez/go-script"
+
+
+def test_branch_name_is_deterministic_and_collision_resistant():
+    # No LLM on the primary path to invent this -- same title + request id
+    # must always produce the same branch, and different requests against
+    # the same repo must never collide.
+    name = publish_pr._branch_name("ARI: fix the cart bug", "req-12345678")
+    assert name == publish_pr._branch_name("ARI: fix the cart bug", "req-12345678")
+    assert name.startswith("ari/")
+    assert "req-1234" in name  # first 8 chars of the request id
+    assert " " not in name
+
+
+def test_extract_pr_from_opencode_result_uses_structured_tool_output():
     result = {
         "text": "done",
         "tool_calls": [
@@ -43,100 +71,139 @@ def test_extract_pr_from_structured_tool_output():
             }
         ],
     }
-    pr = publish_pr._extract_pr(result)
+    pr = publish_pr._extract_pr_from_opencode_result(result)
     assert pr == {"url": "https://github.com/x/y/pull/42", "branch": "ari/fix-1"}
 
 
-def test_extract_pr_falls_back_to_text_regex():
+def test_extract_pr_from_opencode_result_falls_back_to_text_regex():
     result = {"text": "Opened it here: https://github.com/x/y/pull/7 — done.", "tool_calls": []}
-    pr = publish_pr._extract_pr(result)
+    pr = publish_pr._extract_pr_from_opencode_result(result)
     assert pr["url"] == "https://github.com/x/y/pull/7"
 
 
-def test_extract_pr_returns_none_when_nothing_found():
-    assert publish_pr._extract_pr({"text": "no pr here", "tool_calls": []}) is None
+def test_extract_pr_from_opencode_result_returns_none_when_nothing_found():
+    assert publish_pr._extract_pr_from_opencode_result({"text": "no pr here", "tool_calls": []}) is None
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_instruction_scopes_staging_to_changed_files():
-    opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
-        {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/x/y/pull/1"}}
-    ], "trace": _STUB_TRACE})
+async def test_publish_pr_primary_path_stages_commits_pushes_and_opens_pr():
+    tools = _publish_pr_tools()
     ctx = _ctx(
         results={"generate_change": {"summary": "fixed it", "changed_files": ["cart_service.py"]}},
-        tools={"opencode": opencode},
+        tools=tools,
     )
 
-    await publish_pr.run(ctx)
+    result = await publish_pr.run(ctx)
 
-    instruction = opencode.await_args.args[1]
-    assert "cart_service.py" in instruction
-    assert "git add -A" in instruction  # named explicitly as what NOT to do
-    assert "do not use" in instruction.lower()
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_raises_clear_error_when_no_pr_found():
-    opencode = AsyncMock(return_value={"text": "I could not open a PR", "tool_calls": []})
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools={"opencode": opencode})
-
-    with pytest.raises(RuntimeError, match="could not find a PR url"):
-        await publish_pr.run(ctx)
-
-
-def test_repo_slug_strips_dot_git_suffix():
-    assert publish_pr._repo_slug("https://github.com/neyaadeez/go-script") == "neyaadeez/go-script"
-    assert publish_pr._repo_slug("https://github.com/neyaadeez/go-script.git") == "neyaadeez/go-script"
+    tools["git_add"].assert_awaited_once_with("/tmp/ws", ["cart_service.py"])
+    tools["git_commit"].assert_awaited_once()
+    tools["git_push"].assert_awaited_once()
+    tools["github_create_pr"].assert_awaited_once()
+    tools["opencode"].assert_not_awaited()  # primary path succeeded -- no fallback
+    assert result == {"pr": {"url": "https://github.com/x/y/pull/1", "branch": "ari/x"}}
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_instruction_states_repo_explicitly():
-    # Regression test: live testing against a real repo showed opencode
-    # will not infer the target repo from the working tree's git remote on
-    # its own — it asked for clarification instead of opening the PR. The
-    # instruction must state owner/repo up front.
-    opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
-        {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/n/r/pull/1"}}
-    ], "trace": _STUB_TRACE})
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.go"]}}, tools={"opencode": opencode})
+async def test_publish_pr_create_pr_call_uses_repo_slug_title_body_branch_and_base():
+    tools = _publish_pr_tools()
+    ctx = _ctx(
+        results={"generate_change": {"summary": "fixed the bug", "changed_files": ["a.go"]}},
+        tools=tools,
+    )
     ctx.config["repo"]["url"] = "https://github.com/neyaadeez/go-script"
 
     await publish_pr.run(ctx)
 
-    instruction = opencode.await_args.args[1]
-    assert "neyaadeez/go-script" in instruction
-    assert "do not ask for the repository" in instruction.lower()
+    args = tools["github_create_pr"].await_args.args
+    repo_config, owner_repo, title, body, head, base = args
+    assert owner_repo == "neyaadeez/go-script"
+    assert "fixed the bug" in title or "fixed the bug" in body
+    assert head.startswith("ari/")
+    assert base == "main"
 
 
 @pytest.mark.asyncio
 async def test_publish_pr_base_ref_param_overrides_repo_default():
-    opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
-        {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/x/y/pull/1"}}
-    ], "trace": _STUB_TRACE})
+    tools = _publish_pr_tools()
     ctx = _ctx(
         results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}},
-        tools={"opencode": opencode},
+        tools=tools,
         params={"base_ref": "staging"},
     )
 
     await publish_pr.run(ctx)
 
-    instruction = opencode.await_args.args[1]
-    assert "against staging" in instruction
-    assert "against main" not in instruction
+    assert tools["github_create_pr"].await_args.args[5] == "staging"
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_base_ref_defaults_to_repo_ref_when_unset():
-    opencode = AsyncMock(return_value={"text": "ok", "tool_calls": [
-        {"tool": "github_create_pull_request", "input": {"head": "b"}, "output": {"html_url": "https://github.com/x/y/pull/1"}}
-    ], "trace": _STUB_TRACE})
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools={"opencode": opencode})
+async def test_publish_pr_base_ref_defaults_to_clone_repo_ref_when_unset():
+    tools = _publish_pr_tools()
+    ctx = _ctx(
+        results={
+            "clone_repo": {"cloned_path": "/tmp/ws/repo", "ref": "dev"},
+            "generate_change": {"summary": "fixed it", "changed_files": ["a.py"]},
+        },
+        tools=tools,
+    )
 
     await publish_pr.run(ctx)
 
-    instruction = opencode.await_args.args[1]
-    assert "against main" in instruction
+    assert tools["github_create_pr"].await_args.args[5] == "dev"
+
+
+@pytest.mark.asyncio
+async def test_publish_pr_raises_when_generate_change_reports_no_changed_files():
+    tools = _publish_pr_tools()
+    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": []}}, tools=tools)
+
+    with pytest.raises(RuntimeError, match="no changed files"):
+        await publish_pr.run(ctx)
+
+    tools["git_add"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_pr_falls_back_to_opencode_when_primary_path_fails():
+    # The safety net this whole design keeps: an unusual repo/auth state a
+    # fixed git/REST sequence can't handle should still get a real
+    # attempt via the more flexible opencode+MCP path, not just fail.
+    tools = _publish_pr_tools(
+        git_push=AsyncMock(side_effect=RuntimeError("git push failed: permission denied")),
+        opencode=AsyncMock(
+            return_value={
+                "text": "ok",
+                "tool_calls": [
+                    {
+                        "tool": "github_create_pull_request",
+                        "input": {"head": "b"},
+                        "output": {"html_url": "https://github.com/x/y/pull/9"},
+                    }
+                ],
+            }
+        ),
+    )
+    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
+
+    result = await publish_pr.run(ctx)
+
+    tools["opencode"].assert_awaited_once()
+    instruction = tools["opencode"].await_args.args[1]
+    assert "permission denied" in instruction
+    assert "a.py" in instruction
+    assert result == {"pr": {"url": "https://github.com/x/y/pull/9", "branch": "b"}}
+
+
+@pytest.mark.asyncio
+async def test_publish_pr_raises_clearly_when_both_primary_and_fallback_fail():
+    tools = _publish_pr_tools(
+        git_push=AsyncMock(side_effect=RuntimeError("git push failed: permission denied")),
+        opencode=AsyncMock(return_value={"text": "I could not open a PR either", "tool_calls": []}),
+    )
+    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
+
+    with pytest.raises(RuntimeError, match="primary path failed"):
+        await publish_pr.run(ctx)
 
 
 def _clone_repo_tools(**overrides):
@@ -239,6 +306,31 @@ async def test_generate_change_returns_only_the_marked_summary_not_raw_narration
     result = await opencode_change.run(ctx)
 
     assert result["summary"] == "Removed the Zone field."
+
+
+@pytest.mark.asyncio
+async def test_generate_change_also_returns_root_cause_from_the_same_summary():
+    # analyze used to be a separate capability/opencode session that
+    # produced this artifact; now generate_change investigates and edits
+    # in one call, so it has to produce root_cause itself too (see
+    # agent_meta.artifacts: "root_cause": "generate_change.root_cause").
+    opencode = AsyncMock(
+        return_value={"text": "Found it in models.go.\nSUMMARY:\nZone field was never cleared.", "trace": _STUB_TRACE}
+    )
+    ctx = _ctx(
+        results={},
+        tools={
+            "opencode": opencode,
+            "git_diff": AsyncMock(return_value="diff"),
+            "git_changed_files": AsyncMock(return_value=["models.go"]),
+        },
+        capability="generate_change",
+    )
+
+    result = await opencode_change.run(ctx)
+
+    assert result["root_cause"] == {"summary": "Zone field was never cleared.", "evidence": []}
+    assert result["summary"] == "Zone field was never cleared."
 
 
 @pytest.mark.asyncio

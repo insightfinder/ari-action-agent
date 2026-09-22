@@ -8,11 +8,19 @@
 # Adding a capability = write the module + add an entry here. No engine
 # code changes.
 #
-# analyze/generate_change/verify/publish_pr are all backed by opencode, each
-# through its own scoped opencode "agent" (ari-analyze/ari-change/ari-verify/
-# ari-publish — see tools/opencode_cli.py) with only the permissions and
-# MCP tools that step actually needs. Only ari-publish has the GitHub MCP
-# server's tools enabled.
+# generate_change/verify are backed by opencode, each through its own
+# scoped opencode "agent" (ari-change/ari-verify — see tools/opencode_cli.py)
+# with only the permissions that step actually needs. publish_pr's primary
+# path is plain deterministic git/REST (no opencode); it falls back to
+# opencode (agent: ari-publish, the only one with the GitHub MCP server's
+# tools enabled) only if that primary path fails.
+#
+# There used to be a separate `analyze` capability (read-only investigation,
+# its own opencode agent/session) that ran before generate_change — merged
+# into generate_change: opencode's own agentic loop already investigates as
+# needed within one turn before editing, so the split only ever cost a
+# second opencode subprocess + LLM session start for every request that was
+# always going to edit anyway. See generate_change.py's own docstring.
 
 capabilities:
   clone_repo:
@@ -35,33 +43,21 @@ capabilities:
       max_attempts: 3
       backoff_seconds: 5
 
-  analyze:
-    module: ari_oncall_agent.capabilities.analyze
-    description: >
-      Use opencode (agent: ari-analyze, read-only — cannot edit files) to
-      investigate the repository before editing it: localize the root
-      cause for a bug/issue (stack trace, bug report, flaky test), or scope
-      out exactly what needs to change for a feature/edit/refactor request.
-      Worth skipping when the request already names the exact
-      fields/files/behavior to change and there's genuinely nothing to
-      investigate first.
-    tools: [opencode]
-    retry:
-      max_attempts: 2
-      backoff_seconds: 10
-
   generate_change:
     module: ari_oncall_agent.capabilities.generate_change
     description: >
-      Use opencode (agent: ari-change, can edit files) to make the requested
-      code change — a bug fix, a new feature, a refactor, or a specific
-      edit, whatever the request actually asks for — informed by the
-      analysis output when one ran (or a prior verify failure, when looping
-      back). Diff and the list of changed files are captured via `git
-      diff`/`git diff --name-only`, not trusted from opencode's own report
-      of what it changed — publish_pr uses the file list to scope staging
-      and avoid sweeping in scratch files a later step (e.g. verify) may
-      have left behind.
+      Use opencode (agent: ari-change, can edit files) to investigate the
+      repository as needed and make the requested code change — a bug fix,
+      a new feature, a refactor, or a specific edit, whatever the request
+      actually asks for — informed by a prior verify failure when looping
+      back. Always the step that both localizes a root cause (for a bug/
+      issue) and edits, in one pass — never run a separate read-only
+      investigation step first, opencode already investigates as needed
+      within this same call before editing. Diff and the list of changed
+      files are captured via `git diff`/`git diff --name-only`, not
+      trusted from opencode's own report of what it changed — publish_pr
+      uses the file list to scope staging and avoid sweeping in scratch
+      files a later step (e.g. verify) may have left behind.
     tools: [opencode, git_diff, git_changed_files]
     retry:
       max_attempts: 2
@@ -72,8 +68,15 @@ capabilities:
     description: >
       Use opencode (agent: ari-verify, can run arbitrary build/lint/test
       commands but cannot edit files) to run the project's test suite
-      against the generated change. Skippable when the request explicitly
-      asks to skip tests/verification.
+      against the generated change. Opt-in, NOT part of the default
+      pipeline: only include this step when the request explicitly asks
+      for tests/verification to be run (e.g. "verify it works", "run the
+      tests", "make sure it builds") — omit it for an ordinary bug
+      fix/feature/edit request. Building/testing an arbitrary target repo
+      is the slowest, least predictable step in this pipeline (cold
+      dependency downloads, unknown build tooling per repo), so it's a
+      real cost only worth paying when explicitly asked for, not a
+      default every request should pay.
     tools: [opencode]
     retry:
       max_attempts: 1
@@ -99,14 +102,17 @@ capabilities:
   publish_pr:
     module: ari_oncall_agent.capabilities.publish_pr
     description: >
-      Use opencode (agent: ari-publish — the only agent with the GitHub
-      MCP server's tools enabled) to push the change branch and open a pull
-      request. Accepts an optional `base_ref` param (the PR's target
-      branch) when the prompt names one explicitly and it differs from
-      the branch clone_repo checked out, e.g. "raise a PR against
-      staging" while working from dev — otherwise defaults to the same
-      branch clone_repo used. Always the last step.
-    tools: [opencode]
+      Deterministically (no LLM/opencode involved — title, body, branch
+      name and file list are already fully known by this point) stage,
+      commit, and push the change to a new branch, then open a pull
+      request via the GitHub REST API; falls back to opencode + the
+      GitHub MCP server (agent: ari-publish) if that primary path fails.
+      Accepts an optional `base_ref` param (the PR's target branch) when
+      the prompt names one explicitly and it differs from the branch
+      clone_repo checked out, e.g. "raise a PR against staging" while
+      working from dev — otherwise defaults to the same branch clone_repo
+      used. Always the last step.
+    tools: [git_add, git_commit, git_push, github_create_pr, opencode]
     retry:
       max_attempts: 3
       backoff_seconds: 5

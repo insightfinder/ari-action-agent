@@ -5,11 +5,14 @@
 # Adding a tool = write the function + add an entry here + list its name
 # under the relevant capability's `tools:` in capabilities.yaml.
 #
-# Note: GitHub PR operations are NOT a separate tool here. opencode itself
-# is configured (per-request, see tools/opencode_cli.py:write_config) with
-# the GitHub MCP server, and only the `ari-publish` opencode agent has
-# those MCP tools enabled. `publish_pr` calls the same `opencode` tool as
-# every other opencode-backed capability — see configs/capabilities.yaml.
+# Note: publish_pr's primary path does NOT use opencode. Its git
+# operations (add/commit/push) and its GitHub API call (open the PR) are
+# plain, deterministic tools below — see capabilities/publish_pr.py for
+# why: everything that step needs (title, body, branch, files) is already
+# known by the time it runs, so there's nothing for an LLM/MCP round trip
+# to decide. It still lists `opencode` among its tools for its fallback
+# path (opencode + the GitHub MCP server, same as this capability's
+# original implementation), used only if the primary path fails.
 
 tools:
   git_clone:
@@ -31,6 +34,22 @@ tools:
   git_default_branch:
     module: ari_oncall_agent.tools.git_ops
     function: default_branch
+
+  git_add:
+    module: ari_oncall_agent.tools.git_ops
+    function: add
+
+  git_commit:
+    module: ari_oncall_agent.tools.git_ops
+    function: commit
+
+  git_push:
+    module: ari_oncall_agent.tools.git_ops
+    function: push
+
+  github_create_pr:
+    module: ari_oncall_agent.tools.github_rest
+    function: create_pull_request
 
   repo_cache:
     module: ari_oncall_agent.tools.repo_cache

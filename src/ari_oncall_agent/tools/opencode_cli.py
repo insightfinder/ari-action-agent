@@ -1,9 +1,19 @@
 """oncall agent's own opencode wiring: which capability maps to which
 scoped opencode agent, each agent's least-privilege permission block, and
-the per-request opencode.json (LLM key + GitHub MCP server + PAT). The
+the per-request opencode.json (LLM key, GitHub MCP server + PAT). The
 actual subprocess/event-parsing/tracing mechanics are agent-kind-agnostic
 and live in common/opencode_runtime.py — this module supplies only what's
 specific to fixing code.
+
+`publish_pr`'s *primary* path no longer calls opencode at all: title,
+body, branch name and file list are already fully deterministic by the
+time it runs, so routing it through an LLM-driven agent bought nothing but
+latency (see capabilities/publish_pr.py, tools/git_ops.py,
+tools/github_rest.py). `ari-publish` below still exists and is still
+wired with the GitHub MCP server's tools — publish_pr falls back to it
+(a real opencode run, same as before) if the deterministic path fails, so
+the more flexible/comprehensive MCP-driven route is still available as a
+safety net rather than removed outright.
 """
 
 import json
@@ -18,22 +28,22 @@ from .build_cache import reserve_build_cache_home
 # (not just in the YAML) because it's opencode-specific wiring, not a fact
 # about the capability itself.
 CAPABILITY_AGENTS = {
-    "analyze": "ari-analyze",
     "generate_change": "ari-change",
     "verify": "ari-verify",
     "publish_pr": "ari-publish",
 }
 
-# Read-only git inspection only — `ari-analyze`/`ari-change` have no
-# business committing or pushing anything (that's `ari-publish`'s job,
-# per `capabilities/publish_pr.py`'s own instruction: "Stage and commit
-# exactly these files"). Confirmed live this mattered, not just in
-# principle: the old blanket `"git *": "allow"` let a reproduction of
-# `ari-change` create a branch, commit, push, and open a real PR itself,
-# entirely bypassing `ari-publish` (see docs/MEMORY.md for the full
-# incident) — `git *` also matches destructive commands like `git reset
-# --hard`/`git clean -fdx`, not just the read-only inspection these two
-# agents actually need.
+# Read-only git inspection only — `ari-change` has no business committing
+# or pushing anything (that's publish_pr.py's job — deterministically via
+# tools/git_ops.py on the primary path, or `ari-publish` below on the
+# fallback path). Confirmed live this mattered, not just in principle: the
+# old blanket `"git *": "allow"` let a reproduction of `ari-change` create
+# a branch, commit, push, and open a real PR itself, entirely bypassing
+# the dedicated publish step (see docs/MEMORY.md for the full incident) —
+# `git *` also matches destructive commands like `git reset --hard`/`git
+# clean -fdx`, not just the read-only inspection this agent actually needs
+# (it still reads history — `git log`/`git diff`/etc — while investigating
+# before it edits; see generate_change.py).
 _READ_ONLY_GIT_BASH = {
     "git diff*": "allow",
     "git status*": "allow",
@@ -62,26 +72,14 @@ def _no_delegation_tools() -> dict[str, bool]:
 
 
 _AGENT_DEFS = {
-    # Read-only: investigate (root cause for a bug, or scope for a
-    # feature/edit) without touching the tree.
-    "ari-analyze": {
-        "description": "Investigates the repo — root cause for a bug, or scope for a feature/edit. Never edits files.",
-        "mode": "primary",
-        "permission": {
-            "edit": "deny",
-            "bash": _READ_ONLY_GIT_BASH,
-            "webfetch": "deny",
-        },
-        # See _no_delegation_tools() — disables opencode's built-in "task"
-        # subagent-delegation tool, which otherwise runs outside this
-        # agent's own `permission` block entirely.
-        "tools": _no_delegation_tools(),
-    },
-    # Can edit, can inspect git history, cannot commit/push (ari-publish's
-    # job), cannot run arbitrary build/test commands (that's verify's job),
-    # and cannot touch GitHub.
+    # Investigates as needed (root cause for a bug, or scope for a feature/
+    # edit) and edits, both in one session — no separate read-only
+    # investigation agent any more (see generate_change.py's docstring for
+    # why that split was removed). Can inspect git history, cannot commit/
+    # push (ari-publish's job), cannot run arbitrary build/test commands
+    # (that's verify's job), and cannot touch GitHub.
     "ari-change": {
-        "description": "Makes the requested code change — a bug fix, feature, refactor, or edit.",
+        "description": "Investigates the repo as needed, then makes the requested code change — a bug fix, feature, refactor, or edit.",
         "mode": "primary",
         "permission": {
             "edit": "allow",
@@ -107,7 +105,9 @@ _AGENT_DEFS = {
     # The only agent with GitHub MCP tools enabled. No build tooling. Keeps
     # its own broad `git *` — pushing/committing/branching is exactly its
     # job — but still no delegation: it should do its own git/MCP calls
-    # directly, not hand them to an unrestricted subagent.
+    # directly, not hand them to an unrestricted subagent. Only reached as
+    # publish_pr's fallback now (see capabilities/publish_pr.py) — the
+    # primary path is deterministic and never touches opencode at all.
     "ari-publish": {
         "description": "Pushes the change branch and opens a pull request via the GitHub MCP server.",
         "mode": "primary",
@@ -137,12 +137,14 @@ def write_config(workdir: str, llm: dict, repo: dict) -> str:
             llm["provider"]: {"options": {"apiKey": llm["api_key"]}}
         },
         # Every tool from the github MCP server is off by default; only the
-        # ari-publish agent re-enables it (see _AGENT_DEFS). Keeps the
-        # analyze/fix/verify agents from ever seeing (or spending context
-        # budget on) GitHub tools they have no business calling. `task`
-        # (subagent delegation) is off globally, full stop — see
-        # _no_delegation_tools() for why every agent also repeats this
-        # explicitly rather than relying on this default alone.
+        # ari-publish agent re-enables it (see _AGENT_DEFS) — reached only
+        # as publish_pr's fallback (capabilities/publish_pr.py), not on the
+        # normal deterministic path. Keeps the change/verify agents from
+        # ever seeing (or spending context budget on) GitHub tools they
+        # have no business calling. `task` (subagent delegation) is off
+        # globally, full stop — see _no_delegation_tools() for why every
+        # agent also repeats this explicitly rather than relying on this
+        # default alone.
         "tools": {"github_*": False, "task": False},
         "agent": _AGENT_DEFS,
     }
@@ -185,12 +187,12 @@ async def run_opencode(ctx, instruction: str, *, continue_session: bool | None =
         # tool, which inherits this process's env) benefit from a real
         # dependency cache — see build_cache.py/settings.build_cache_root.
         # Scoped to this one capability, not every opencode call:
-        # analyze/generate_change/publish_pr have no business sharing
-        # state through $HOME, and opencode's own state is already
-        # isolated separately per request (see opencode_runtime.
-        # run_opencode's XDG_* handling). Held for the duration of the
-        # call so eviction (build_cache.py) can never delete anything out
-        # from under an in-flight build.
+        # generate_change/publish_pr have no business sharing state
+        # through $HOME, and opencode's own state is already isolated
+        # separately per request (see opencode_runtime.run_opencode's
+        # XDG_* handling). Held for the duration of the call so eviction
+        # (build_cache.py) can never delete anything out from under an
+        # in-flight build.
         async with reserve_build_cache_home() as build_cache_root:
             return await _run_opencode(
                 ctx, instruction, agent, continue_session=continue_session, extra_env={"HOME": build_cache_root}

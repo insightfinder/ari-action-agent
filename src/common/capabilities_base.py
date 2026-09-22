@@ -12,7 +12,7 @@ from typing import Any, Callable
 # there's no collision risk, and this stays a one-line check regardless of
 # how many agent kinds share this codebase.
 _OPENCODE_CAPABILITIES = {
-    "analyze", "generate_change", "verify", "publish_pr",  # oncall
+    "generate_change", "verify", "publish_pr",  # oncall
     "resolve_target", "inspect", "diagnose", "propose_action", "execute_action",  # jenkins
 }
 

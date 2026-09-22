@@ -1833,3 +1833,239 @@ cleanup_workspace → resolve_artifacts → respond` against the local
 Temporal server completes correctly with `status: "needs_approval"` and
 a populated `pending_action` artifact — not just unit-tested in
 isolation.
+
+## 2026-09-21 — Live "why is on-call ARI slow" investigation on the `test` cluster
+
+Asked to check the live worker pod's logs and figure out why requests
+were slow. Investigated against the real `test` kubectl context
+(`insightfinder` namespace) rather than guessing from code — `kubectl
+logs`/`describe` on `ari-oncall-worker-85c7444df6-tgwlk`, and, critically,
+`temporal workflow list`/`show` run *inside* the `ari-oncall-temporal`
+pod (it ships the `temporal` CLI) against the real Temporal dev server,
+since the deployed image predates any of this session's work and had no
+way to expose that data otherwise.
+
+**Found, all confirmed live, not inferred:**
+- The worker pod had **OOMKilled 6 times in ~16h** (2Gi limit / 512Mi
+  request) — `describe pod` showed `Last State: Terminated, Reason:
+  OOMKilled`.
+- Both `repo-cache` and `sandbox` were plain `emptyDir` volumes (the
+  deployed `deploy/k8s/deployment-worker.yaml` and the Helm chart both
+  confirmed this) — every OOM restart wiped the whole mirror cache, so it
+  was rarely warm.
+- Two concurrent requests hitting `clone_repo`/`analyze` within ~2s of
+  each other both failed with `opencode (...) failed (exit 1): ...
+  database is locked` — opencode keeps its own local session state under
+  `$HOME` (one shared SQLite file regardless of `--dir`), and nothing
+  isolated `HOME` per activity, so two concurrent opencode subprocesses in
+  the same worker process collided on it.
+- `common/orchestration/worker.py`'s `Worker(...)` had no
+  `max_concurrent_activities` — Temporal's SDK default (100) let far more
+  concurrent opencode/build subprocesses pile into one 2-CPU/2Gi container
+  than it could sustain, very likely a real contributor to the OOM kills
+  above.
+- The account had also hit its Anthropic **API usage cap** at the moment
+  of the initial check (`"You will regain access on 2026-10-01"`) — not a
+  code bug, but explains why everything looked completely stuck that day.
+
+**Fixed, all in this same pass:**
+- `common/opencode_runtime.py`: `run_opencode` now isolates only
+  `XDG_DATA_HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME`
+  under the request's own `ctx.workspace` — deliberately **not** the real
+  `$HOME`, so `verify`'s build-tool dependency caches (`~/.m2`, Go's
+  module cache, `~/.npm`) stay shared/warm across requests. (First pass
+  isolated the whole `$HOME`, which would have silently forced a cold
+  dependency download on every `verify` run — caught and corrected before
+  this was ever deployed, see the entry below on build caching.)
+- `common/settings.py` + `common/orchestration/worker.py`: new
+  `max_concurrent_activities` setting (default `3`, conservative for a
+  2 CPU/2Gi pod), wired into `Worker(...)` in place of the SDK default.
+- Helm chart (`insightfinder/charts`, `charts/oncallari`): `repo-cache`
+  backed by a real PVC instead of `emptyDir` (a `ariOncallAgent.
+  persistence.repoCache` toggle + PVC template already existed in the
+  chart but was off — just flipped it on). `accessMode` made configurable
+  and defaulted to `ReadWriteOnce`, not the PVC template's original
+  hardcoded `ReadWriteMany` — checked the actual `test` cluster's
+  StorageClasses (`kubectl get storageclass`) and found only `gp3`
+  (AWS EBS via `ebs.csi.aws.com`), which is RWO-only; `worker.replicaCount`
+  is `1` there today anyway, so RWO still fully fixes the restart-loses-
+  cache problem, just doesn't share the cache across replicas (documented
+  as a follow-up for whenever an EFS/NFS StorageClass exists).
+
+**Verified:** full suite 127 passed (124 + 3 new — `test_opencode_runtime.py`
+covering the XDG isolation). `helm lint`/`helm template` confirmed the PVC
+renders and the worker mounts it in place of `emptyDir`.
+
+## 2026-09-21 — Temporal workflow history showed `verify` had *never* completed in the entire retained window
+
+Asked to check why every workflow in the Temporal UI "takes a huge time."
+Pulled the full event history (not just logs) for all 13 workflows
+retained (72h retention) via the in-pod `temporal workflow show -o json`.
+Found a single, consistent, load-bearing pattern:
+
+- 10 of 13 workflows: `verify` starts, then **7.5–10 minutes later** an
+  `EVENT_TYPE_WORKFLOW_EXECUTION_CANCEL_REQUESTED` fires (`identity:
+  1@ari-oncall-api-<pod>` — the API pod forwarding a real `tasks/cancel`
+  call it received), killing the in-flight `verify` activity. The whole
+  workflow then falls back through `cleanup_workspace → resolve_artifacts
+  → respond` and reports `pipeline_status: "failed"`.
+- 1 workflow: `verify` ran the *full* ~19 minutes, essentially hitting
+  `workflow.py`'s then-hardcoded 20-minute `start_to_close_timeout`.
+- The remaining 2 were the "database is locked" fast-failures above.
+
+**In the entire retained window, `verify` never completed successfully
+once.** Root cause, confirmed by reading the code (`capabilities/verify.py`,
+`tools/sandbox.py`, `settings.py`): **there was no dependency cache
+anywhere** — every `verify` run did a fully cold Maven/Go-module/npm
+dependency download before even running the actual build/test, on top of
+`workflow.py` unconditionally aborting the *entire* pipeline on any raised
+`ActivityError` (timeout or cancel) even for a step (`verify`) that
+already had an `on_failure: goto generate_change` retry-loop defined for
+a *reported* failure — the retry loop just never triggered for a killed
+activity, only for one that returned `{"status": "failed"}` on its own.
+
+**Fixed:**
+- `configs/oncall/capabilities.yaml`: `verify.timeout_seconds: 480` (new
+  per-capability override, threaded through `capabilities_registry.py` →
+  `activities.py`'s `plan_task` → `workflow.py`) — well inside the
+  observed ~8-10 minute external-cancel window, so the pipeline's own
+  timeout wins the race deterministically instead of an external caller.
+- `common/orchestration/workflow.py`: a raised `ActivityError` for a step
+  that *has* an `on_failure` policy is now folded into the same
+  `{"status": "failed", "failure": ...}` shape a reported failure already
+  produces, and goes through the identical retry loop. Only a step with no
+  `on_failure` policy still aborts the pipeline outright on a raised
+  error. Verified with a real `temporalio.testing.WorkflowEnvironment`
+  (time-skipping) run, not just mocks — confirmed `verify` retries via
+  `generate_change` on a simulated kill, and a step with no `on_failure`
+  still aborts immediately (`tests/test_workflow_execution.py`).
+- New persistent, shared HOME for `verify`'s build subprocesses only
+  (`settings.build_cache_root`, `ari_oncall_agent/tools/build_cache.py`),
+  scoped narrowly to the `verify` capability in `opencode_cli.py` — see
+  the XDG-isolation correction in the entry above for why this had to be
+  a *separate* HOME from opencode's own per-request state, not the same
+  one. Backed by a new PVC in the Helm chart (`ariOncallAgent.persistence.
+  buildCache`, mirroring the `repoCache` PVC pattern).
+
+**Verified:** full suite 143 passed. `helm lint`/`helm template` confirmed
+the new `build-cache` PVC renders and mounts.
+
+## 2026-09-21 — Repo-cache and build-cache PVCs kept small (5Gi) on purpose → LRU eviction
+
+User asked to size both PVCs at 5Gi and add LRU eviction so a small cache
+doesn't just fill up and start failing. Built a shared, generic utility
+(`common/cache_gc.py`) rather than one-off logic in each cache: sizing
+signal is `shutil.disk_usage(cache_root)` (the real filesystem backing
+the PVC), triggers below 15% free, evicts least-recently-used entries
+(newest mtime found scanning a few levels into each candidate — cheap,
+no full recursive walk) until back above 30% free. Both thresholds are
+settings (`cache_evict_low_water`/`cache_evict_high_water`), shared by
+both caches, wired through the Helm chart too.
+
+Two different locking shapes were needed, matched to how each cache is
+actually structured:
+- **repo-cache** (`ari_oncall_agent/tools/repo_cache.py`): one
+  independently-lockable entry per repo already existed (its own
+  `<hash>.lock` flock, from the earlier same-repo-concurrency fix) —
+  eviction reuses those exact lock files, non-blocking, so it only ever
+  deletes a repo that isn't currently being fetched/cloned.
+- **build-cache** (`ari_oncall_agent/tools/build_cache.py`, new): no
+  natural per-entry lock — every immediate child (`.m2`, `go`, `.npm`,
+  ...) is one shared tool's own cache, not an independent per-repo unit.
+  Used a classic reader/writer lock over the whole root instead: a
+  `verify` run holds it `LOCK_SH` for the call's duration, eviction only
+  ever attempts `LOCK_EX | LOCK_NB` — it either runs while genuinely idle
+  or skips that round entirely, never blocking a build or deleting out
+  from under one.
+
+**Verified:** 8 new tests (`test_cache_gc.py`, `test_build_cache.py`)
+covering the no-op-when-fine case, oldest-first eviction with high-water
+stopping, and that a locked/in-use entry is never touched (confirmed via
+real `fcntl.flock` contention across separate `open()` calls on the same
+path, not mocked). Full suite 140 passed. Helm chart PVC sizes rendered
+as 5Gi.
+
+## 2026-09-21 — `publish_pr` made deterministic (git + REST), opencode+MCP kept as fallback
+
+`publish_pr` used to be entirely opencode-driven: one `ari-publish` agent
+with the GitHub MCP server's tools enabled, doing `git add`/`commit`/
+`push` via its bash tool and opening the PR via an MCP tool call — every
+one of those steps paid a full LLM reasoning round-trip, on top of an MCP
+network hop, for work that was **already fully deterministic** by the
+time this step runs (title, body, branch name, and file list are all
+computed in plain Python before opencode is ever invoked). Confirmed via
+the same Temporal history above that this pattern (LLM-mediated
+mechanical git operations) was a real, generalizable cost, not specific
+to `verify`.
+
+**Primary path now**: `git_ops.add`/`commit`/`push` (new plain subprocess
+helpers, same shape as the existing `clone`/`diff`/`changed_files`) plus a
+direct GitHub REST API call (new `tools/github_rest.py`,
+`POST /repos/{owner}/{repo}/pulls`, same PAT already available) — zero
+LLM/opencode/MCP involvement. Branch name is now derived deterministically
+(`ari/<title-slug>-<request-id-prefix>`) instead of left for the LLM to
+invent.
+
+**Fallback, explicitly requested, not removed**: if any step of the
+primary path raises, `publish_pr` falls back to the original opencode +
+GitHub MCP flow (`ari-publish` agent, kept in `opencode_cli.py` exactly as
+before) — the fallback instruction tells opencode a prior attempt may
+have partially completed (check `git status`/`git log`/`git branch`
+first, don't blindly redo finished work) rather than assuming a clean
+slate. Only if *both* the primary path and the fallback fail does the
+step actually error out. Kept because the MCP-driven route is more
+flexible for whatever an unusual repo/auth state might need that a fixed
+git/REST sequence can't adapt to.
+
+**Verified:** 12 new tests — `test_git_ops.py` exercises `add`/`commit`/
+`push` against a real local bare-repo remote (not mocked: confirms `push`
+creates a genuinely new remote branch without moving `main`'s tip);
+`test_github_rest.py` mocks only the HTTP transport layer
+(`httpx.MockTransport`), not the function under test. Rewrote every
+`publish_pr` test in `test_capabilities.py` for the new primary/fallback
+shape, including one that forces the primary path to fail and asserts the
+fallback actually runs and finds the PR url. Full suite 152 passed.
+
+## 2026-09-21 — `analyze` merged into `generate_change`; `verify` flipped from opt-out to opt-in
+
+Two more asks from the same optimization pass:
+
+**Merge**: `analyze` (read-only investigation, its own `ari-analyze`
+opencode agent/session) used to always run before `generate_change`
+(edit, a second opencode agent/session) for anything that needed
+scoping out first — two separate opencode subprocess starts and LLM
+session boundaries for a single logical "figure out what to do, then do
+it" unit of work. Merged: `generate_change` (agent: `ari-change`, `edit:
+allow`) now investigates as needed and edits in one continued session —
+opencode's own agentic loop already reads/greps before editing within a
+single turn, same as how a capable engineer actually works, so the split
+bought nothing but a second subprocess/session-start cost every time.
+`analyze.py` deleted; `ari-analyze` removed from `_AGENT_DEFS`/
+`CAPABILITY_AGENTS`. The `root_cause` artifact (`agent_meta.artifacts`)
+now comes from `generate_change.root_cause` — reuses the same
+`SUMMARY:`-marked text as the change summary, since for a single-pass
+agent "what I found and did" is one coherent narrative, not two separate
+extractions.
+
+**Opt-in verify**: capability selection is entirely LLM-planner-driven
+(`common/planner.py` — there is no hardcoded pipeline to branch on), so
+the only lever is what the planner is told. Flipped `verify`'s
+`capabilities.yaml` description and `meta.py`'s `planner_domain_guidance`
+from opt-out ("skippable when asked to skip") to explicit opt-in ("only
+include this step when the request explicitly asks for tests/
+verification... omit it for an ordinary bug fix/feature/edit request") —
+building/testing an arbitrary target repo is this pipeline's slowest,
+least predictable step (see the two entries above on why), so it's a real
+cost only worth paying when actually asked for. Also removed `analyze`
+and `verify` from `planner_fallback_steps` (the template used only when
+the planner's own JSON output fails to parse) so that fallback matches
+the new default pipeline shape too: `clone_repo → generate_change →
+publish_pr`.
+
+**Verified:** full suite 154 passed, including an explicit
+`"analyze" not in catalog` assertion and one asserting `verify`'s catalog
+description actually says "opt-in"/"not part of the default pipeline"
+(can't unit-test the LLM planner's actual behavior, so this is the
+closest verifiable proxy — the existing `test_fallback_steps_only_name_
+capabilities_that_kind_actually_has` test already generically guards the
+fallback-steps list against referencing a capability that doesn't exist).

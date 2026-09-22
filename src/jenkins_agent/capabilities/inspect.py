@@ -1,7 +1,8 @@
 """Gathers whatever the question needs about the resolved target — status,
 parameters, history, queue position, node — using the Jenkins MCP tools.
 LLM-driven tool use, not a fixed fetch list, same philosophy as the oncall
-agent's own `analyze`/`generate_change`.
+agent's own `generate_change` (investigates as needed, not a fixed
+read list).
 
 `write_config` is called again here (not just once by resolve_target) as
 a belt-and-suspenders guard: this agent has no state between requests, so

@@ -26,10 +26,11 @@ async def run(ctx: StepContext) -> dict:
     # internal implementation detail of the caching layer.
     await set_origin(path, repo)
 
-    # Every later opencode call (analyze/generate_change/verify/publish_pr)
-    # runs with --dir <path>, so the per-request opencode.json (LLM key,
-    # GitHub MCP server + PAT, scoped agents) has to exist here before any
-    # of them run.
+    # Every later opencode call (analyze/generate_change/verify, plus
+    # publish_pr only if it falls back to opencode+MCP — see
+    # tools/opencode_cli.py) runs with --dir <path>, so the per-request
+    # opencode.json (LLM key, GitHub MCP server + PAT, scoped agents) has
+    # to exist here before any of them run.
     write_config(path, ctx.config["llm"], repo)
 
     return {"cloned_path": path, "ref": ref}
