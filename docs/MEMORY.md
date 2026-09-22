@@ -2069,3 +2069,42 @@ description actually says "opt-in"/"not part of the default pipeline"
 closest verifiable proxy — the existing `test_fallback_steps_only_name_
 capabilities_that_kind_actually_has` test already generically guards the
 fallback-steps list against referencing a capability that doesn't exist).
+
+## 2026-09-22 — Real Docker sandbox e2e run against 3 live repos, using gpt-4o-mini (Anthropic key was over quota) — found and fixed 4 live bugs
+
+Built `Dockerfile.api`/`Dockerfile.oncall` locally, wired to the existing
+`temporal-dev` stack, and ran real requests (real GitHub PAT, real repos:
+`InsightAgent`, `insightfinder-mcp-server`, `test-fluxcd`) instead of unit
+tests alone. Found, fixed, and re-verified live:
+
+- **Missing `clone_repo`**: the planner (a cheaper model) sometimes
+  scheduled `generate_change` without `clone_repo` first, so opencode ran
+  against an empty, non-git `--dir` and crashed opaquely. Fixed with
+  `StepContext.require_cloned_repo()` (raises clearly) plus sharper
+  `planner_domain_guidance`.
+- **`publish_pr` inconsistently included**: same request, two separate
+  runs — one opened a PR, the other didn't, despite neither prompt
+  declining one. Fixed with a new `AgentMeta.default_step_policy` hook
+  (`ari_oncall_agent/meta.py`'s `_ensure_publish_pr_by_default`): always
+  appends `publish_pr` when `generate_change` ran, unless
+  `options.skip_pr` or the planner's own explicit `skip_publish_pr: true`
+  (a new `Plan` field — omitting the step alone isn't a reliable enough
+  signal that the user declined, vs. the model just forgetting).
+- **Wrong branch guessed**: planner set `ref="main"` for `InsightAgent`,
+  whose real default branch is `master` — hard failure. Fixed by having
+  `ensure_cache_and_clone` check `git_branch_exists` *before* cloning and
+  fall back to the dynamically-detected `git_default_branch` (works for
+  any name — `main`/`master`/`dev`/anything — confirmed with a
+  same-shaped `dev`-default test repo too, not special-cased to two
+  names).
+- **Ugly PR title**: title and body came from the same `SUMMARY:` text,
+  title just being a blind 72-char slice — cut off mid-word live (PR
+  insightfinder/insightfinder-mcp-server#55: "...that aggreg-"). Fixed by
+  asking opencode for separate `TITLE:`/`SUMMARY:` sections
+  (`generate_change.py`), with a word-boundary-safe `_safe_title()`
+  fallback only if the model omits the title even after one retry.
+
+All three repos completed real end-to-end runs with real PRs after the
+fixes: insightfinder/InsightAgent#989, insightfinder/insightfinder-mcp-
+server#55 (pre-title-fix), insightfinder/test-fluxcd#7. Full test suite
+at 189 passed throughout.
