@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import sys
 from pathlib import Path
@@ -169,3 +170,116 @@ async def test_push_raises_clearly_when_the_remote_is_unreachable(tmp_path, remo
     _, work = remote_and_clone
     with pytest.raises(RuntimeError, match="git push failed"):
         await git_ops.push(str(work), {"url": str(tmp_path / "does-not-exist")}, "ari/change-1")
+
+
+# --- subprocess deadline ---------------------------------------------
+#
+# Live failure this guards: a `generate_change` run had opencode finish
+# normally in 121s, then sat in `diff`'s `proc.communicate()` for another
+# 18 minutes until Temporal's activity timeout cancelled it. The pipes had
+# already drained -- it was stuck awaiting process exit -- and no git
+# process remained in the container. The retry ran the same command in the
+# same sandbox in under a second, so it is a race, not the repo or the
+# command. Unbounded, it costs 20 minutes and (since `generate_change` has
+# no `on_failure` policy) reports nothing.
+
+
+class _NeverExits:
+    """A process whose communicate() never returns, like the live hang."""
+
+    def __init__(self):
+        self.pid = 4242
+        self.killed = False
+
+    async def communicate(self):
+        await asyncio.sleep(3600)
+
+    def kill(self):
+        self.killed = True
+
+
+class _Gone(_NeverExits):
+    """Already reaped by the time we try to kill it."""
+
+    def kill(self):
+        raise ProcessLookupError
+
+
+@pytest.mark.asyncio
+async def test_communicate_returns_normally_within_the_deadline():
+    class _Fast:
+        pid = 1
+        async def communicate(self):
+            return b"out", b""
+
+    assert await git_ops._communicate(_Fast(), "git diff") == (b"out", b"")
+
+
+@pytest.mark.asyncio
+async def test_communicate_raises_instead_of_hanging_forever():
+    proc = _NeverExits()
+    with pytest.raises(RuntimeError) as exc_info:
+        await git_ops._communicate(proc, "git diff", timeout=0.05)
+    message = str(exc_info.value)
+    assert "git diff" in message, "must name the operation that stalled"
+    assert "timed out" in message
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_child_is_killed_not_left_holding_the_sandbox():
+    # Attempts of one request share a workspace (the sandbox is keyed by
+    # request_id alone), so a survivor could still be writing to the tree
+    # the retry is about to read.
+    proc = _NeverExits()
+    with pytest.raises(RuntimeError):
+        await git_ops._communicate(proc, "git diff", timeout=0.05)
+    assert proc.killed is True
+
+
+@pytest.mark.asyncio
+async def test_kill_failing_because_the_child_already_exited_is_not_an_error():
+    # The suspected cause is a lost exit notification, so the child being
+    # gone already is the expected case, not an exceptional one.
+    with pytest.raises(RuntimeError, match="timed out"):
+        await git_ops._communicate(_Gone(), "git diff", timeout=0.05)
+
+
+@pytest.mark.asyncio
+async def test_every_git_call_goes_through_the_deadline_helper(repo):
+    # A new git helper added later must not reintroduce a bare
+    # communicate() -- that is exactly how this bug shipped.
+    import inspect
+    source = inspect.getsource(git_ops)
+    bare = [
+        line.strip()
+        for line in source.splitlines()
+        if "await proc.communicate()" in line and not line.strip().startswith("#")
+    ]
+    assert bare == [], f"bare communicate() without a deadline: {bare}"
+
+
+def test_deadlines_are_tiered_to_what_each_operation_actually_costs():
+    # One number cannot serve both ends: clone of a large monorepo is
+    # legitimately minutes, while diff/add/commit/changed_files are
+    # sub-second in practice. A single generous value left the observed
+    # `diff` stall costing five minutes instead of twenty — better, but
+    # still five minutes of nothing for a sub-second operation.
+    assert git_ops._CLONE_TIMEOUT_SECONDS >= 300, "clone must tolerate a big monorepo"
+    assert git_ops._DEFAULT_TIMEOUT_SECONDS >= 10, "still a guard, not a latency budget"
+    assert git_ops._DEFAULT_TIMEOUT_SECONDS < git_ops._CLONE_TIMEOUT_SECONDS
+
+
+def test_only_clone_gets_the_long_deadline():
+    # Guards the wiring, not just the constants: clone is the one call
+    # site that may pass the long tier; everything else must fall through
+    # to the short default, or the tiering is decorative.
+    import inspect
+    calls = [
+        line.strip()
+        for line in inspect.getsource(git_ops).splitlines()
+        if "_communicate(proc" in line and not line.strip().startswith("#")
+    ]
+    long_tier = [c for c in calls if "_CLONE_TIMEOUT_SECONDS" in c]
+    assert len(long_tier) == 1, f"exactly one long-tier call expected, got {long_tier}"
+    assert '"git clone"' in long_tier[0]
+    assert len(calls) >= 8, "all git call sites should be routed through the helper"

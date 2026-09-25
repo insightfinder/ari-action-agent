@@ -2108,3 +2108,136 @@ All three repos completed real end-to-end runs with real PRs after the
 fixes: insightfinder/InsightAgent#989, insightfinder/insightfinder-mcp-
 server#55 (pre-title-fix), insightfinder/test-fluxcd#7. Full test suite
 at 189 passed throughout.
+
+## 2026-09-25 — A 20-minute "slow run" was a hung `git diff`, not slow work
+
+Chased a live complaint that on-call ARI runs are wildly inconsistent —
+most finish in ~2 minutes, some take 20+ and hit the activity timeout.
+The obvious reading (a big monorepo, the model exploring more) turned out
+to be wrong, and the tracing added on 09-17 is what made that visible.
+
+**The runs, measured on the `test` cluster** (worker logs, `opencode_call`
+lines) — all the same incident against InfrastructureCore:
+
+| run | tool calls | `generate_change` | wall clock |
+|---|---|---|---|
+| 2c841c33 | 18 | 57s | ~2m |
+| 7ed8ef87 | 21 | 95s | ~2m |
+| cc5c8caa | 20 | 84s | 2m3s |
+| 75cc0ce6 | 19 | 104s | 1m31s |
+| **b22cb82d** | **33** | **121s** | **22m** |
+
+The slow one looks like "the model did 33 calls instead of 20" until you
+line up its timestamps: opencode returned at 09:53:21 having done its 33
+calls in 121s, and then *nothing happened for 18 minutes*. Inspecting the
+worker pod mid-hang (`/proc`, not `ps` — the image has no `ps`) showed
+**only PID 1**: no opencode, no git, no child of any kind.
+
+**The traceback Temporal printed when it finally cancelled the activity
+named the line exactly:**
+
+```
+  File "ari_oncall_agent/capabilities/generate_change.py", line 164, in run
+    diff = await git_diff(ctx.repo_dir)
+  File "ari_oncall_agent/tools/git_ops.py", line 132, in diff
+    stdout, stderr = await proc.communicate()
+  File "asyncio/subprocess.py", line 202, in communicate
+    await self.wait()
+  File "asyncio/base_subprocess.py", line 230, in _wait
+    return await waiter
+  asyncio.exceptions.CancelledError: Activity cancelled
+```
+
+`communicate()` had already drained both pipes; it was parked on process
+exit. The retry ran the identical `git diff HEAD` in the identical sandbox
+directory **in under a second** (10:11:30 → 10:12:53, including a fresh
+82s opencode call), so nothing about the repo, the command or the
+workspace explains it. It is a race.
+
+**Leading suspect, not proven:** a lost child-exit notification. The
+worker mixes `asyncio` subprocesses with `asyncio.to_thread` (repo_cache,
+build_cache) and Temporal's own threads, and an exited child whose
+SIGCHLD never reaches the loop's watcher leaves `_wait()` waiting forever
+— which matches all three observations (no process left, parked in
+`_wait`, fixed by simply running again). Recorded as a hypothesis; the
+fix below does not depend on it being right.
+
+**Fixed: `tools/git_ops.py` — every `proc.communicate()` now has a
+deadline.** New `_communicate(proc, what, timeout=None)` wraps it in
+`asyncio.wait_for`, kills the child on expiry (attempts of one request
+share a sandbox — `sandbox.py` keys it by `request_id` alone — so a
+survivor could still be writing to the tree the retry is about to read),
+and raises a message naming the operation. All eight call sites (clone,
+default_branch, set origin, diff, add, commit, push, changed_files) go
+through it.
+
+Deadlines are **tiered**, because one number cannot serve both ends of the
+range: `clone` of a large monorepo is legitimately minutes
+(`GIT_CLONE_TIMEOUT_SECONDS`, 600s), while everything else is sub-second in
+practice — `diff` and `changed_files` both measured well under 1s against
+InfrastructureCore (`GIT_SUBPROCESS_TIMEOUT_SECONDS`, 30s). The first cut
+used a single generous 300s, which would have left the observed `diff`
+stall costing five minutes instead of twenty — better, but still five
+minutes of silence for an operation that has never taken more than a
+second. Both remain far above any real duration: a guard that fires on
+healthy work is worse than no guard, since it turns a slow-but-fine run
+into a failed one.
+
+**What this does and does not fix.** It does not remove the race — the root
+cause is unproven and the stall was seen exactly once in six runs, with no
+known trigger, so there is no way to reproduce it on demand. What it
+changes is the blast radius: the next occurrence fails in 30s with a named
+error the retry can act on, instead of 20 minutes of silence followed by a
+silently-failed incident.
+
+**Two related gaps left open, deliberately:**
+- Nothing heartbeats. Temporal can only notice a stall via the activity's
+  wall-clock timeout, and — because cancellation is delivered *in the
+  heartbeat response* — it cannot tell a stuck activity to stop. A
+  `heartbeat_timeout` driven off opencode's existing NDJSON line loop
+  would detect a stall in ~2 minutes instead of 20, and make cancellation
+  possible at all.
+- `generate_change` has no `on_failure` policy (unlike `verify`, which got
+  `timeout_seconds: 480` + a soft-failure loop on 09-21), so two failed
+  attempts end the incident silently — no PR, no report, and in an
+  unattended sweep nobody finds out.
+
+**Verified:** `tests/test_git_ops.py` +6 (a stalled child raises rather
+than hangs, is killed, an already-reaped child is not an error, the
+default is >= 120s, and a source-level assertion that no bare
+`communicate()` is reintroduced — which is exactly how this shipped).
+Full suite 122 passed on Windows excluding the 10 modules needing
+`fcntl`/`a2a`.
+
+**Verified on Test EKS (2026-09-25), against a purpose-built image.** Both
+`ari-oncall-api` and `ari-oncall-worker` were built from this branch, tagged
+`fix-git-timeout`, and rolled out to the `insightfinder` namespace before any
+of this was pushed.
+
+1. *Normal path, default 30s.* Workflow `0c63edf0` completed in 2m13s; all
+   four steps ran; `generate_change` made 23 opencode calls in 97.98s. Zero
+   `timed out after` lines — the deadline does not fire on real work.
+2. *Normal path, 1s.* With `GIT_SUBPROCESS_TIMEOUT_SECONDS=1`, workflow
+   `c99e227b` still completed clean. Every git call in this repo finishes in
+   under a second, so 1s is not tight enough to force the failure path.
+3. *Forced failure, 0.001s.* Workflow `2adbee78` ended in 47s instead of
+   hanging. The worker log carried
+   `RuntimeError: git default branch timed out after 0s (pid 31) and was killed`,
+   Temporal retried through attempts 1/2/3 with a fresh pid each time
+   (31, 39, 48), and the pod had **0** leftover git processes. This is the
+   behaviour the fix exists for, observed end to end.
+4. *Restored.* Env var removed, module constants back to `30.0 / 600.0`,
+   workflow `a89fb051` completed in 2m1s with zero timeout lines and zero
+   leftover processes.
+
+Note on step 3's `after 0s`: the message used `:.0f`, which rounds 0.001 to
+0. Changed to `:g` afterwards. For every value that will actually be
+configured (30, 600) the two render identically, so the image verified above
+and the code as committed behave the same.
+
+**Deployment gotcha, not yet in the chart.** The worker mounts RWO EBS
+volumes, so the default `RollingUpdate` strategy deadlocks: the new pod waits
+for a volume the old pod still holds. Recovery is scale to 0, patch
+`strategy: {type: Recreate}`, scale back to 1. This is currently only a live
+`kubectl patch` on Test — `insightfinder/charts` still ships RollingUpdate,
+so the next `helm upgrade` will reintroduce the deadlock.
