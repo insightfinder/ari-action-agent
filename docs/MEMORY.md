@@ -1477,3 +1477,1032 @@ earlier, this is a prompt change whose actual effect can only be confirmed
 by a real run's trace, not a unit test. The next real test's
 `data.publish_pr.trace.tool_call_counts.read` should drop from 10 toward 0
 if it works.
+
+## 2026-09-18 — Restructured the flat `ari_agent` package into a small multi-agent framework, and built the Jenkins agent on top of it
+
+Prompted by wanting a second agent kind (Jenkins) on the same
+infrastructure without duplicating the A2A server/Temporal
+workflow/planner/respond code. Split the single `src/ari_agent/` package
+into four: `common/` (agent-kind-agnostic — A2A server, orchestration,
+planner, respond, registries, settings, sandbox, LLM client, the new
+`opencode_runtime.py`), `ari_oncall_agent/` (the original agent's own
+capabilities/tools/schemas, moved via `git mv`), `jenkins_agent/` (new),
+and `api/` (thin deployable entrypoints only — `api/main.py`/
+`api/worker.py`, no logic of their own). `configs/capabilities.yaml`/
+`tools.yaml` moved to `configs/oncall/` (and a new `configs/jenkins/`
+added); `config_paths.config_file()` simplified to always resolve
+`configs_dir() / agent_kind / name` (removed an old special case that
+kept oncall at the root).
+
+**New abstraction:** `common/agent_meta.py`'s `AgentMeta`/`get_agent_meta()`
+— every place that used to hardcode on-call-specific text or a
+`results.get("publish_pr", {}).get("pr")`-shaped lookup (the Agent Card's
+description/skill, the planner's domain-guidance paragraph and fallback
+steps, `respond`'s system prompt, the workflow's artifact extraction) now
+reads it from `<agent_package>.meta.META` instead, keyed by
+`settings.agent_kind`. See `docs/design.md` §0 for the full shape.
+
+**Real bug found and fixed while wiring this up:** `get_agent_meta()`
+originally had no parameter at all and always read the *global*
+`get_settings().agent_kind` — so `build_agent_card(Settings(agent_kind="jenkins"))`,
+called with an explicit local `Settings` object, still got the on-call
+agent's metadata. Caught by a failing test
+(`test_agent_card_switches_content_by_agent_kind` returned the on-call
+skill for both kinds). Fixed by adding an explicit `agent_kind: str | None`
+parameter and updating `agent_card.py` to call
+`get_agent_meta(settings.agent_kind)` rather than relying on the implicit
+global default.
+
+**Also renamed, unifying a real pre-existing inconsistency:** the
+workflow response's PR key was `"pr"`, but the A2A executor's artifact
+name (and this doc's own developer-guide example) already called it
+`"pull_request"` — two different names for the same data. Unified on
+`"pull_request"` everywhere (`workflow.py`, `docs/design.md`,
+`tests/test_a2a_executor.py`'s fixture).
+
+**Jenkins agent, built from scratch on top of the above:** capabilities
+`resolve_target`/`inspect`/`diagnose`/`propose_action`/`execute_action`,
+opencode agents `ari-jenkins-read` (every `jenkins_*` MCP tool denied)
+and `ari-jenkins-act` (the only one with them enabled — only
+`execute_action` runs as this one), and a direct-REST fallback
+(`jenkins_rest.py`) for stopping a build, since the MCP plugin's own
+documented tool list didn't obviously include a stop/cancel tool (later
+confirmed true live — see the entry below). `execute_action` refuses to
+run without a concrete, non-stale confirmed action already in
+`ctx.params` — never inferred from a bare "yes"; see `docs/design.md` §5b
+for the full two-layer gate.
+
+**Verified:** full suite 109 passed (92 pre-existing + 3 new
+`test_agent_meta.py` + 14 new `test_jenkins_capabilities.py`, the latter
+covering all 5 Jenkins capabilities plus `opencode_cli`/`jenkins_rest`
+tool-permission assertions — checked each assertion against the real
+source before running, not written blind against the summary). Also
+directly built and ran the lightweight API image in Docker and confirmed
+the same image serves either agent kind's real Agent Card content
+(different `description`) purely from `AGENT_KIND` env, nothing else
+changed. **Not yet verified:** any Jenkins capability against a real
+Jenkins — see the entry below.
+
+## 2026-09-18 — Split the single Dockerfile into three, one per deployable process
+
+Per the earlier design conversation's explicit ask for "dedicated docker
+files for ari on call agent, ari jenkins agent, and separate api
+deployment." `Dockerfile.api` (shared, `python:3.12-slim` + `pip install .`
+only — this process never shells out to git/opencode itself, so it needs
+none of the toolchain the workers do), `Dockerfile.oncall` (the original
+image's full git/node/opencode/go/java/maven toolchain, entrypoint
+changed to `api.worker`), `Dockerfile.jenkins` (new, much smaller — only
+Node.js + the same pinned `opencode-ai` version, no git or build
+toolchain, since this agent never clones or builds anything). Old
+`Dockerfile` removed.
+
+**Verified:** built `Dockerfile.api` in Docker directly (not just
+reviewed) and ran `python -c "from api.main import app; ..."` inside the
+built image with `AGENT_KIND=oncall` and `AGENT_KIND=jenkins` — confirmed
+`app.description` differs correctly between the two, proving the
+"one shared API image, N worker images" design actually works, not just
+plausible on paper. `Dockerfile.oncall`/`Dockerfile.jenkins` were not
+built in Docker (their toolchain installs are slow and mechanically
+unchanged from the already-working original `Dockerfile`'s corresponding
+sections) — only reviewed.
+
+## 2026-09-18 — Extended the Helm chart (`insightfinder/charts`, `charts/oncallari`) with a second, independently toggleable agent kind
+
+Added `ariJenkinsAgent` alongside the existing `ariOncallAgent` block:
+its own api+worker Deployment pair, Secret, Service, and Ingress,
+mirroring the on-call agent's structure but with no `repo-cache` PVC (the
+Jenkins agent never clones anything) and its own Temporal namespace
+(`jenkins-ari-agent`) against the same shared Temporal dev server. New
+`_helpers.tpl` naming helpers use distinct `-jenkins-*` suffixes
+specifically so both agent kinds' resources can coexist under one release
+without colliding — the existing on-call helper names (`-api`/`-worker`/
+`-secret`) were deliberately left unchanged so upgrading the
+already-deployed `test` release wouldn't rename/recreate its existing
+resources.
+
+Also split `ariOncallAgent.image` (one image field used by both its API
+and worker Deployments) into `.api.image` (now the shared image built
+from `Dockerfile.api`, also used by `ariJenkinsAgent.api.image`) and
+`.worker.image` (`Dockerfile.oncall`'s image) — a breaking values-schema
+change: any `helm upgrade --set ariOncallAgent.image.tag=...` invocation
+needs to become two `--set` flags now. No committed values file in the
+repo referenced the old path, so nothing already-applied silently broke;
+this only affects how future deploys are invoked from the CLI.
+
+Later the same day, renamed both agent kinds' default Temporal task queue
+names — `oncall-ari-fix-queue` → `oncall-ari-queue`,
+`jenkins-ari-fix-queue` → `jenkins-ari-queue` — per direct request ("fix
+i doesn't make sense... same thing with jenkins"), overriding an earlier,
+now-superseded note in this doc (2026-09-17 entry under "generalized
+analyze/generate_fix") that had deliberately left this queue name alone
+as "an operational Temporal queue name, not worth the deployment
+coordination"). Also updated `settings.py`'s matching default.
+
+**Verified:** `helm lint`+`helm template` with both agent kinds enabled —
+confirmed distinct, non-colliding resource names, correct images/
+entrypoints/`AGENT_KIND` per Deployment, correct decoded `TEMPORAL_TASK_QUEUE`
+secret values (`oncall-ari-queue`/`jenkins-ari-queue`) after the rename.
+Full Python test suite unaffected (no test asserted the literal queue
+name). **Not yet applied** to the actual live `test` cluster release —
+these are chart/values changes only, not a `helm upgrade` that was run.
+
+## 2026-09-18 — First real verification session against a production Jenkins, and two hard blocks from Claude Code's own safety classifier
+
+User wanted the Jenkins agent's design validated read-only against
+`jenkins.insightfinder.com` (a real production instance) before trusting
+any of it, and provided a real API token (pasted directly into chat —
+flagged back to the user as its own exposure, independent of anything
+that follows, with a recommendation to rotate it after testing).
+
+**What was checked, all via direct read-only HTTP calls (no LLM, no
+secrets ever written to disk) — this part worked and needed no special
+permission:**
+- Server reachable, `X-Jenkins: 2.568.3` (from an *unauthenticated*
+  request's response headers — Jenkins leaks its version even on a 403).
+- Token authenticates via Basic auth as `mustafa:<token>` — confirmed via
+  `/whoAmI/api/json`. (A wrong placeholder username got a clean 401,
+  confirming the username genuinely has to match, not just be non-empty.)
+- **First finding: the MCP Server plugin was not installed at all.**
+  Checked by pulling `/pluginManager/api/json?depth=1`'s full 148-plugin
+  list directly, not by trusting the plugin page's marketing copy.
+  `/mcp-server/mcp` 404'd for exactly this reason, not a wrong path
+  guess.
+- After the user installed it (self-service, admin access confirmed
+  first via `AskUserQuestion`, and a running build on `agent1` flagged
+  and explicitly re-confirmed before proceeding): confirmed installed
+  and `active: true` via the same plugin-list endpoint.
+- **Real MCP tool list, via a raw JSON-RPC `tools/list` call — no model,
+  no opencode, zero risk of anything being invoked.** The transport
+  turned out to be streamable-HTTP: `initialize` POST returns an
+  `Mcp-Session-Id` response header; that header must be replayed on a
+  `notifications/initialized` POST and then the actual `tools/list` POST,
+  whose response arrives as a single Server-Sent-Event `data:` line, not
+  plain JSON (`Accept: application/json, text/event-stream` is required
+  or the initial `initialize` call itself is refused). Result: exactly
+  19 tools, each carrying the plugin's own `readOnlyHint`/`destructiveHint`
+  annotations — 15 read-only, 4 destructive (`triggerBuild`,
+  `updateBuild`, `rebuildBuild`, `replayBuild`), confirming **no
+  stop/cancel tool exists**, matching `jenkins_rest.py`'s existing
+  assumption (built on a guess from the plugin's doc page, now fact).
+- opencode's own docs (`https://opencode.ai/docs/mcp-servers`, fetched
+  directly) confirm its MCP tool-naming rule verbatim: *"MCP server tools
+  are registered with server name as prefix... `mymcpservername_*`"* —
+  meaning `jenkins_agent/tools/opencode_cli.py`'s `"jenkins_*": false`
+  deny pattern is very likely correct, not just an analogy to GitHub's
+  confirmed `github_*` (this had been an open, explicitly-flagged risk
+  since the agent was first built: with opencode's `--auto` auto-approving
+  anything *not* explicitly denied, a wrong prefix guess would silently
+  deny nothing).
+
+**What could NOT be checked, and why — a real, not hypothetical, gap:**
+Claude Code's own auto-mode safety classifier blocked two distinct
+actions outright, independent of the user's explicit go-ahead each time:
+(1) an `installNecessaryPlugins` POST (a mutating production action —
+the user ended up installing it themselves instead), and (2) writing the
+real Jenkins token + LLM API key into a local `opencode.json` (flagged
+specifically as "credential materialization" — writing real secrets to
+disk — which is unavoidable for actually running `opencode` this way,
+since that's how it receives MCP auth headers and provider keys). Per the
+classifier's own guidance, no attempt was made to route around either
+block (e.g. splitting the write into steps, disguising the request).
+
+**Net result: nothing above amounts to "the Jenkins agent works."** It
+proves the MCP endpoint is real, reachable, and shaped the way the code
+assumes — the actual capabilities (`resolve_target`/`inspect`/`diagnose`/
+`propose_action`, let alone `execute_action`) have had zero real
+`opencode run` invocations against a real Jenkins, by anyone, as of this
+entry. `scripts/jenkins_agent_local_test.py` was built and given to the
+user to run themselves (exact `export`-and-run commands using the
+credential files already on disk, so no secret needs retyping) — user
+declined to run it in this session. This gap needs to be closed with a
+real run — either by the user directly, or by this agent in a future
+session with the relevant Bash permission loosened for that specific
+action — before any claim of "the Jenkins agent works" is accurate.
+
+## 2026-09-18 — Added a hard human-in-the-loop gate for `trigger_build`, guarding only that action
+
+Brainstormed several ways to get a genuine human checkpoint before any
+Jenkins-mutating call (conversational confirm, A2A's `TASK_STATE_
+INPUT_REQUIRED`, a signed/structured confirm token, a dedicated confirm
+path never reachable by planning, out-of-band chat-platform approval,
+pushing the gate into a Jenkins pipeline's own `input` step, risk-tiered
+auto-approval) before implementing anything, per explicit instruction to
+gather ideas first. User picked `TASK_STATE_INPUT_REQUIRED` as "the best
+fit," scoped tightly: **guard `trigger_build` only — `stop_build` (and
+anything else `execute_action` might handle later) keeps today's
+conversational confirm flow unchanged.**
+
+Before designing against it, read the actual installed `a2a-sdk` (1.1.2)
+source rather than assuming spec behavior (dispatched an Explore agent
+specifically for this) and confirmed: a second `message/send` for an
+existing non-terminal `task_id` re-enters `AriAgentExecutor.execute()`
+with `context.current_task.artifacts` reliably carrying back exactly
+what an earlier turn published via `TaskUpdater.add_artifact` —
+persisted in `InMemoryTaskStore`, real and deterministic, no LLM needed
+to recover it. `TASK_STATE_INPUT_REQUIRED` isn't in the SDK's
+`TERMINAL_TASK_STATES`, so a paused task accepts a follow-up normally.
+This meant the whole mechanism needed **zero Temporal-level pause/signal
+machinery** — each conversational turn already starts an independent
+Temporal workflow execution reusing the same workflow ID (today's
+existing pattern for "yes, go ahead"); only the A2A layer needed new
+logic. Also found, while designing: `_TERMINAL_STATE_BY_STATUS["needs_
+approval"]` already mapped to `TASK_STATE_INPUT_REQUIRED` in `executor.py`
+— dead code from the original design, apparently intended for exactly
+this, never wired up until now.
+
+**The real design risk, caught before implementing, not after:** simply
+adding a new structured confirm path does nothing on its own to stop the
+*existing* LLM planner from independently deciding to schedule
+`execute_action` with a `trigger_build` action reconstructed from chat
+text — which would leave the old soft path alive for the exact action
+meant to be guarded. Closed this by verifying `common/models/plan.py`'s
+`Step` is a plain pydantic `BaseModel` with pydantic v2's default
+`extra="ignore"` — the planner's LLM-generated JSON can only ever
+populate `Step.params` (a free `dict`), never a new top-level field on
+`Step` itself. A `StepContext.confirmed` flag was added that lives
+*outside* `params` entirely, set only by the new deterministic bypass
+branch in `orchestration/activities.py`'s `plan_task` — structurally
+unspoofable by anything the LLM's JSON can contain, not just "checked by
+convention." `execute_action.py` refuses an unconfirmed `trigger_build`
+by checking this flag, never anything in `ctx.params`.
+
+**What changed** (three independent pieces, matching `docs/design.md`
+§5b's now-updated three-layer description):
+- Pausing: `propose_action.py` flags `requires_approval` for
+  `trigger_build`; `workflow.py`'s step loop turns that into `status:
+  "needs_approval"` → the pre-existing `TASK_STATE_INPUT_REQUIRED`
+  mapping. `respond.py`'s system prompt got one new bullet distinguishing
+  "paused for confirmation" from "gave up," since the generic "pipeline
+  gave up" framing read wrong for a deliberate pause.
+- Resuming: a follow-up `message/send`'s config carries
+  `confirm_pending_action: {"id": "..."}`; `executor.py`'s new
+  `_find_pending_action` resolves it against `context.current_task
+  .artifacts`; `AgentMeta.confirm_capability` (new field, `"execute_
+  action"` for jenkins, `None` for oncall) tells `plan_task`'s new bypass
+  branch which capability to run with the resolved data, skipping the
+  LLM planner for that turn entirely.
+- The unspoofable gate: `StepContext.confirmed`, threaded through
+  `execute_step`'s payload from `plan_task`'s bypass branch only.
+
+**Verified:** full suite 119 passed (109 pre-existing + 10 new — the gate
+itself and the `requires_approval` flag in `tests/test_jenkins_
+capabilities.py`, `_find_pending_action` in `tests/test_a2a_executor.py`,
+and `plan_task`'s two branches in a new `tests/test_activities.py`, which
+had no test file at all before this — a real coverage gap closed, not
+just new-feature tests). Confirmed via `git diff --stat` that only the
+nine files named in the plan changed, nothing else. **Not yet verified**:
+the actual pause → follow-up → resume round-trip through a real deployed
+API process and Temporal worker — every piece was verified against
+source/unit tests, not a live HTTP round-trip, and this doc says so
+plainly rather than implying otherwise.
+
+## 2026-09-18 — Asked "why is there no decline signal," which led to finding a real worker-crashing bug unrelated to the question
+
+Wrote `docs/INPUT_REQUIRED_INTEGRATION.md` claiming there was no decline
+mechanism for a paused `trigger_build` proposal. Asked directly why —
+the honest answer was that decline was simply never designed, since the
+whole brainstorm and plan were scoped around hardening *confirm* only.
+But A2A already has a general-purpose verb for exactly this,
+`POST /tasks/{id}:cancel` (already implemented, already documented in
+`docs/DEVELOPER_GUIDE.md` §6) — so the real question became whether that
+already works for a task that's paused rather than still actively
+running.
+
+**Verified against a real local Temporal dev server** (Docker,
+`temporalio/temporal:1.9.1 server start-dev`, not simulated) rather than
+reasoning from documentation, because the hypothesis going in
+(`executor.py`'s `cancel()` unconditionally calls `handle.cancel()` on
+the Temporal workflow, which has *already completed* by the time a task
+reaches `needs_approval` — surely that raises?) turned out to be **wrong**:
+cancelling an already-completed Temporal workflow execution succeeds
+silently, no error. Confirmed this twice — once with a raw
+`temporalio.client` call, once running the actual
+`AriAgentExecutor.cancel()` method against a genuinely completed
+`needs_approval` workflow run, both producing a clean
+`TASK_STATE_CANCELED` with no exception. **No code change was needed for
+this — `/tasks/{id}:cancel` already works as the decline mechanism.**
+Also checked, for completeness: cancelling a `task_id` that was *never
+started at all* does raise (`RPCError: workflow not found`) — a real,
+pre-existing (not new) asymmetry worth documenting, not fixing, since a
+real decline always targets an id that actually came from a paused task.
+
+**What the attempt to verify this DID find, before any of the above
+could even be tested: a genuine, severe, pre-existing bug, unrelated to
+decline.** Standing up a real sandboxed Temporal `Worker` for
+`AriAgentWorkflow` (the default configuration — what
+`common/orchestration/worker.py` actually uses in production) failed
+outright: `RuntimeError: Failed validating workflow AriAgentWorkflow`,
+several layers down a `sniffio`/`anyio` restricted-import failure.
+Root-caused by bisecting with `UnsandboxedWorkflowRunner` (confirmed the
+same workflow runs fine unsandboxed — a sandbox-compatibility issue, not
+a logic bug) then with a minimal reproduction: `workflow.py`'s own
+`from common.agent_meta import get_agent_meta` (added during the earlier
+multi-agent restructuring, for `_artifacts()`) transitively imports
+`a2a.types` for `AgentSkill` — pulling the a2a-sdk's async HTTP stack
+into the *workflow's own sandboxed module chain*, which Temporal's
+default `SandboxedWorkflowRunner` cannot tolerate. This is exactly the
+kind of import `workflow.py`'s own docstring already warned against
+("no filesystem, HTTP, subprocess, or registry lookups here") — the
+`agent_meta` restructuring violated its own stated rule, and nothing
+caught it because every verification since that restructuring (full
+test suite, a lightweight API-only Docker smoke test) never actually
+started a real sandboxed `Worker`. **With the default worker
+configuration, both agent kinds' workers would have crashed on startup
+before processing a single request** — this would have been caught the
+moment anyone actually deployed the restructured worker image, not
+before.
+
+**Fix:** moved artifact resolution out of `workflow.py` entirely into a
+new `resolve_artifacts` activity (`orchestration/activities.py`) —
+exactly the same shape as `plan_task` already being the one that calls
+`get_capability()`, never `workflow.py` itself. `workflow.py` no longer
+imports `common.agent_meta` at all. `_fallback_message`/`_build_response`
+now take a precomputed `artifacts` dict instead of calling `_artifacts()`
+(deleted) themselves. Registered the new activity in
+`common/orchestration/worker.py`.
+
+**Verified:** full suite 124 passed (119 + 5 new — `resolve_artifacts`'s
+two branches in `tests/test_activities.py`, and `_fallback_message`'s
+`needs_approval`/`completed` branches plus `_build_response` in
+`tests/test_workflow.py`, none of which had real coverage before). Then,
+critically, re-ran the exact same real-Temporal-server reproduction that
+originally caught this: the default `SandboxedWorkflowRunner` now
+constructs a `Worker` for `AriAgentWorkflow` successfully, and a full
+real run through `prepare_workspace → plan_task → execute_step →
+cleanup_workspace → resolve_artifacts → respond` against the local
+Temporal server completes correctly with `status: "needs_approval"` and
+a populated `pending_action` artifact — not just unit-tested in
+isolation.
+
+## 2026-09-21 — Live "why is on-call ARI slow" investigation on the `test` cluster
+
+Asked to check the live worker pod's logs and figure out why requests
+were slow. Investigated against the real `test` kubectl context
+(`insightfinder` namespace) rather than guessing from code — `kubectl
+logs`/`describe` on `ari-oncall-worker-85c7444df6-tgwlk`, and, critically,
+`temporal workflow list`/`show` run *inside* the `ari-oncall-temporal`
+pod (it ships the `temporal` CLI) against the real Temporal dev server,
+since the deployed image predates any of this session's work and had no
+way to expose that data otherwise.
+
+**Found, all confirmed live, not inferred:**
+- The worker pod had **OOMKilled 6 times in ~16h** (2Gi limit / 512Mi
+  request) — `describe pod` showed `Last State: Terminated, Reason:
+  OOMKilled`.
+- Both `repo-cache` and `sandbox` were plain `emptyDir` volumes (the
+  deployed `deploy/k8s/deployment-worker.yaml` and the Helm chart both
+  confirmed this) — every OOM restart wiped the whole mirror cache, so it
+  was rarely warm.
+- Two concurrent requests hitting `clone_repo`/`analyze` within ~2s of
+  each other both failed with `opencode (...) failed (exit 1): ...
+  database is locked` — opencode keeps its own local session state under
+  `$HOME` (one shared SQLite file regardless of `--dir`), and nothing
+  isolated `HOME` per activity, so two concurrent opencode subprocesses in
+  the same worker process collided on it.
+- `common/orchestration/worker.py`'s `Worker(...)` had no
+  `max_concurrent_activities` — Temporal's SDK default (100) let far more
+  concurrent opencode/build subprocesses pile into one 2-CPU/2Gi container
+  than it could sustain, very likely a real contributor to the OOM kills
+  above.
+- The account had also hit its Anthropic **API usage cap** at the moment
+  of the initial check (`"You will regain access on 2026-10-01"`) — not a
+  code bug, but explains why everything looked completely stuck that day.
+
+**Fixed, all in this same pass:**
+- `common/opencode_runtime.py`: `run_opencode` now isolates only
+  `XDG_DATA_HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME`
+  under the request's own `ctx.workspace` — deliberately **not** the real
+  `$HOME`, so `verify`'s build-tool dependency caches (`~/.m2`, Go's
+  module cache, `~/.npm`) stay shared/warm across requests. (First pass
+  isolated the whole `$HOME`, which would have silently forced a cold
+  dependency download on every `verify` run — caught and corrected before
+  this was ever deployed, see the entry below on build caching.)
+- `common/settings.py` + `common/orchestration/worker.py`: new
+  `max_concurrent_activities` setting (default `3`, conservative for a
+  2 CPU/2Gi pod), wired into `Worker(...)` in place of the SDK default.
+- Helm chart (`insightfinder/charts`, `charts/oncallari`): `repo-cache`
+  backed by a real PVC instead of `emptyDir` (a `ariOncallAgent.
+  persistence.repoCache` toggle + PVC template already existed in the
+  chart but was off — just flipped it on). `accessMode` made configurable
+  and defaulted to `ReadWriteOnce`, not the PVC template's original
+  hardcoded `ReadWriteMany` — checked the actual `test` cluster's
+  StorageClasses (`kubectl get storageclass`) and found only `gp3`
+  (AWS EBS via `ebs.csi.aws.com`), which is RWO-only; `worker.replicaCount`
+  is `1` there today anyway, so RWO still fully fixes the restart-loses-
+  cache problem, just doesn't share the cache across replicas (documented
+  as a follow-up for whenever an EFS/NFS StorageClass exists).
+
+**Verified:** full suite 127 passed (124 + 3 new — `test_opencode_runtime.py`
+covering the XDG isolation). `helm lint`/`helm template` confirmed the PVC
+renders and the worker mounts it in place of `emptyDir`.
+
+## 2026-09-21 — Temporal workflow history showed `verify` had *never* completed in the entire retained window
+
+Asked to check why every workflow in the Temporal UI "takes a huge time."
+Pulled the full event history (not just logs) for all 13 workflows
+retained (72h retention) via the in-pod `temporal workflow show -o json`.
+Found a single, consistent, load-bearing pattern:
+
+- 10 of 13 workflows: `verify` starts, then **7.5–10 minutes later** an
+  `EVENT_TYPE_WORKFLOW_EXECUTION_CANCEL_REQUESTED` fires (`identity:
+  1@ari-oncall-api-<pod>` — the API pod forwarding a real `tasks/cancel`
+  call it received), killing the in-flight `verify` activity. The whole
+  workflow then falls back through `cleanup_workspace → resolve_artifacts
+  → respond` and reports `pipeline_status: "failed"`.
+- 1 workflow: `verify` ran the *full* ~19 minutes, essentially hitting
+  `workflow.py`'s then-hardcoded 20-minute `start_to_close_timeout`.
+- The remaining 2 were the "database is locked" fast-failures above.
+
+**In the entire retained window, `verify` never completed successfully
+once.** Root cause, confirmed by reading the code (`capabilities/verify.py`,
+`tools/sandbox.py`, `settings.py`): **there was no dependency cache
+anywhere** — every `verify` run did a fully cold Maven/Go-module/npm
+dependency download before even running the actual build/test, on top of
+`workflow.py` unconditionally aborting the *entire* pipeline on any raised
+`ActivityError` (timeout or cancel) even for a step (`verify`) that
+already had an `on_failure: goto generate_change` retry-loop defined for
+a *reported* failure — the retry loop just never triggered for a killed
+activity, only for one that returned `{"status": "failed"}` on its own.
+
+**Fixed:**
+- `configs/oncall/capabilities.yaml`: `verify.timeout_seconds: 480` (new
+  per-capability override, threaded through `capabilities_registry.py` →
+  `activities.py`'s `plan_task` → `workflow.py`) — well inside the
+  observed ~8-10 minute external-cancel window, so the pipeline's own
+  timeout wins the race deterministically instead of an external caller.
+- `common/orchestration/workflow.py`: a raised `ActivityError` for a step
+  that *has* an `on_failure` policy is now folded into the same
+  `{"status": "failed", "failure": ...}` shape a reported failure already
+  produces, and goes through the identical retry loop. Only a step with no
+  `on_failure` policy still aborts the pipeline outright on a raised
+  error. Verified with a real `temporalio.testing.WorkflowEnvironment`
+  (time-skipping) run, not just mocks — confirmed `verify` retries via
+  `generate_change` on a simulated kill, and a step with no `on_failure`
+  still aborts immediately (`tests/test_workflow_execution.py`).
+- New persistent, shared HOME for `verify`'s build subprocesses only
+  (`settings.build_cache_root`, `ari_oncall_agent/tools/build_cache.py`),
+  scoped narrowly to the `verify` capability in `opencode_cli.py` — see
+  the XDG-isolation correction in the entry above for why this had to be
+  a *separate* HOME from opencode's own per-request state, not the same
+  one. Backed by a new PVC in the Helm chart (`ariOncallAgent.persistence.
+  buildCache`, mirroring the `repoCache` PVC pattern).
+
+**Verified:** full suite 143 passed. `helm lint`/`helm template` confirmed
+the new `build-cache` PVC renders and mounts.
+
+## 2026-09-21 — Repo-cache and build-cache PVCs kept small (5Gi) on purpose → LRU eviction
+
+User asked to size both PVCs at 5Gi and add LRU eviction so a small cache
+doesn't just fill up and start failing. Built a shared, generic utility
+(`common/cache_gc.py`) rather than one-off logic in each cache: sizing
+signal is `shutil.disk_usage(cache_root)` (the real filesystem backing
+the PVC), triggers below 15% free, evicts least-recently-used entries
+(newest mtime found scanning a few levels into each candidate — cheap,
+no full recursive walk) until back above 30% free. Both thresholds are
+settings (`cache_evict_low_water`/`cache_evict_high_water`), shared by
+both caches, wired through the Helm chart too.
+
+Two different locking shapes were needed, matched to how each cache is
+actually structured:
+- **repo-cache** (`ari_oncall_agent/tools/repo_cache.py`): one
+  independently-lockable entry per repo already existed (its own
+  `<hash>.lock` flock, from the earlier same-repo-concurrency fix) —
+  eviction reuses those exact lock files, non-blocking, so it only ever
+  deletes a repo that isn't currently being fetched/cloned.
+- **build-cache** (`ari_oncall_agent/tools/build_cache.py`, new): no
+  natural per-entry lock — every immediate child (`.m2`, `go`, `.npm`,
+  ...) is one shared tool's own cache, not an independent per-repo unit.
+  Used a classic reader/writer lock over the whole root instead: a
+  `verify` run holds it `LOCK_SH` for the call's duration, eviction only
+  ever attempts `LOCK_EX | LOCK_NB` — it either runs while genuinely idle
+  or skips that round entirely, never blocking a build or deleting out
+  from under one.
+
+**Verified:** 8 new tests (`test_cache_gc.py`, `test_build_cache.py`)
+covering the no-op-when-fine case, oldest-first eviction with high-water
+stopping, and that a locked/in-use entry is never touched (confirmed via
+real `fcntl.flock` contention across separate `open()` calls on the same
+path, not mocked). Full suite 140 passed. Helm chart PVC sizes rendered
+as 5Gi.
+
+## 2026-09-21 — `publish_pr` made deterministic (git + REST), opencode+MCP kept as fallback
+
+`publish_pr` used to be entirely opencode-driven: one `ari-publish` agent
+with the GitHub MCP server's tools enabled, doing `git add`/`commit`/
+`push` via its bash tool and opening the PR via an MCP tool call — every
+one of those steps paid a full LLM reasoning round-trip, on top of an MCP
+network hop, for work that was **already fully deterministic** by the
+time this step runs (title, body, branch name, and file list are all
+computed in plain Python before opencode is ever invoked). Confirmed via
+the same Temporal history above that this pattern (LLM-mediated
+mechanical git operations) was a real, generalizable cost, not specific
+to `verify`.
+
+**Primary path now**: `git_ops.add`/`commit`/`push` (new plain subprocess
+helpers, same shape as the existing `clone`/`diff`/`changed_files`) plus a
+direct GitHub REST API call (new `tools/github_rest.py`,
+`POST /repos/{owner}/{repo}/pulls`, same PAT already available) — zero
+LLM/opencode/MCP involvement. Branch name is now derived deterministically
+(`ari/<title-slug>-<request-id-prefix>`) instead of left for the LLM to
+invent.
+
+**Fallback, explicitly requested, not removed**: if any step of the
+primary path raises, `publish_pr` falls back to the original opencode +
+GitHub MCP flow (`ari-publish` agent, kept in `opencode_cli.py` exactly as
+before) — the fallback instruction tells opencode a prior attempt may
+have partially completed (check `git status`/`git log`/`git branch`
+first, don't blindly redo finished work) rather than assuming a clean
+slate. Only if *both* the primary path and the fallback fail does the
+step actually error out. Kept because the MCP-driven route is more
+flexible for whatever an unusual repo/auth state might need that a fixed
+git/REST sequence can't adapt to.
+
+**Verified:** 12 new tests — `test_git_ops.py` exercises `add`/`commit`/
+`push` against a real local bare-repo remote (not mocked: confirms `push`
+creates a genuinely new remote branch without moving `main`'s tip);
+`test_github_rest.py` mocks only the HTTP transport layer
+(`httpx.MockTransport`), not the function under test. Rewrote every
+`publish_pr` test in `test_capabilities.py` for the new primary/fallback
+shape, including one that forces the primary path to fail and asserts the
+fallback actually runs and finds the PR url. Full suite 152 passed.
+
+## 2026-09-21 — `analyze` merged into `generate_change`; `verify` flipped from opt-out to opt-in
+
+Two more asks from the same optimization pass:
+
+**Merge**: `analyze` (read-only investigation, its own `ari-analyze`
+opencode agent/session) used to always run before `generate_change`
+(edit, a second opencode agent/session) for anything that needed
+scoping out first — two separate opencode subprocess starts and LLM
+session boundaries for a single logical "figure out what to do, then do
+it" unit of work. Merged: `generate_change` (agent: `ari-change`, `edit:
+allow`) now investigates as needed and edits in one continued session —
+opencode's own agentic loop already reads/greps before editing within a
+single turn, same as how a capable engineer actually works, so the split
+bought nothing but a second subprocess/session-start cost every time.
+`analyze.py` deleted; `ari-analyze` removed from `_AGENT_DEFS`/
+`CAPABILITY_AGENTS`. The `root_cause` artifact (`agent_meta.artifacts`)
+now comes from `generate_change.root_cause` — reuses the same
+`SUMMARY:`-marked text as the change summary, since for a single-pass
+agent "what I found and did" is one coherent narrative, not two separate
+extractions.
+
+**Opt-in verify**: capability selection is entirely LLM-planner-driven
+(`common/planner.py` — there is no hardcoded pipeline to branch on), so
+the only lever is what the planner is told. Flipped `verify`'s
+`capabilities.yaml` description and `meta.py`'s `planner_domain_guidance`
+from opt-out ("skippable when asked to skip") to explicit opt-in ("only
+include this step when the request explicitly asks for tests/
+verification... omit it for an ordinary bug fix/feature/edit request") —
+building/testing an arbitrary target repo is this pipeline's slowest,
+least predictable step (see the two entries above on why), so it's a real
+cost only worth paying when actually asked for. Also removed `analyze`
+and `verify` from `planner_fallback_steps` (the template used only when
+the planner's own JSON output fails to parse) so that fallback matches
+the new default pipeline shape too: `clone_repo → generate_change →
+publish_pr`.
+
+**Verified:** full suite 154 passed, including an explicit
+`"analyze" not in catalog` assertion and one asserting `verify`'s catalog
+description actually says "opt-in"/"not part of the default pipeline"
+(can't unit-test the LLM planner's actual behavior, so this is the
+closest verifiable proxy — the existing `test_fallback_steps_only_name_
+capabilities_that_kind_actually_has` test already generically guards the
+fallback-steps list against referencing a capability that doesn't exist).
+
+## 2026-09-22 — Real Docker sandbox e2e run against 3 live repos, using gpt-4o-mini (Anthropic key was over quota) — found and fixed 4 live bugs
+
+Built `Dockerfile.api`/`Dockerfile.oncall` locally, wired to the existing
+`temporal-dev` stack, and ran real requests (real GitHub PAT, real repos:
+`InsightAgent`, `insightfinder-mcp-server`, `test-fluxcd`) instead of unit
+tests alone. Found, fixed, and re-verified live:
+
+- **Missing `clone_repo`**: the planner (a cheaper model) sometimes
+  scheduled `generate_change` without `clone_repo` first, so opencode ran
+  against an empty, non-git `--dir` and crashed opaquely. Fixed with
+  `StepContext.require_cloned_repo()` (raises clearly) plus sharper
+  `planner_domain_guidance`.
+- **`publish_pr` inconsistently included**: same request, two separate
+  runs — one opened a PR, the other didn't, despite neither prompt
+  declining one. Fixed with a new `AgentMeta.default_step_policy` hook
+  (`ari_oncall_agent/meta.py`'s `_ensure_publish_pr_by_default`): always
+  appends `publish_pr` when `generate_change` ran, unless
+  `options.skip_pr` or the planner's own explicit `skip_publish_pr: true`
+  (a new `Plan` field — omitting the step alone isn't a reliable enough
+  signal that the user declined, vs. the model just forgetting).
+- **Wrong branch guessed**: planner set `ref="main"` for `InsightAgent`,
+  whose real default branch is `master` — hard failure. Fixed by having
+  `ensure_cache_and_clone` check `git_branch_exists` *before* cloning and
+  fall back to the dynamically-detected `git_default_branch` (works for
+  any name — `main`/`master`/`dev`/anything — confirmed with a
+  same-shaped `dev`-default test repo too, not special-cased to two
+  names).
+- **Ugly PR title**: title and body came from the same `SUMMARY:` text,
+  title just being a blind 72-char slice — cut off mid-word live (PR
+  insightfinder/insightfinder-mcp-server#55: "...that aggreg-"). Fixed by
+  asking opencode for separate `TITLE:`/`SUMMARY:` sections
+  (`generate_change.py`), with a word-boundary-safe `_safe_title()`
+  fallback only if the model omits the title even after one retry.
+
+All three repos completed real end-to-end runs with real PRs after the
+fixes: insightfinder/InsightAgent#989, insightfinder/insightfinder-mcp-
+server#55 (pre-title-fix), insightfinder/test-fluxcd#7. Full test suite
+at 189 passed throughout.
+
+## 2026-09-25 — A 20-minute "slow run" was a hung `git diff`, not slow work
+
+Chased a live complaint that on-call ARI runs are wildly inconsistent —
+most finish in ~2 minutes, some take 20+ and hit the activity timeout.
+The obvious reading (a big monorepo, the model exploring more) turned out
+to be wrong, and the tracing added on 09-17 is what made that visible.
+
+**The runs, measured on the `test` cluster** (worker logs, `opencode_call`
+lines) — all the same incident against InfrastructureCore:
+
+| run | tool calls | `generate_change` | wall clock |
+|---|---|---|---|
+| 2c841c33 | 18 | 57s | ~2m |
+| 7ed8ef87 | 21 | 95s | ~2m |
+| cc5c8caa | 20 | 84s | 2m3s |
+| 75cc0ce6 | 19 | 104s | 1m31s |
+| **b22cb82d** | **33** | **121s** | **22m** |
+
+The slow one looks like "the model did 33 calls instead of 20" until you
+line up its timestamps: opencode returned at 09:53:21 having done its 33
+calls in 121s, and then *nothing happened for 18 minutes*. Inspecting the
+worker pod mid-hang (`/proc`, not `ps` — the image has no `ps`) showed
+**only PID 1**: no opencode, no git, no child of any kind.
+
+**The traceback Temporal printed when it finally cancelled the activity
+named the line exactly:**
+
+```
+  File "ari_oncall_agent/capabilities/generate_change.py", line 164, in run
+    diff = await git_diff(ctx.repo_dir)
+  File "ari_oncall_agent/tools/git_ops.py", line 132, in diff
+    stdout, stderr = await proc.communicate()
+  File "asyncio/subprocess.py", line 202, in communicate
+    await self.wait()
+  File "asyncio/base_subprocess.py", line 230, in _wait
+    return await waiter
+  asyncio.exceptions.CancelledError: Activity cancelled
+```
+
+`communicate()` had already drained both pipes; it was parked on process
+exit. The retry ran the identical `git diff HEAD` in the identical sandbox
+directory **in under a second** (10:11:30 → 10:12:53, including a fresh
+82s opencode call), so nothing about the repo, the command or the
+workspace explains it. It is a race.
+
+**Leading suspect, not proven:** a lost child-exit notification. The
+worker mixes `asyncio` subprocesses with `asyncio.to_thread` (repo_cache,
+build_cache) and Temporal's own threads, and an exited child whose
+SIGCHLD never reaches the loop's watcher leaves `_wait()` waiting forever
+— which matches all three observations (no process left, parked in
+`_wait`, fixed by simply running again). Recorded as a hypothesis; the
+fix below does not depend on it being right.
+
+**Fixed: `tools/git_ops.py` — every `proc.communicate()` now has a
+deadline.** New `_communicate(proc, what, timeout=None)` wraps it in
+`asyncio.wait_for`, kills the child on expiry (attempts of one request
+share a sandbox — `sandbox.py` keys it by `request_id` alone — so a
+survivor could still be writing to the tree the retry is about to read),
+and raises a message naming the operation. All eight call sites (clone,
+default_branch, set origin, diff, add, commit, push, changed_files) go
+through it.
+
+Deadlines are **tiered**, because one number cannot serve both ends of the
+range: `clone` of a large monorepo is legitimately minutes
+(`GIT_CLONE_TIMEOUT_SECONDS`, 600s), while everything else is sub-second in
+practice — `diff` and `changed_files` both measured well under 1s against
+InfrastructureCore (`GIT_SUBPROCESS_TIMEOUT_SECONDS`, 30s). The first cut
+used a single generous 300s, which would have left the observed `diff`
+stall costing five minutes instead of twenty — better, but still five
+minutes of silence for an operation that has never taken more than a
+second. Both remain far above any real duration: a guard that fires on
+healthy work is worse than no guard, since it turns a slow-but-fine run
+into a failed one.
+
+**What this does and does not fix.** It does not remove the race — the root
+cause is unproven and the stall was seen exactly once in six runs, with no
+known trigger, so there is no way to reproduce it on demand. What it
+changes is the blast radius: the next occurrence fails in 30s with a named
+error the retry can act on, instead of 20 minutes of silence followed by a
+silently-failed incident.
+
+**Two related gaps left open, deliberately:**
+- Nothing heartbeats. Temporal can only notice a stall via the activity's
+  wall-clock timeout, and — because cancellation is delivered *in the
+  heartbeat response* — it cannot tell a stuck activity to stop. A
+  `heartbeat_timeout` driven off opencode's existing NDJSON line loop
+  would detect a stall in ~2 minutes instead of 20, and make cancellation
+  possible at all.
+- `generate_change` has no `on_failure` policy (unlike `verify`, which got
+  `timeout_seconds: 480` + a soft-failure loop on 09-21), so two failed
+  attempts end the incident silently — no PR, no report, and in an
+  unattended sweep nobody finds out.
+
+**Verified:** `tests/test_git_ops.py` +6 (a stalled child raises rather
+than hangs, is killed, an already-reaped child is not an error, the
+default is >= 120s, and a source-level assertion that no bare
+`communicate()` is reintroduced — which is exactly how this shipped).
+Full suite 122 passed on Windows excluding the 10 modules needing
+`fcntl`/`a2a`.
+
+**Verified on Test EKS (2026-09-25), against a purpose-built image.** Both
+`ari-oncall-api` and `ari-oncall-worker` were built from this branch, tagged
+`fix-git-timeout`, and rolled out to the `insightfinder` namespace before any
+of this was pushed.
+
+1. *Normal path, default 30s.* Workflow `0c63edf0` completed in 2m13s; all
+   four steps ran; `generate_change` made 23 opencode calls in 97.98s. Zero
+   `timed out after` lines — the deadline does not fire on real work.
+2. *Normal path, 1s.* With `GIT_SUBPROCESS_TIMEOUT_SECONDS=1`, workflow
+   `c99e227b` still completed clean. Every git call in this repo finishes in
+   under a second, so 1s is not tight enough to force the failure path.
+3. *Forced failure, 0.001s.* Workflow `2adbee78` ended in 47s instead of
+   hanging. The worker log carried
+   `RuntimeError: git default branch timed out after 0s (pid 31) and was killed`,
+   Temporal retried through attempts 1/2/3 with a fresh pid each time
+   (31, 39, 48), and the pod had **0** leftover git processes. This is the
+   behaviour the fix exists for, observed end to end.
+4. *Restored.* Env var removed, module constants back to `30.0 / 600.0`,
+   workflow `a89fb051` completed in 2m1s with zero timeout lines and zero
+   leftover processes.
+
+Note on step 3's `after 0s`: the message used `:.0f`, which rounds 0.001 to
+0. Changed to `:g` afterwards. For every value that will actually be
+configured (30, 600) the two render identically, so the image verified above
+and the code as committed behave the same.
+
+**Deployment gotcha, not yet in the chart.** The worker mounts RWO EBS
+volumes, so the default `RollingUpdate` strategy deadlocks: the new pod waits
+for a volume the old pod still holds. Recovery is scale to 0, patch
+`strategy: {type: Recreate}`, scale back to 1. This is currently only a live
+`kubectl patch` on Test — `insightfinder/charts` still ships RollingUpdate,
+so the next `helm upgrade` will reintroduce the deadlock.
+
+## 2026-09-28 — Timeout + retry on every outbound API call
+
+Asked for by Mustafa: "the API layer must all have timeout and retry."
+The Temporal *activity* layer was already audited for retry policy on
+2026-09-22 (`plan_task`, `cleanup_workspace`, `prepare_workspace` — see
+that entry); the HTTP layer never was. Audit of every outbound call on
+`test` (`ffd2dd8`) found timeouts everywhere and retries nowhere:
+
+| call site | timeout | retry (before) |
+| --- | --- | --- |
+| `github_rest.create_pull_request` | `timeout=30` | none |
+| `jenkins_rest.stop_build` (crumb GET + stop POST) | `timeout=30` | none |
+| `app_factory` A2A push-notification sender | `timeout=30` | none |
+| `llm/client` planner call | **unset** — SDK default | SDK default |
+
+The `timeout=30` on those `httpx.AsyncClient`s is fine: httpx applies one
+scalar to connect/read/write/pool alike, so none of them could hang.
+
+**The LLM client was the one real timeout hole**, and its own docstring
+had it backwards — it said we "inherit their retry/timeout handling" as
+though that settled it. Measured inside the deployed image rather than
+assumed: `openai 3.19.2` and `anthropic 1.8.0` both ship
+`Timeout(connect=5, read=600, write=600, pool=600)` with
+`max_retries=2`. That is 600s x 3 = **30 minutes**, against a
+`start_to_close_timeout` of 1200s — Temporal would kill the activity
+while the SDK sat waiting, and the traceback would blame the activity,
+not the SDK default that caused it. Now explicit: 120s x 3 = 6 minutes
+(`LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`), with a test asserting the
+worst case stays under 1200s so the two cannot drift apart again.
+
+**New `src/common/http_retry.py`** carries the one policy. What it will
+and will not retry is the whole design:
+
+- Retried: `httpx.TransportError` and `{408, 425, 429, 500, 502, 503,
+  504}` — "the server did not process this, or could not tell us whether
+  it did".
+- Not retried: every other 4xx. A 401/404/422 is a verdict, not weather;
+  retrying burns the budget and delays the real error.
+- `Retry-After` (delta-seconds *and* HTTP-date) beats our own backoff,
+  because the server knows its rate-limit window and we do not — capped
+  at 60s so a server cannot park an activity past its timeout. A
+  malformed header falls back to backoff rather than aborting.
+- Backoff is exponential with equal jitter. Jitter is not decoration
+  here: the worker runs several capabilities concurrently against the
+  same GitHub org, so un-jittered backoff would line their retries up
+  into one burst against an API already rate-limiting us.
+- It **returns** the response on a final non-2xx instead of raising.
+  Callers already write error messages carrying their own API's context;
+  this layer has nothing better to say. It raises only when there is no
+  response at all, and then names the operation (`what=`) — the same
+  reason `git_ops._communicate` names its git subcommand.
+
+**`create_pull_request` is the one call a retry could duplicate**, so it
+got idempotency rather than just retries. The head branch is already
+deterministic per request (`_branch_name` → `ari/<slug>-<request_id[:8]>`),
+which makes "does this already exist?" answerable:
+
+1. `GET /pulls?head=<owner>:<branch>&state=open` first — an existing open
+   PR is returned as-is, no POST.
+2. That lookup is best-effort: anything but a clean 200 with a non-empty
+   list means "create it". It exists to avoid a duplicate and must never
+   become the reason no PR gets opened.
+3. A 422 from the POST re-runs the lookup. This closes the race the
+   pre-check cannot: a previous attempt's POST reached GitHub, its
+   response was lost, so this attempt saw no open PR. GitHub says 422,
+   and the PR the caller wanted exists — that is success, not failure.
+
+**`publish_pr.py` deliberately untouched.** Its one big `try` around
+git add/commit/push/create-PR drops *any* failure to the opencode
+fallback (extra subprocess + several LLM-mediated tool calls, measured as
+this step's dominant cost on 2026-09-21). That looked like the thing to
+fix, but it is a symptom: once a transient 502 is absorbed inside
+`create_pull_request`, it never reaches that `except` at all. Splitting
+the `try` would have been a second, riskier change buying nothing.
+
+**Verified:** +45 tests. `tests/test_http_retry.py` covers each retryable
+status individually, each non-retryable one, `Retry-After` in both
+formats plus past-dated/malformed/absent, the cap, the jitter bounds, and
+that exhausted retries return rather than raise. `tests/test_jenkins_rest.py`
+is new — `stop_build` had no HTTP-level test at all, it was mocked
+everywhere. Two source-level guards in the same spirit as the
+`communicate()` guard in `test_git_ops.py`: every `httpx.AsyncClient` in
+`src/` sets a timeout, and no module calls httpx directly instead of
+going through `http_retry` — a REST client added later is exactly how
+this stops being true.
+
+Full suite **241 passed**, run inside the deployed
+`ari-oncall-agent-worker:test` image with `src/` and `tests/` mounted
+over it, so the 10 modules that cannot be collected on Windows (`a2a`,
+`fcntl`) were included rather than skipped.
+
+## 2026-09-28 — First real `opencode run` against a live Jenkins, which immediately found the read agent could not call a single tool
+
+This closes the gap the 2026-09-18 Jenkins entry ended on, verbatim:
+*"the actual capabilities ... have had zero real `opencode run`
+invocations against a real Jenkins, by anyone."* They have now. The first
+one failed, for a reason no amount of reading would have found.
+
+**Getting to a first run at all took two unrelated unblocks**, both worth
+recording because neither is in any code:
+
+- *Network.* The agent runs on the `test` EKS cluster in `us-west-1`;
+  `jenkins.insightfinder.com` is an EC2 instance in `us-east-1` with no
+  peering between them. Its security group already allowed `10.0.0.0/16`,
+  `10.1.0.0/16` and `10.2.0.0/16`, which looks like it covers the cluster
+  and does not: that cluster's VPC has no NAT gateway at all. Its nodes
+  carry public IPs directly, so a pod egresses as **whichever node it
+  happens to be scheduled on** — eight of them, each a different address.
+  Allowing the one address observed first (`sgr-0e52e1f30382b2119` on
+  `sg-01a97ff62f0dec233`) worked until the worker was redeployed and
+  landed on a different node, at which point every MCP call timed out
+  again and looked exactly like a regression in the fix below. Anything
+  from this cluster that must reach a firewalled host needs every node's
+  address allowed, or it is one reschedule away from breaking. Revoke
+  these when Jenkins testing is done. Reachability was first checked from
+  inside the worker pod with a raw socket — which proves the network and
+  nothing about the agent, a distinction that mattered twice.
+- *A bad key that looked like a dead key.* The first attempt failed with
+  `anthropic.AuthenticationError: API key is invalid`, and the same key
+  from the same host failed the same way against `api.anthropic.com`
+  directly. It was not revoked: the `export` had been pasted into a
+  `/bin/sh` session where it was mangled mid-line. Worth knowing because
+  Anthropic answers a mangled key and a revoked key identically — 401
+  `authentication_error` either way (a valid key out of credit is a 400,
+  and over its rate limit a 429, so the distinction that matters is not
+  the one the status code makes).
+
+**The bug.** `chat` against `Jenkins-Backup` returned
+`TASK_STATE_COMPLETED` with the model politely explaining that no Jenkins
+or MCP server was connected. The worker trace said why:
+
+```
+tool_call_counts={'list_mcp_resources': 1, 'list_mcp_resource_templates': 1}
+tool_call_total=2
+```
+
+Those are opencode's own built-in MCP introspection tools. The model had
+nothing else — it reached for the only MCP-shaped things it could see,
+found no *resources* (the plugin exposes tools, not resources), and gave
+up. No MCP connection error anywhere in the logs, because the connection
+was fine.
+
+`ari-jenkins-read` carried `"tools": {..., "jenkins_*": False}`, and
+`write_config` set the same wildcard as the global default. The
+2026-09-18 entry had already confirmed opencode's naming rule from its own
+docs — *"MCP server tools are registered with server name as prefix"* —
+and concluded the `jenkins_*` guess was "very likely correct". It was
+correct. That was the problem. The server is registered under the key
+`jenkins`, so **every** tool is `jenkins_*`: the plugin's 15 read-only
+tools exactly as much as its 4 mutating ones. The wildcard denied the
+read agent the entire Jenkins API, and `resolve_target`/`inspect`/
+`diagnose`/`propose_action` have no other route to Jenkins — only
+`jenkins_stop_build` is direct REST.
+
+The risk flagged in `opencode_cli.py`'s own docstring since the agent was
+built was the *opposite* failure: a wrong prefix matching nothing and
+silently denying nothing under `--auto`. Confirming the prefix was right
+was treated as closing that risk, when the same fact opened this one. A
+wildcard has two failure modes and only one of them was ever considered.
+
+**Proved by A/B inside the deployed pod** (`2609190017-test`), not
+reasoned about: same `mcp` block, same agent, deny replaced with the four
+exact names, then `opencode run --dir ... --agent ari-jenkins-read
+--format json --auto` asking for the last build of `Jenkins-Backup`.
+opencode called `jenkins_getBuild` — the live tool name, which also
+settles the prefix question by observation rather than by documentation —
+and answered `#120 SUCCESS`, matching what the REST API reports. The
+config written for that run was deleted from the pod afterwards; it held
+a real Jenkins token and a real LLM key.
+
+**The fix** replaces every wildcard with exact names, in all three places
+(global default, both agents):
+
+- `_MCP_SERVER_NAME = "jenkins"` is now the single source of the prefix,
+  used to build both the `mcp` key and every permission entry, so renaming
+  the server cannot detach the permissions from the tools it guards.
+- `_MUTATING_TOOLS` pins the plugin's four `destructiveHint` tools.
+- Read-only tools are deliberately *not* enumerated. Listing them would
+  need an edit every time the plugin adds one, and a forgotten entry there
+  silently costs a capability its data; the list worth maintaining by hand
+  is the short one whose contents the plugin, not we, decide.
+- `ari-jenkins-act` dropped from `jenkins_*: True` to
+  `jenkins_triggerBuild: True`. It had been allowed all four mutations
+  although `execute_action` performs exactly one. `replayBuild` is the
+  reason this is not cosmetic: its required `mainScript` argument is
+  arbitrary Pipeline Groovy run on the controller, so a wildcard handed a
+  confirmed `pending_action` a code-execution route that design.md §5
+  explicitly closes for `api_get` and never considered here.
+
+**The test suite had the bug written into it as the expected behaviour** —
+`test_only_ari_jenkins_act_can_call_a_mutating_jenkins_tool` asserted
+`read["jenkins_*"] is False`. It passed for the same reason the agent was
+broken. Rewritten, plus four new tests aimed at the class of mistake
+rather than this instance: that no permission entry anywhere contains a
+`*` (the guard that would have caught this), that representative read-only
+tools are reachable from every block, that `_MUTATING_TOOLS` still matches
+the plugin's destructive set, and that the permission prefix still tracks
+the `mcp` key.
+
+**Verified:** full suite **245 passed** (241 before, +4 new), run inside
+the deployed `ari-oncall-agent-worker:test` image with this working copy's
+`src/`, `tests/` and `docs/examples/` over it, so the modules that cannot
+be collected on Windows (`a2a`, `fcntl`) were included rather than
+skipped. The behaviour the new tests describe was separately confirmed by
+the live `opencode run` above — the tests pin it, they did not establish
+it.
+
+**Then verified through the deployed agent, not just through opencode.**
+The fix was built as `ari-jenkins-agent-worker:fix-jenkins-tool-perms`
+(worker only — the API image runs no capabilities) from `HEAD` plus this
+one file, so the new image differs from the running one by the fix and
+nothing else, and rolled out with `kubectl set image` rather than
+`helm upgrade`, which would have touched the on-call agent sharing the
+release. All three sample-client modes then passed against the real
+Jenkins:
+
+- `chat` on `Jenkins-Backup` — reported #120 SUCCESS, ~3.4s, timer-triggered,
+  120/120 green, freestyle on the controller with no SCM. Matches the REST
+  API.
+- `task-poll` on `CI_Pipelines/9-Dev_Branch_Pipeline/EU-EnvCheck-Automation`
+  #208 — read the console log and the JUnit report, separated the failing
+  NA checks from the passing EU ones in the same run, tied the UI timeout
+  to four preceding `401`s on `/api/v1/refreshusertoken`, and noted #207
+  had failed for a *different* reason. It concluded the fault is in the
+  monitored backend rather than the test suite, which is the right call
+  and not one available from build status alone.
+- `propose` — returned `TASK_STATE_INPUT_REQUIRED` with a `pending_action`
+  artifact, and `Jenkins-Backup` was still at #120 with nothing queued
+  afterwards. Worth recording *how* it behaved: the prompt says "deploy to
+  staging", the job is a parameterless backup job, and rather than inventing
+  a parameter to satisfy the phrasing it said so and offered the six real
+  `*/staging` jobs under `CI_Pipelines`. That is section 4's "ask rather
+  than guess" happening on its own.
+
+Across all three runs the trace shows seven distinct read-only tools used
+(`jenkins_getJobs`, `getJob`, `getBuild`, `getBuildLog`, `searchBuildLog`,
+`getTestResults`, `getFlakyFailures`) and **no mutating tool called at
+all** — the permission block doing exactly what it now says.
+
+**A second network trap, which first looked exactly like the fix failing.**
+After the rollout every MCP call timed out again and opencode registered
+no `jenkins_*` tools whatsoever (`Model tried to call unavailable tool
+'jenkins_getLastBuild'. Available tools: glob, grep, invalid, read, skill,
+todowrite`). The cause was not the fix: the new pod had been scheduled onto
+a different node, and — as corrected above — this cluster's pods egress as
+their *node's* public IP, so it arrived from an address the security group
+did not know. All eight nodes are allowed now. Note the shape of the
+symptom, because it is misleading twice over: a blocked MCP endpoint
+removes the tools from the model's toolset entirely rather than erroring,
+so it is indistinguishable from a permission bug by the model's own
+account of itself. The distinguishing evidence was that opencode's
+built-in `list_mcp_resources` disappeared too, which a permission entry
+naming only `jenkins_*` tools could not explain. (The first attempt after
+the rollout also got eaten by an unrelated race — the terminating old pod
+was still polling the task queue and picked the activity up, then died
+holding it; Temporal waits out the 20-minute `start_to_close_timeout`
+before retrying, so a redeploy needs the old pod actually gone, not merely
+`rollout status` reporting success.)
+
+**Still unverified.** `execute_action` has not been run against a real
+Jenkins — doing so means triggering a real build on a production
+controller, which is a decision, not a test step. The read path is proven
+end to end through the deployed agent; the write path is proven only in
+unit tests.

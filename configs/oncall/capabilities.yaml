@@ -1,0 +1,140 @@
+# Declarative capability registry.
+#
+# The planner reads `description`/`tools` to decide which capabilities to use
+# and in what order for a given prompt. The executor reads `module` to load
+# the capability's `run(ctx) -> dict` function, and `retry`/`on_failure` to
+# drive Temporal's per-step retry/looping behavior.
+#
+# Adding a capability = write the module + add an entry here. No engine
+# code changes.
+#
+# generate_change/verify are backed by opencode, each through its own
+# scoped opencode "agent" (ari-change/ari-verify — see tools/opencode_cli.py)
+# with only the permissions that step actually needs. publish_pr's primary
+# path is plain deterministic git/REST (no opencode); it falls back to
+# opencode (agent: ari-publish, the only one with the GitHub MCP server's
+# tools enabled) only if that primary path fails.
+#
+# There used to be a separate `analyze` capability (read-only investigation,
+# its own opencode agent/session) that ran before generate_change — merged
+# into generate_change: opencode's own agentic loop already investigates as
+# needed within one turn before editing, so the split only ever cost a
+# second opencode subprocess + LLM session start for every request that was
+# always going to edit anyway. See generate_change.py's own docstring.
+
+capabilities:
+  clone_repo:
+    module: ari_oncall_agent.capabilities.clone_repo
+    description: >
+      Get the target repository ready in an isolated, per-request sandbox
+      workspace: ensure/refresh a shared local mirror cache for this repo
+      (so repeated requests against the same repo don't each pay for a
+      full fresh remote clone), then fast-clone the requested branch from
+      that cache into this request's own working copy, and write that
+      request's opencode.json (LLM key, GitHub MCP server + PAT, scoped
+      agents). Accepts an optional `ref` param (branch to check out) when
+      the prompt names one explicitly, e.g. "check the repo in dev
+      branch" — otherwise falls back to the request's configured default,
+      and if neither is set, to whatever branch the remote itself reports
+      as its default (main/master/whatever it actually is, never assumed).
+      Always the first step of any pipeline that touches a repo.
+    tools: [repo_cache_and_clone, git_set_origin, opencode_config]
+    retry:
+      max_attempts: 3
+      backoff_seconds: 5
+
+  generate_change:
+    module: ari_oncall_agent.capabilities.generate_change
+    description: >
+      Use opencode (agent: ari-change, can edit files) to investigate the
+      repository as needed and make the requested code change — a bug fix,
+      a new feature, a refactor, or a specific edit, whatever the request
+      actually asks for — informed by a prior verify failure when looping
+      back. Always the step that both localizes a root cause (for a bug/
+      issue) and edits, in one pass — never run a separate read-only
+      investigation step first, opencode already investigates as needed
+      within this same call before editing. Diff and the list of changed
+      files are captured via `git diff`/`git diff --name-only`, not
+      trusted from opencode's own report of what it changed — publish_pr
+      uses the file list to scope staging and avoid sweeping in scratch
+      files a later step (e.g. verify) may have left behind.
+    tools: [opencode, git_diff, git_changed_files]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 10
+
+  verify:
+    module: ari_oncall_agent.capabilities.verify
+    description: >
+      Use opencode (agent: ari-verify, can run arbitrary build/lint/test
+      commands but cannot edit files) to run the project's test suite
+      against the generated change. Opt-in, NOT part of the default
+      pipeline: only include this step when the request explicitly asks
+      for tests/verification to be run (e.g. "verify it works", "run the
+      tests", "make sure it builds") — omit it for an ordinary bug
+      fix/feature/edit request. Building/testing an arbitrary target repo
+      is the slowest, least predictable step in this pipeline (cold
+      dependency downloads, unknown build tooling per repo), so it's a
+      real cost only worth paying when explicitly asked for, not a
+      default every request should pay.
+    tools: [opencode]
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+    # Shorter than workflow.py's 20-minute default on purpose. Confirmed
+    # live (Temporal history, 2026-09-21): with no bound here, a
+    # slow/hung build routinely ran past callers' own ~8-10 minute
+    # patience timeout, which cancelled the activity out from under this
+    # pipeline every single time — wasting that whole window before
+    # falling back, on every real request in a 48h sample. Timing out
+    # here first (well inside that window) makes the failure deterministic
+    # and lets the on_failure loop below retry with a fresh attempt
+    # instead of racing an external cancel. Paired with a persistent
+    # build-tool dependency cache (settings.build_cache_root) so repeat
+    # attempts against the same repo aren't paying a cold-dependency-
+    # download tax every time either.
+    timeout_seconds: 480
+    on_failure:
+      goto: generate_change
+      max_attempts: 3
+      then: fail_needs_human
+
+  publish_pr:
+    module: ari_oncall_agent.capabilities.publish_pr
+    description: >
+      Deterministically (no LLM/opencode involved — title, body, branch
+      name and file list are already fully known by this point) stage,
+      commit, and push the change to a new branch, then open a pull
+      request via the GitHub REST API; falls back to opencode + the
+      GitHub MCP server (agent: ari-publish) if that primary path fails.
+      Opt-out, part of the default pipeline whenever generate_change runs
+      — see meta.py's default_step_policy, which appends this step
+      automatically even if the planner's own step list omits it, unless
+      the request explicitly asked not to open a PR. Accepts an optional
+      `base_ref` param (the PR's target branch) when the prompt names one
+      explicitly and it differs from the branch clone_repo checked out,
+      e.g. "raise a PR against staging" while working from dev —
+      otherwise defaults to the same branch clone_repo used. Always the
+      last step.
+    tools: [git_add, git_commit, git_push, github_create_pr, opencode]
+    retry:
+      max_attempts: 3
+      backoff_seconds: 5
+
+  # `internal: true` — never chosen by the planner (excluded from
+  # catalog()), always run directly by orchestration/workflow.py after
+  # whatever plan the planner picked finishes (or gives up). This is what
+  # actually answers the user: a plain question gets a real answer, a full
+  # pipeline run gets a synthesized summary instead of a templated
+  # one-liner. See capabilities/respond.py.
+  respond:
+    module: common.respond
+    description: >
+      Write the final human-facing response — a direct answer when no
+      repo work was needed, or a synthesis of what was found/changed/
+      verified/published when it was.
+    tools: [llm_complete]
+    internal: true
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5

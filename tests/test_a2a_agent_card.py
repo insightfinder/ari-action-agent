@@ -5,8 +5,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from a2a.utils import TransportProtocol  # noqa: E402
 
-from ari_agent.a2a_server.agent_card import build_agent_card  # noqa: E402
-from ari_agent.settings import Settings  # noqa: E402
+from common.a2a_server.agent_card import build_agent_card  # noqa: E402
+from common.settings import Settings  # noqa: E402
 
 
 def test_agent_card_declares_both_jsonrpc_and_rest_at_the_public_url():
@@ -42,3 +42,17 @@ def test_agent_card_has_the_code_analysis_fix_skill():
 
     ids = {s.id for s in card.skills}
     assert "code_analysis_fix" in ids
+
+
+def test_agent_card_switches_content_by_agent_kind():
+    oncall_card = build_agent_card(Settings(agent_kind="oncall"))
+
+    assert {s.id for s in oncall_card.skills} == {"code_analysis_fix"}
+
+
+def test_agent_card_defaults_to_oncall_for_an_unknown_agent_kind():
+    # Fail safe, not fail closed — an unrecognized kind (e.g. a typo in a
+    # deployment's env var) still serves a real, working card.
+    card = build_agent_card(Settings(agent_kind="something-typoed"))
+
+    assert {s.id for s in card.skills} == {"code_analysis_fix"}

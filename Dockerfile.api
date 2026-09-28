@@ -1,0 +1,23 @@
+# API/A2A HTTP process image — shared across every agent kind. This
+# process only speaks A2A over HTTP and starts Temporal workflows; it
+# never shells out to git/opencode/a build toolchain itself (that's the
+# worker's job — see Dockerfile.oncall / Dockerfile.jenkins). Which agent
+# kind's card and skill it serves is pure runtime config (AGENT_KIND /
+# AGENT_NAME / AGENT_PUBLIC_URL / AGENT_API_KEYS), so this one image can
+# back an "ari-oncall-api" deployment, an "ari-jenkins-api" deployment, or
+# both from the same image with different env — see api/main.py.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY src ./src
+COPY configs ./configs
+
+RUN pip install --no-cache-dir .
+
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

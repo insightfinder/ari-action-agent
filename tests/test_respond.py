@@ -6,9 +6,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent.capabilities import respond  # noqa: E402
-from ari_agent.capabilities.base import StepContext  # noqa: E402
-from ari_agent.capabilities.registry import catalog  # noqa: E402
+from common import respond  # noqa: E402
+from common.capabilities_base import StepContext  # noqa: E402
+from common.capabilities_registry import catalog  # noqa: E402
 
 
 def _ctx(prompt, results, params, history=None, tools=None):
@@ -28,7 +28,24 @@ def _ctx(prompt, results, params, history=None, tools=None):
 def test_respond_is_excluded_from_planner_catalog():
     names = {c["name"] for c in catalog()}
     assert "respond" not in names
-    assert {"clone_repo", "analyze", "generate_change", "verify", "publish_pr"} <= names
+    assert {"clone_repo", "generate_change", "verify", "publish_pr"} <= names
+    # "analyze" was merged into "generate_change" (see generate_change.py's
+    # own docstring) — must not reappear as a separate planner-selectable
+    # capability.
+    assert "analyze" not in names
+
+
+def test_verify_description_tells_the_planner_it_is_opt_in():
+    # verify is the pipeline's slowest, least predictable step (cold
+    # dependency downloads, unpredictable per-repo build tooling) — must
+    # not be part of the default pipeline any more, only run when the
+    # request explicitly asks for it. This can't be tested by actually
+    # invoking the LLM planner, so assert the instruction it's given says
+    # so unambiguously.
+    verify_entry = next(c for c in catalog() if c["name"] == "verify")
+    description = verify_entry["description"].lower()
+    assert "opt-in" in description
+    assert "not part of the default pipeline" in description
 
 
 @pytest.mark.asyncio
@@ -55,8 +72,11 @@ async def test_respond_synthesizes_full_pipeline_results():
     ctx = _ctx(
         prompt="fix the bug",
         results={
-            "analyze": {"root_cause": {"summary": "race condition", "evidence": []}},
-            "generate_change": {"summary": "added a mutex", "diff": "..."},
+            "generate_change": {
+                "root_cause": {"summary": "race condition", "evidence": []},
+                "summary": "added a mutex",
+                "diff": "...",
+            },
             "verify": {"status": "passed"},
             "publish_pr": {"pr": {"url": "https://github.com/x/y/pull/1", "branch": "b"}},
         },
@@ -96,5 +116,5 @@ def test_system_prompt_forbids_dangling_follow_up_questions():
     # this agent doesn't implement a paused "waiting on you" task state.
     # This rule must stay in the prompt regardless of how the caller is
     # waiting for the result (blocking, polling, or a webhook).
-    assert "NEVER end with a question" in respond._SYSTEM_PROMPT
-    assert "plain recommendation" in respond._SYSTEM_PROMPT
+    assert "NEVER end with a question" in respond._SYSTEM_PROMPT_TEMPLATE
+    assert "plain recommendation" in respond._SYSTEM_PROMPT_TEMPLATE
