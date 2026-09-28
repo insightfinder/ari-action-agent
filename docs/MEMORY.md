@@ -2241,3 +2241,268 @@ for a volume the old pod still holds. Recovery is scale to 0, patch
 `strategy: {type: Recreate}`, scale back to 1. This is currently only a live
 `kubectl patch` on Test — `insightfinder/charts` still ships RollingUpdate,
 so the next `helm upgrade` will reintroduce the deadlock.
+
+## 2026-09-28 — Timeout + retry on every outbound API call
+
+Asked for by Mustafa: "the API layer must all have timeout and retry."
+The Temporal *activity* layer was already audited for retry policy on
+2026-09-22 (`plan_task`, `cleanup_workspace`, `prepare_workspace` — see
+that entry); the HTTP layer never was. Audit of every outbound call on
+`test` (`ffd2dd8`) found timeouts everywhere and retries nowhere:
+
+| call site | timeout | retry (before) |
+| --- | --- | --- |
+| `github_rest.create_pull_request` | `timeout=30` | none |
+| `jenkins_rest.stop_build` (crumb GET + stop POST) | `timeout=30` | none |
+| `app_factory` A2A push-notification sender | `timeout=30` | none |
+| `llm/client` planner call | **unset** — SDK default | SDK default |
+
+The `timeout=30` on those `httpx.AsyncClient`s is fine: httpx applies one
+scalar to connect/read/write/pool alike, so none of them could hang.
+
+**The LLM client was the one real timeout hole**, and its own docstring
+had it backwards — it said we "inherit their retry/timeout handling" as
+though that settled it. Measured inside the deployed image rather than
+assumed: `openai 3.19.2` and `anthropic 1.8.0` both ship
+`Timeout(connect=5, read=600, write=600, pool=600)` with
+`max_retries=2`. That is 600s x 3 = **30 minutes**, against a
+`start_to_close_timeout` of 1200s — Temporal would kill the activity
+while the SDK sat waiting, and the traceback would blame the activity,
+not the SDK default that caused it. Now explicit: 120s x 3 = 6 minutes
+(`LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`), with a test asserting the
+worst case stays under 1200s so the two cannot drift apart again.
+
+**New `src/common/http_retry.py`** carries the one policy. What it will
+and will not retry is the whole design:
+
+- Retried: `httpx.TransportError` and `{408, 425, 429, 500, 502, 503,
+  504}` — "the server did not process this, or could not tell us whether
+  it did".
+- Not retried: every other 4xx. A 401/404/422 is a verdict, not weather;
+  retrying burns the budget and delays the real error.
+- `Retry-After` (delta-seconds *and* HTTP-date) beats our own backoff,
+  because the server knows its rate-limit window and we do not — capped
+  at 60s so a server cannot park an activity past its timeout. A
+  malformed header falls back to backoff rather than aborting.
+- Backoff is exponential with equal jitter. Jitter is not decoration
+  here: the worker runs several capabilities concurrently against the
+  same GitHub org, so un-jittered backoff would line their retries up
+  into one burst against an API already rate-limiting us.
+- It **returns** the response on a final non-2xx instead of raising.
+  Callers already write error messages carrying their own API's context;
+  this layer has nothing better to say. It raises only when there is no
+  response at all, and then names the operation (`what=`) — the same
+  reason `git_ops._communicate` names its git subcommand.
+
+**`create_pull_request` is the one call a retry could duplicate**, so it
+got idempotency rather than just retries. The head branch is already
+deterministic per request (`_branch_name` → `ari/<slug>-<request_id[:8]>`),
+which makes "does this already exist?" answerable:
+
+1. `GET /pulls?head=<owner>:<branch>&state=open` first — an existing open
+   PR is returned as-is, no POST.
+2. That lookup is best-effort: anything but a clean 200 with a non-empty
+   list means "create it". It exists to avoid a duplicate and must never
+   become the reason no PR gets opened.
+3. A 422 from the POST re-runs the lookup. This closes the race the
+   pre-check cannot: a previous attempt's POST reached GitHub, its
+   response was lost, so this attempt saw no open PR. GitHub says 422,
+   and the PR the caller wanted exists — that is success, not failure.
+
+**`publish_pr.py` deliberately untouched.** Its one big `try` around
+git add/commit/push/create-PR drops *any* failure to the opencode
+fallback (extra subprocess + several LLM-mediated tool calls, measured as
+this step's dominant cost on 2026-09-21). That looked like the thing to
+fix, but it is a symptom: once a transient 502 is absorbed inside
+`create_pull_request`, it never reaches that `except` at all. Splitting
+the `try` would have been a second, riskier change buying nothing.
+
+**Verified:** +45 tests. `tests/test_http_retry.py` covers each retryable
+status individually, each non-retryable one, `Retry-After` in both
+formats plus past-dated/malformed/absent, the cap, the jitter bounds, and
+that exhausted retries return rather than raise. `tests/test_jenkins_rest.py`
+is new — `stop_build` had no HTTP-level test at all, it was mocked
+everywhere. Two source-level guards in the same spirit as the
+`communicate()` guard in `test_git_ops.py`: every `httpx.AsyncClient` in
+`src/` sets a timeout, and no module calls httpx directly instead of
+going through `http_retry` — a REST client added later is exactly how
+this stops being true.
+
+Full suite **241 passed**, run inside the deployed
+`ari-oncall-agent-worker:test` image with `src/` and `tests/` mounted
+over it, so the 10 modules that cannot be collected on Windows (`a2a`,
+`fcntl`) were included rather than skipped.
+
+## 2026-09-28 — First real `opencode run` against a live Jenkins, which immediately found the read agent could not call a single tool
+
+This closes the gap the 2026-09-18 Jenkins entry ended on, verbatim:
+*"the actual capabilities ... have had zero real `opencode run`
+invocations against a real Jenkins, by anyone."* They have now. The first
+one failed, for a reason no amount of reading would have found.
+
+**Getting to a first run at all took two unrelated unblocks**, both worth
+recording because neither is in any code:
+
+- *Network.* The agent runs on the `test` EKS cluster in `us-west-1`;
+  `jenkins.insightfinder.com` is an EC2 instance in `us-east-1` with no
+  peering between them. Its security group already allowed `10.0.0.0/16`,
+  `10.1.0.0/16` and `10.2.0.0/16`, which looks like it covers the cluster
+  and does not: that cluster's VPC has no NAT gateway at all. Its nodes
+  carry public IPs directly, so a pod egresses as **whichever node it
+  happens to be scheduled on** — eight of them, each a different address.
+  Allowing the one address observed first (`sgr-0e52e1f30382b2119` on
+  `sg-01a97ff62f0dec233`) worked until the worker was redeployed and
+  landed on a different node, at which point every MCP call timed out
+  again and looked exactly like a regression in the fix below. Anything
+  from this cluster that must reach a firewalled host needs every node's
+  address allowed, or it is one reschedule away from breaking. Revoke
+  these when Jenkins testing is done. Reachability was first checked from
+  inside the worker pod with a raw socket — which proves the network and
+  nothing about the agent, a distinction that mattered twice.
+- *A bad key that looked like a dead key.* The first attempt failed with
+  `anthropic.AuthenticationError: API key is invalid`, and the same key
+  from the same host failed the same way against `api.anthropic.com`
+  directly. It was not revoked: the `export` had been pasted into a
+  `/bin/sh` session where it was mangled mid-line. Worth knowing because
+  Anthropic answers a mangled key and a revoked key identically — 401
+  `authentication_error` either way (a valid key out of credit is a 400,
+  and over its rate limit a 429, so the distinction that matters is not
+  the one the status code makes).
+
+**The bug.** `chat` against `Jenkins-Backup` returned
+`TASK_STATE_COMPLETED` with the model politely explaining that no Jenkins
+or MCP server was connected. The worker trace said why:
+
+```
+tool_call_counts={'list_mcp_resources': 1, 'list_mcp_resource_templates': 1}
+tool_call_total=2
+```
+
+Those are opencode's own built-in MCP introspection tools. The model had
+nothing else — it reached for the only MCP-shaped things it could see,
+found no *resources* (the plugin exposes tools, not resources), and gave
+up. No MCP connection error anywhere in the logs, because the connection
+was fine.
+
+`ari-jenkins-read` carried `"tools": {..., "jenkins_*": False}`, and
+`write_config` set the same wildcard as the global default. The
+2026-09-18 entry had already confirmed opencode's naming rule from its own
+docs — *"MCP server tools are registered with server name as prefix"* —
+and concluded the `jenkins_*` guess was "very likely correct". It was
+correct. That was the problem. The server is registered under the key
+`jenkins`, so **every** tool is `jenkins_*`: the plugin's 15 read-only
+tools exactly as much as its 4 mutating ones. The wildcard denied the
+read agent the entire Jenkins API, and `resolve_target`/`inspect`/
+`diagnose`/`propose_action` have no other route to Jenkins — only
+`jenkins_stop_build` is direct REST.
+
+The risk flagged in `opencode_cli.py`'s own docstring since the agent was
+built was the *opposite* failure: a wrong prefix matching nothing and
+silently denying nothing under `--auto`. Confirming the prefix was right
+was treated as closing that risk, when the same fact opened this one. A
+wildcard has two failure modes and only one of them was ever considered.
+
+**Proved by A/B inside the deployed pod** (`2609190017-test`), not
+reasoned about: same `mcp` block, same agent, deny replaced with the four
+exact names, then `opencode run --dir ... --agent ari-jenkins-read
+--format json --auto` asking for the last build of `Jenkins-Backup`.
+opencode called `jenkins_getBuild` — the live tool name, which also
+settles the prefix question by observation rather than by documentation —
+and answered `#120 SUCCESS`, matching what the REST API reports. The
+config written for that run was deleted from the pod afterwards; it held
+a real Jenkins token and a real LLM key.
+
+**The fix** replaces every wildcard with exact names, in all three places
+(global default, both agents):
+
+- `_MCP_SERVER_NAME = "jenkins"` is now the single source of the prefix,
+  used to build both the `mcp` key and every permission entry, so renaming
+  the server cannot detach the permissions from the tools it guards.
+- `_MUTATING_TOOLS` pins the plugin's four `destructiveHint` tools.
+- Read-only tools are deliberately *not* enumerated. Listing them would
+  need an edit every time the plugin adds one, and a forgotten entry there
+  silently costs a capability its data; the list worth maintaining by hand
+  is the short one whose contents the plugin, not we, decide.
+- `ari-jenkins-act` dropped from `jenkins_*: True` to
+  `jenkins_triggerBuild: True`. It had been allowed all four mutations
+  although `execute_action` performs exactly one. `replayBuild` is the
+  reason this is not cosmetic: its required `mainScript` argument is
+  arbitrary Pipeline Groovy run on the controller, so a wildcard handed a
+  confirmed `pending_action` a code-execution route that design.md §5
+  explicitly closes for `api_get` and never considered here.
+
+**The test suite had the bug written into it as the expected behaviour** —
+`test_only_ari_jenkins_act_can_call_a_mutating_jenkins_tool` asserted
+`read["jenkins_*"] is False`. It passed for the same reason the agent was
+broken. Rewritten, plus four new tests aimed at the class of mistake
+rather than this instance: that no permission entry anywhere contains a
+`*` (the guard that would have caught this), that representative read-only
+tools are reachable from every block, that `_MUTATING_TOOLS` still matches
+the plugin's destructive set, and that the permission prefix still tracks
+the `mcp` key.
+
+**Verified:** full suite **245 passed** (241 before, +4 new), run inside
+the deployed `ari-oncall-agent-worker:test` image with this working copy's
+`src/`, `tests/` and `docs/examples/` over it, so the modules that cannot
+be collected on Windows (`a2a`, `fcntl`) were included rather than
+skipped. The behaviour the new tests describe was separately confirmed by
+the live `opencode run` above — the tests pin it, they did not establish
+it.
+
+**Then verified through the deployed agent, not just through opencode.**
+The fix was built as `ari-jenkins-agent-worker:fix-jenkins-tool-perms`
+(worker only — the API image runs no capabilities) from `HEAD` plus this
+one file, so the new image differs from the running one by the fix and
+nothing else, and rolled out with `kubectl set image` rather than
+`helm upgrade`, which would have touched the on-call agent sharing the
+release. All three sample-client modes then passed against the real
+Jenkins:
+
+- `chat` on `Jenkins-Backup` — reported #120 SUCCESS, ~3.4s, timer-triggered,
+  120/120 green, freestyle on the controller with no SCM. Matches the REST
+  API.
+- `task-poll` on `CI_Pipelines/9-Dev_Branch_Pipeline/EU-EnvCheck-Automation`
+  #208 — read the console log and the JUnit report, separated the failing
+  NA checks from the passing EU ones in the same run, tied the UI timeout
+  to four preceding `401`s on `/api/v1/refreshusertoken`, and noted #207
+  had failed for a *different* reason. It concluded the fault is in the
+  monitored backend rather than the test suite, which is the right call
+  and not one available from build status alone.
+- `propose` — returned `TASK_STATE_INPUT_REQUIRED` with a `pending_action`
+  artifact, and `Jenkins-Backup` was still at #120 with nothing queued
+  afterwards. Worth recording *how* it behaved: the prompt says "deploy to
+  staging", the job is a parameterless backup job, and rather than inventing
+  a parameter to satisfy the phrasing it said so and offered the six real
+  `*/staging` jobs under `CI_Pipelines`. That is section 4's "ask rather
+  than guess" happening on its own.
+
+Across all three runs the trace shows seven distinct read-only tools used
+(`jenkins_getJobs`, `getJob`, `getBuild`, `getBuildLog`, `searchBuildLog`,
+`getTestResults`, `getFlakyFailures`) and **no mutating tool called at
+all** — the permission block doing exactly what it now says.
+
+**A second network trap, which first looked exactly like the fix failing.**
+After the rollout every MCP call timed out again and opencode registered
+no `jenkins_*` tools whatsoever (`Model tried to call unavailable tool
+'jenkins_getLastBuild'. Available tools: glob, grep, invalid, read, skill,
+todowrite`). The cause was not the fix: the new pod had been scheduled onto
+a different node, and — as corrected above — this cluster's pods egress as
+their *node's* public IP, so it arrived from an address the security group
+did not know. All eight nodes are allowed now. Note the shape of the
+symptom, because it is misleading twice over: a blocked MCP endpoint
+removes the tools from the model's toolset entirely rather than erroring,
+so it is indistinguishable from a permission bug by the model's own
+account of itself. The distinguishing evidence was that opencode's
+built-in `list_mcp_resources` disappeared too, which a permission entry
+naming only `jenkins_*` tools could not explain. (The first attempt after
+the rollout also got eaten by an unrelated race — the terminating old pod
+was still polling the task queue and picked the activity up, then died
+holding it; Temporal waits out the 20-minute `start_to_close_timeout`
+before retrying, so a redeploy needs the old pod actually gone, not merely
+`rollout status` reporting success.)
+
+**Still unverified.** `execute_action` has not been run against a real
+Jenkins — doing so means triggering a real build on a production
+controller, which is a decision, not a test step. The read path is proven
+end to end through the deployed agent; the write path is proven only in
+unit tests.

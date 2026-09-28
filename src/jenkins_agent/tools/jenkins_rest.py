@@ -21,6 +21,8 @@ import base64
 
 import httpx
 
+from common.http_retry import request_with_retry
+
 
 def _auth_header(auth: dict) -> str:
     auth_type = auth.get("type", "api_token")
@@ -47,10 +49,26 @@ async def stop_build(jenkins: dict, job_full_name: str, build_number: int) -> No
         verify = jenkins["ca_bundle"]  # httpx accepts a CA bundle path/content for `verify`
 
     async with httpx.AsyncClient(verify=verify, timeout=30) as client:
-        crumb_resp = await client.get(f"{base_url.rstrip('/')}/crumbIssuer/api/json", headers=headers)
+        crumb_resp = await request_with_retry(
+            client,
+            "GET",
+            f"{base_url.rstrip('/')}/crumbIssuer/api/json",
+            what=f"Jenkins API crumb issuer at {base_url}",
+            headers=headers,
+        )
         if crumb_resp.status_code == 200:
             crumb = crumb_resp.json()
             headers[crumb["crumbRequestField"]] = crumb["crumb"]
 
-        resp = await client.post(f"{job_url(base_url, job_full_name)}/{build_number}/stop", headers=headers)
+        # Safe to retry despite being a POST: stopping a build that has
+        # already stopped is a no-op on Jenkins' side, so a duplicate
+        # delivery costs nothing. That is not true of `triggerBuild`,
+        # which is why this module only carries "stop".
+        resp = await request_with_retry(
+            client,
+            "POST",
+            f"{job_url(base_url, job_full_name)}/{build_number}/stop",
+            what=f"Jenkins API stop build {job_full_name}#{build_number}",
+            headers=headers,
+        )
         resp.raise_for_status()

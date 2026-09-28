@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -277,13 +278,80 @@ async def test_execute_action_stops_via_direct_rest_not_opencode():
 
 
 def test_only_ari_jenkins_act_can_call_a_mutating_jenkins_tool():
-    assert opencode_cli._AGENT_DEFS["ari-jenkins-read"]["tools"]["jenkins_*"] is False
-    assert opencode_cli._AGENT_DEFS["ari-jenkins-act"]["tools"]["jenkins_*"] is True
+    read = opencode_cli._AGENT_DEFS["ari-jenkins-read"]["tools"]
+    act = opencode_cli._AGENT_DEFS["ari-jenkins-act"]["tools"]
+
+    # execute_action triggers builds; nothing proposes the other three, and
+    # replayBuild would be arbitrary Groovy on the controller.
+    assert act["jenkins_triggerBuild"] is True
+    assert read["jenkins_triggerBuild"] is False
+    for name in ("updateBuild", "rebuildBuild", "replayBuild"):
+        assert read[f"jenkins_{name}"] is False
+        assert act[f"jenkins_{name}"] is False
+
     for name, definition in opencode_cli._AGENT_DEFS.items():
         assert definition["mode"] == "primary", f"{name} must be mode=primary or --agent silently ignores it"
         assert definition["tools"]["task"] is False
         assert definition["permission"]["edit"] == "deny"
         assert definition["permission"]["bash"] == "deny"
+
+
+def test_read_agent_leaves_every_read_only_jenkins_tool_reachable(tmp_path):
+    """The 2026-09-28 regression: a `jenkins_*: False` wildcard denied the
+    plugin's 15 read-only tools along with its 4 mutating ones, so
+    resolve_target/inspect/diagnose/propose_action reached Jenkins with no
+    tools at all and the model reported no MCP server was connected."""
+    path = opencode_cli.write_config(
+        str(tmp_path), {"provider": "anthropic", "api_key": "k", "model": "m"}, _JENKINS_CONFIG
+    )
+    cfg = json.loads(Path(path).read_text())
+
+    blocks = [cfg["tools"]] + [a["tools"] for a in cfg["agent"].values()]
+    for block in blocks:
+        for tool in ("jenkins_getJob", "jenkins_getBuild", "jenkins_getBuildLog", "jenkins_whoAmI"):
+            assert block.get(tool, True) is not False, f"{tool} must stay reachable"
+
+
+def test_no_tools_permission_anywhere_uses_a_wildcard(tmp_path):
+    """opencode runs with --auto, so a permission entry is only as good as
+    its match. A wildcard fails open in one direction (stops matching, denies
+    nothing) and shut in the other (matches too much, denies the reads) — the
+    second is what actually happened. Exact names only, everywhere."""
+    path = opencode_cli.write_config(
+        str(tmp_path), {"provider": "anthropic", "api_key": "k", "model": "m"}, _JENKINS_CONFIG
+    )
+    cfg = json.loads(Path(path).read_text())
+
+    for where, block in [("global", cfg["tools"])] + [(n, a["tools"]) for n, a in cfg["agent"].items()]:
+        for tool in block:
+            assert "*" not in tool, f"{where}: wildcard permission {tool!r}"
+
+
+def test_mutating_tool_names_match_the_plugins_destructive_set():
+    """Pinned from a live `tools/list` against the Jenkins MCP Server plugin
+    (19 tools, 15 readOnlyHint / 4 destructiveHint) — docs/MEMORY.md,
+    2026-09-18 and 2026-09-28. No stop/cancel tool exists, which is why
+    jenkins_rest.stop_build is a direct-REST fallback rather than a tool."""
+    assert set(opencode_cli._MUTATING_TOOLS) == {
+        "triggerBuild",
+        "updateBuild",
+        "rebuildBuild",
+        "replayBuild",
+    }
+
+
+def test_permission_prefix_follows_the_mcp_server_key(tmp_path):
+    """opencode derives a remote MCP tool's name from the server's config
+    key, so renaming the server without renaming the permissions would
+    detach one from the other and silently un-deny every mutation."""
+    path = opencode_cli.write_config(
+        str(tmp_path), {"provider": "anthropic", "api_key": "k", "model": "m"}, _JENKINS_CONFIG
+    )
+    cfg = json.loads(Path(path).read_text())
+
+    assert list(cfg["mcp"]) == [opencode_cli._MCP_SERVER_NAME]
+    for name in opencode_cli._MUTATING_TOOLS:
+        assert f"{opencode_cli._MCP_SERVER_NAME}_{name}" in cfg["tools"]
 
 
 def test_jenkins_rest_job_url_handles_nested_folders():

@@ -10,13 +10,21 @@ no repo, no code to edit; every real action goes through the Jenkins MCP
 server. Locked down further than the oncall agents' opencode wiring
 accordingly: edit and bash both denied outright, not just scoped.
 
-Not yet verified against a real Jenkins instance: the exact MCP tool-name
-prefix opencode assigns a remote MCP server's tools (assumed here to
-follow the same convention observed live for GitHub's MCP server —
-`github_<tool>` — so `jenkins_*` as the wildcard permission pattern below;
-confirmed only by analogy, not by a real run). Also unconfirmed: whether
-the plugin's tool list includes a `stopBuild`-equivalent at all — see
-tools/jenkins_rest.py for a direct-REST fallback in case it doesn't.
+Tool permissions are written out as explicit, exact tool names rather
+than a `jenkins_*` wildcard. That wildcard was the original design and it
+was actively wrong: opencode prefixes a remote MCP server's tools with
+the server's config key (`_MCP_SERVER_NAME` below), so `jenkins_*`
+matches the plugin's 15 read-only tools exactly as well as its 4 mutating
+ones — it denied the read agent everything and left it unable to call
+Jenkins at all. See docs/MEMORY.md, 2026-09-28. Naming the four mutating
+tools is also strictly safer than a wildcard in the other direction: with
+opencode's `--auto` auto-approving anything not explicitly denied, a
+wildcard that stops matching (a renamed server key, a future opencode
+naming change) silently denies nothing, while an exact name that stops
+matching denies nothing but also grants nothing.
+
+The plugin has no stop/cancel tool — see `_MUTATING_TOOLS` — which is why
+tools/jenkins_rest.py keeps a direct-REST `stop_build` fallback.
 """
 
 import json
@@ -47,22 +55,61 @@ def _no_delegation_tools() -> dict[str, bool]:
     return {"task": False}
 
 
+# The key this server is registered under in `write_config`'s `mcp` block.
+# opencode prefixes a remote MCP server's tools with it (documented at
+# https://opencode.ai/docs/mcp-servers: "MCP server tools are registered
+# with server name as prefix"), so it is also the prefix every permission
+# entry below has to use. Kept as one constant precisely so renaming the
+# server cannot silently detach the permissions from the tools.
+_MCP_SERVER_NAME = "jenkins"
+
+# The Jenkins MCP Server plugin's complete set of non-read-only tools, from
+# its own `readOnlyHint`/`destructiveHint` annotations over a live
+# `tools/list` call (19 tools, 15 read-only) — see docs/MEMORY.md,
+# 2026-09-18 and 2026-09-28. `replayBuild` is the one worth naming twice:
+# its required `mainScript` argument is arbitrary Pipeline Groovy, executed
+# on the controller, so it is a code-execution tool wearing a build's
+# clothes. There is deliberately no stop/cancel entry here because the
+# plugin exposes none.
+_MUTATING_TOOLS = ("triggerBuild", "updateBuild", "rebuildBuild", "replayBuild")
+
+
+def _jenkins_tools(**overrides: bool) -> dict[str, bool]:
+    """Every mutating Jenkins tool denied by exact name, with any named
+    tool re-allowed. Read-only tools are left unmentioned on purpose: an
+    entry for each would have to be updated whenever the plugin adds one,
+    and a forgotten entry there costs a capability its data. Forgetting an
+    entry *here* is the failure worth engineering against, and the list it
+    comes from is fixed by the plugin, not by us."""
+    tools = {f"{_MCP_SERVER_NAME}_{name}": False for name in _MUTATING_TOOLS}
+    tools.update({f"{_MCP_SERVER_NAME}_{name}": v for name, v in overrides.items()})
+    return tools
+
+
 _AGENT_DEFS = {
     "ari-jenkins-read": {
         "description": "Resolves targets, inspects status, diagnoses failures, and proposes actions "
         "against Jenkins. Read-only — cannot call a mutating Jenkins tool.",
         "mode": "primary",
         "permission": {"edit": "deny", "bash": "deny", "webfetch": "deny"},
-        # jenkins_*: False is the belt; execute_action being the only
-        # capability mapped to ari-jenkins-act (below) is the suspenders.
-        "tools": {**_no_delegation_tools(), "jenkins_*": False},
+        # Denying the mutating tools by name is the belt; execute_action
+        # being the only capability mapped to ari-jenkins-act (below) is
+        # the suspenders. The read-only tools must stay reachable — this
+        # agent has no other way to see Jenkins at all.
+        "tools": {**_no_delegation_tools(), **_jenkins_tools()},
     },
     "ari-jenkins-act": {
-        "description": "The only agent allowed to call a mutating Jenkins tool (trigger/stop a build). "
-        "Runs strictly from a confirmed pending_action — see capabilities/execute_action.py.",
+        "description": "The only agent allowed to trigger a Jenkins build. Runs strictly from a "
+        "confirmed pending_action — see capabilities/execute_action.py.",
         "mode": "primary",
         "permission": {"edit": "deny", "bash": "deny", "webfetch": "deny"},
-        "tools": {**_no_delegation_tools(), "jenkins_*": True},
+        # Only the one mutation execute_action actually performs. The other
+        # three stay denied: nothing in this agent kind proposes them, and
+        # `replayBuild` in particular would hand a confirmed pending_action
+        # a route to arbitrary Groovy on the controller. Stopping a build
+        # does not appear here at all — that path is jenkins_rest.stop_build,
+        # because the plugin has no stop tool to allow.
+        "tools": {**_no_delegation_tools(), **_jenkins_tools(triggerBuild=True)},
     },
 }
 
@@ -107,7 +154,12 @@ def write_config(workdir: str, llm: dict, jenkins: dict) -> str:
     config: dict[str, Any] = {
         "$schema": "https://opencode.ai/config.json",
         "provider": {llm["provider"]: {"options": {"apiKey": llm["api_key"]}}},
-        "tools": {"jenkins_*": False, "task": False},
+        # Defence in depth under the per-agent blocks: same exact-name
+        # denies, so a capability that reaches opencode without a resolved
+        # agent still cannot mutate Jenkins. This must not be a wildcard —
+        # a global `jenkins_*: False` overrides nothing but shadows
+        # everything, which is the bug fixed on 2026-09-28.
+        "tools": {"task": False, **_jenkins_tools()},
         "agent": _AGENT_DEFS,
         "mcp": {
             "jenkins": {

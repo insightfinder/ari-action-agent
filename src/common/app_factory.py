@@ -35,7 +35,14 @@ def create_app() -> FastAPI:
     task_store = InMemoryTaskStore()
     push_config_store = InMemoryPushNotificationConfigStore()
     push_sender = BasePushNotificationSender(
-        httpx_client=httpx.AsyncClient(timeout=30),
+        # The A2A SDK owns the send loop here, so `common.http_retry`
+        # can't wrap the call — but the transport can still absorb the
+        # failure mode that matters for a webhook to a caller's endpoint:
+        # a connection reset or refused connect while that caller is
+        # rolling its pods. `retries` covers connection establishment
+        # only, not a 5xx, which is the most this layer can do without
+        # re-implementing the SDK's sender.
+        httpx_client=httpx.AsyncClient(timeout=30, transport=httpx.AsyncHTTPTransport(retries=3)),
         config_store=push_config_store,
     )
 
