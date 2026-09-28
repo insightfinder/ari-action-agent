@@ -6,7 +6,6 @@ on:
       - main
       - staging
       - test
-      - code-analysis-agent
 
 jobs:
   build-and-push:
@@ -14,15 +13,18 @@ jobs:
     strategy:
       # One shared API image (Dockerfile.api — agent-kind-agnostic, see
       # docs/design.md §7) plus one worker image per agent kind. These
-      # names must match the Helm chart's own ariOncallAgent.api.image /
-      # .worker.image repository values exactly (charts/oncallari/
-      # values.yaml) — update both together if either changes.
+      # three names must match the Helm chart's own
+      # ariOncallAgent.api.image / .worker.image / ariJenkinsAgent.*
+      # repository values exactly (charts/oncallari/values.yaml) — update
+      # both together if either changes.
       matrix:
         include:
           - dockerfile: Dockerfile.api
             image: docker.io/insightfinderinc/ari-agent-api
           - dockerfile: Dockerfile.oncall
             image: docker.io/insightfinderinc/ari-oncall-agent-worker
+          - dockerfile: Dockerfile.jenkins
+            image: docker.io/insightfinderinc/ari-jenkins-agent-worker
       fail-fast: false
     env:
       IMAGE_NAME: ${{ matrix.image }}

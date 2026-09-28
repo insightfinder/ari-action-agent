@@ -26,6 +26,7 @@ from .settings import get_settings
 # cost as registering a new capability or tool.
 _AGENT_PACKAGES = {
     "oncall": "ari_oncall_agent",
+    "jenkins": "jenkins_agent",
 }
 
 

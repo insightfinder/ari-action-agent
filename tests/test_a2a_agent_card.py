@@ -46,8 +46,12 @@ def test_agent_card_has_the_code_analysis_fix_skill():
 
 def test_agent_card_switches_content_by_agent_kind():
     oncall_card = build_agent_card(Settings(agent_kind="oncall"))
+    jenkins_card = build_agent_card(Settings(agent_kind="jenkins"))
 
     assert {s.id for s in oncall_card.skills} == {"code_analysis_fix"}
+    assert {s.id for s in jenkins_card.skills} == {"jenkins_read_diagnose_act"}
+    assert oncall_card.description != jenkins_card.description
+    assert "jenkins" in jenkins_card.description.lower()
 
 
 def test_agent_card_defaults_to_oncall_for_an_unknown_agent_kind():

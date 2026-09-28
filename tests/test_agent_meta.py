@@ -6,10 +6,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from common.agent_meta import get_agent_meta  # noqa: E402
 
 
-def test_oncall_resolves_to_real_metadata():
+def test_oncall_and_jenkins_resolve_to_different_real_metadata():
     oncall = get_agent_meta("oncall")
+    jenkins = get_agent_meta("jenkins")
 
     assert oncall.skill.id == "code_analysis_fix"
+    assert jenkins.skill.id == "jenkins_read_diagnose_act"
+    assert oncall.description != jenkins.description
+    assert oncall.planner_fallback_steps != jenkins.planner_fallback_steps
+    assert oncall.artifacts != jenkins.artifacts
 
 
 def test_unknown_agent_kind_falls_back_to_oncall():
@@ -25,7 +30,7 @@ def test_fallback_steps_only_name_capabilities_that_kind_actually_has():
     import common.capabilities_registry as capabilities_registry
     from common.settings import get_settings
 
-    for kind in ("oncall",):
+    for kind in ("oncall", "jenkins"):
         os.environ["AGENT_KIND"] = kind
         get_settings.cache_clear()
         capabilities_registry._load_specs.cache_clear()
