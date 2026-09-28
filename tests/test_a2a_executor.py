@@ -8,12 +8,13 @@ from google.protobuf.struct_pb2 import Value
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from a2a.types import Message, Part, Role, Task, TaskState, TaskStatus  # noqa: E402
+from a2a.types import Artifact, Message, Part, Role, Task, TaskState, TaskStatus  # noqa: E402
 
-from ari_agent.a2a_server.executor import (  # noqa: E402
+from common.a2a_server.executor import (  # noqa: E402
     _dict_to_part,
     _extract_config,
     _extract_history,
+    _find_pending_action,
     _publish_result,
 )
 
@@ -85,6 +86,38 @@ def test_dict_to_part_round_trips():
     assert json_format.MessageToDict(part.data) == {"url": "https://github.com/x/y/pull/1", "branch": "b"}
 
 
+def _task_with_artifact(artifact_id: str, data: dict) -> Task:
+    return Task(
+        id="t1",
+        context_id="c1",
+        status=TaskStatus(state=TaskState.TASK_STATE_INPUT_REQUIRED),
+        artifacts=[Artifact(artifact_id=artifact_id, name="pending_action", parts=[_dict_to_part(data)])],
+    )
+
+
+def test_find_pending_action_matches_by_id_from_the_tasks_own_artifacts():
+    # Deterministic, no LLM: this is the resume mechanism's whole point --
+    # verified live against a2a-sdk 1.1.2 that a paused task's artifacts
+    # really do come back on a follow-up call for the same task_id.
+    task = _task_with_artifact("a1", {"id": "b2c1", "action": "trigger_build", "job": "deploy/checkout-service"})
+
+    found = _find_pending_action(task, "b2c1")
+
+    assert found == {"id": "b2c1", "action": "trigger_build", "job": "deploy/checkout-service"}
+
+
+def test_find_pending_action_returns_none_for_a_non_matching_id():
+    task = _task_with_artifact("a1", {"id": "b2c1", "action": "trigger_build"})
+
+    assert _find_pending_action(task, "some-other-id") is None
+
+
+def test_find_pending_action_returns_none_when_there_is_no_current_task():
+    # The case where a caller sends confirm_pending_action against a
+    # brand-new task_id with no prior turn at all.
+    assert _find_pending_action(None, "b2c1") is None
+
+
 @pytest.mark.asyncio
 async def test_publish_result_completed_with_pr_and_root_cause():
     updater = MagicMock()
@@ -96,7 +129,7 @@ async def test_publish_result_completed_with_pr_and_root_cause():
         "status": "completed",
         "message": "Opened PR #1",
         "root_cause": {"summary": "npe", "evidence": []},
-        "pr": {"url": "https://github.com/x/y/pull/1", "branch": "ari/fix-1"},
+        "pull_request": {"url": "https://github.com/x/y/pull/1", "branch": "ari/fix-1"},
     }
 
     await _publish_result(updater, result)

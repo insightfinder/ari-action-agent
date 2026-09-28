@@ -1,42 +1,42 @@
 import json
-import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent.tools.opencode_cli import (  # noqa: E402
+import ari_oncall_agent.protected_branches as protected_branches_module  # noqa: E402
+import ari_oncall_agent.tools.opencode_cli as opencode_cli  # noqa: E402
+from ari_oncall_agent.tools.opencode_cli import (  # noqa: E402
     _AGENT_DEFS,
+    _protected_branch_push_denies,
     CAPABILITY_AGENTS,
-    _build_trace,
-    _parse_events,
-    merge_traces,
+    run_opencode,
     write_config,
 )
 
-# Captured verbatim (minus the huge nested responseHeaders blob) from a live
-# `opencode run --format json` invocation against a real opencode v1.18.31
-# binary with a deliberately invalid OpenAI key — see tools/opencode_cli.py's
-# module docstring. This is the actual shape opencode emits on stdout for a
-# fatal error; stderr was empty for the same run.
-REAL_ERROR_EVENT_LINE = json.dumps(
-    {
-        "type": "error",
-        "timestamp": 1789502353830,
-        "sessionID": "ses_f59591234ffekY85D1lYOz6MEt",
-        "error": {
-            "name": "APIError",
-            "data": {
-                "message": (
-                    "Incorrect API key provided: sk-bogus*****-key. You can find your "
-                    "API key at https://platform.openai.com/account/api-keys."
-                ),
-                "statusCode": 401,
-                "isRetryable": False,
-            },
-        },
-    }
-)
+
+@pytest.fixture
+def isolated_protected_branches_config(tmp_path, monkeypatch):
+    """Points protected_branches.py's loader at a throwaway config instead
+    of the real configs/oncall/protected_branches.yaml — some tests need
+    to assert on an *unconfigured* repo getting exactly the defaults and
+    nothing more, which would otherwise be at the mercy of whatever an
+    operator has since added to that shared, editable file."""
+    path = tmp_path / "protected_branches.yaml"
+    path.write_text("default_protected_branches: [main, master]\nprotected_branches: {}\n")
+    monkeypatch.setattr(protected_branches_module, "config_file", lambda name: path)
+    protected_branches_module._load.cache_clear()
+    yield
+    protected_branches_module._load.cache_clear()
+
+# From configs/oncall/protected_branches.yaml -- a real configured repo,
+# not a fixture, since these tests exercise the actual blacklist.
+_PROTECTED_REPO = {"url": "https://github.com/insightfinder/InfrastructureCore", "pat": "ghp_x"}
 
 
 def test_agent_defs_all_use_primary_mode():
@@ -51,47 +51,6 @@ def test_agent_defs_all_use_primary_mode():
 
 def test_capability_agent_mapping_covers_every_defined_agent():
     assert set(CAPABILITY_AGENTS.values()) == set(_AGENT_DEFS.keys())
-
-
-def test_parse_events_extracts_real_fatal_error_from_stdout():
-    result = _parse_events(REAL_ERROR_EVENT_LINE.encode())
-    assert result["error"] is not None
-    assert "Incorrect API key" in result["error"]
-    assert result["text"] == ""
-
-
-def test_parse_events_concatenates_text_parts():
-    events = [
-        {"type": "text", "text": "root cause: "},
-        {"type": "step-start"},
-        {"type": "text", "text": "null pointer in foo.py:42"},
-    ]
-    raw = "\n".join(json.dumps(e) for e in events).encode()
-    result = _parse_events(raw)
-    assert result["text"] == "root cause: \nnull pointer in foo.py:42"
-    assert result["error"] is None
-
-
-def test_parse_events_extracts_tool_calls():
-    events = [
-        {
-            "type": "tool",
-            "tool": "github_create_pull_request",
-            "callID": "call_1",
-            "state": {"status": "completed", "input": {"title": "fix"}, "output": {"html_url": "https://github.com/x/y/pull/9"}},
-        }
-    ]
-    raw = "\n".join(json.dumps(e) for e in events).encode()
-    result = _parse_events(raw)
-    assert len(result["tool_calls"]) == 1
-    assert result["tool_calls"][0]["tool"] == "github_create_pull_request"
-    assert result["tool_calls"][0]["output"]["html_url"].endswith("/pull/9")
-
-
-def test_parse_events_skips_unparseable_lines_without_raising():
-    raw = b"not json\n{\"type\": \"text\", \"text\": \"ok\"}\n\n"
-    result = _parse_events(raw)
-    assert result["text"] == "ok"
 
 
 def test_write_config_includes_mcp_only_when_pat_present(tmp_path):
@@ -140,70 +99,175 @@ def test_write_config_disables_task_tool_globally_too(tmp_path):
     assert cfg["tools"]["task"] is False
 
 
-def test_build_trace_counts_tools_and_finds_the_biggest_gap():
-    # This is the exact signal that used to require a one-off manual
-    # reproduction to find (docs/MEMORY.md, 2026-09-17: "4 delegated task
-    # calls ate 68% of one run") — now computed automatically from
-    # opencode's own event timestamps on every real call.
-    events = [
-        {"type": "step-start", "timestamp": 1000},
-        {"type": "tool", "tool": "read", "timestamp": 1200, "state": {"status": "completed"}},
-        {"type": "tool", "tool": "read", "timestamp": 1500, "state": {"status": "completed"}},
-        {"type": "tool", "tool": "task", "timestamp": 8000, "state": {"status": "completed"}},
-    ]
+@pytest.mark.asyncio
+async def test_run_opencode_points_verify_at_the_shared_build_cache_home(monkeypatch):
+    # verify's bash commands (mvn/go/npm) need a persistent, shared HOME
+    # so their dependency caches survive across requests — see
+    # build_cache.py/settings.build_cache_root. Regression coverage for
+    # the live finding that verify had zero dependency caching, making it
+    # slow enough to routinely outlast callers' own patience timeouts.
+    @asynccontextmanager
+    async def fake_reserve_build_cache_home():
+        yield "/fake/build-cache"
 
-    trace = _build_trace(events, wall_elapsed_s=12.3)
+    monkeypatch.setattr(opencode_cli, "reserve_build_cache_home", fake_reserve_build_cache_home)
+    fake_run_opencode = AsyncMock(return_value={"text": "ok", "trace": {}})
+    monkeypatch.setattr(opencode_cli, "_run_opencode", fake_run_opencode)
 
-    assert trace["elapsed_s"] == 12.3
-    assert trace["tool_call_counts"] == {"read": 2, "task": 1}
-    assert trace["tool_call_total"] == 3
-    assert trace["slowest_gaps"][0] == {"tool": "task", "at_s": 7.0, "preceded_by_gap_s": 6.5}
+    ctx = SimpleNamespace(capability="verify")
+    await run_opencode(ctx, "run the test suite")
 
-
-def test_build_trace_handles_no_tool_calls():
-    events = [{"type": "step-start", "timestamp": 1000}, {"type": "text", "timestamp": 1050, "text": "done"}]
-
-    trace = _build_trace(events, wall_elapsed_s=1.0)
-
-    assert trace["tool_call_counts"] == {}
-    assert trace["tool_call_total"] == 0
-    assert trace["slowest_gaps"] == []
+    fake_run_opencode.assert_awaited_once()
+    _, kwargs = fake_run_opencode.await_args
+    assert kwargs["extra_env"] == {"HOME": "/fake/build-cache"}
 
 
-def test_merge_traces_combines_elapsed_counts_and_top_gaps():
-    first = {
-        "elapsed_s": 5.0,
-        "tool_call_counts": {"read": 2},
-        "tool_call_total": 2,
-        "slowest_gaps": [{"tool": "read", "at_s": 1.0, "preceded_by_gap_s": 3.0}],
-    }
-    second = {
-        "elapsed_s": 2.5,
-        "tool_call_counts": {"read": 1, "edit": 1},
-        "tool_call_total": 2,
-        "slowest_gaps": [{"tool": "edit", "at_s": 0.5, "preceded_by_gap_s": 1.0}],
-    }
+@pytest.mark.asyncio
+async def test_run_opencode_leaves_home_untouched_for_other_capabilities(monkeypatch):
+    # Only verify shells out to build tooling — generate_change/publish_pr
+    # have no business sharing state through a real $HOME (and opencode's
+    # own state is isolated separately, per-request, in
+    # opencode_runtime.py). The build-cache reservation (with its own
+    # eviction sweep + lock acquisition) must not even be entered for them.
+    def fail_if_called():
+        raise AssertionError("reserve_build_cache_home must not be used outside verify")
 
-    merged = merge_traces(first, second)
+    monkeypatch.setattr(opencode_cli, "reserve_build_cache_home", fail_if_called)
+    fake_run_opencode = AsyncMock(return_value={"text": "ok", "trace": {}})
+    monkeypatch.setattr(opencode_cli, "_run_opencode", fake_run_opencode)
 
-    assert merged["elapsed_s"] == 7.5
-    assert merged["tool_call_counts"] == {"read": 3, "edit": 1}
-    assert merged["tool_call_total"] == 4
-    assert merged["slowest_gaps"][0]["preceded_by_gap_s"] == 3.0
+    ctx = SimpleNamespace(capability="generate_change")
+    await run_opencode(ctx, "investigate and edit")
+
+    _, kwargs = fake_run_opencode.await_args
+    assert kwargs.get("extra_env") is None
 
 
-def test_ari_analyze_and_ari_change_cannot_commit_or_push():
+def test_ari_verify_denies_git_push_unconditionally():
+    # verify has no legitimate reason to push anything, ever, regardless
+    # of branch -- unconditional, not tied to protected_branches.yaml,
+    # since its bash is otherwise fully open for arbitrary build tooling.
+    bash_perms = _AGENT_DEFS["ari-verify"]["permission"]["bash"]
+    assert bash_perms["git push*"] == "deny"
+    assert bash_perms["*"] == "allow"
+
+
+def test_protected_branch_push_denies_covers_common_push_forms():
+    denies = _protected_branch_push_denies(_PROTECTED_REPO["url"])
+
+    assert denies["git push origin dev*"] == "deny"
+    assert denies["git push origin staging*"] == "deny"
+    assert denies["git push origin test*"] == "deny"
+    assert denies["git push origin HEAD:dev*"] == "deny"
+    assert denies["git push --force origin dev*"] == "deny"
+    assert denies["git push origin dev:dev*"] == "deny"
+    # main/master come from default_protected_branches (protected_branches.py)
+    # and apply to every repo -- must be included here too, on top of this
+    # repo's own dev/staging/test entry.
+    assert denies["git push origin main*"] == "deny"
+    assert denies["git push origin master*"] == "deny"
+
+
+def test_protected_branch_push_denies_still_covers_main_and_master_for_an_unconfigured_repo(
+    isolated_protected_branches_config,
+):
+    # No entry under protected_branches: at all -- main/master are still
+    # denied by default (protected_branches.py's default_protected_branches).
+    # Isolated config so this doesn't depend on whatever an operator has
+    # since added to the real configs/oncall/protected_branches.yaml.
+    denies = _protected_branch_push_denies("https://github.com/some-org/unrelated-repo")
+
+    assert denies["git push origin main*"] == "deny"
+    assert denies["git push origin master*"] == "deny"
+    assert not any("dev" in pattern or "staging" in pattern for pattern in denies)
+
+
+def test_write_config_adds_protected_branch_denies_for_a_configured_repo(tmp_path):
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+
+    path = write_config(str(tmp_path), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, _PROTECTED_REPO)
+
+    cfg = json.loads(Path(path).read_text())
+    publish_bash = cfg["agent"]["ari-publish"]["permission"]["bash"]
+    assert publish_bash["git push origin dev*"] == "deny"
+    assert publish_bash["git push origin staging*"] == "deny"
+    assert publish_bash["git push origin test*"] == "deny"
+    # The blanket allow (needed to push a fresh ari/... branch) is still
+    # there -- only the specific protected-branch forms are denied.
+    assert publish_bash["git *"] == "allow"
+    # Every other agent is untouched by this repo-specific patch.
+    assert cfg["agent"]["ari-change"]["permission"]["bash"] == _AGENT_DEFS["ari-change"]["permission"]["bash"]
+
+
+def test_write_config_still_denies_main_and_master_for_a_repo_with_no_own_entry(
+    tmp_path, isolated_protected_branches_config
+):
+    # main/master are protected for every repo by default (see
+    # protected_branches.py) — a repo with no entry of its own under
+    # protected_branches: still must not get the untouched, unpatched
+    # default bash permission. Isolated config (main/master only, no
+    # per-repo entries) so this doesn't depend on whatever an operator has
+    # since added to the real configs/oncall/protected_branches.yaml.
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+
+    path = write_config(
+        str(tmp_path), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, {"url": "https://github.com/x/y", "pat": "t"}
+    )
+
+    cfg = json.loads(Path(path).read_text())
+    publish_bash = cfg["agent"]["ari-publish"]["permission"]["bash"]
+    assert publish_bash != _AGENT_DEFS["ari-publish"]["permission"]["bash"]
+    assert publish_bash["git push origin main*"] == "deny"
+    assert publish_bash["git push origin master*"] == "deny"
+    assert not any("dev" in pattern or "staging" in pattern for pattern in publish_bash)
+
+
+def test_write_config_never_leaks_one_repos_denies_into_anothers(tmp_path, monkeypatch):
+    # A repo with its own extra protected branch, called first, must not
+    # leak those denies into a later call for an unrelated repo (a
+    # shared-mutable-dict bug would do exactly this). Isolated config with
+    # an explicit per-repo entry, so the "no leak" assertion is actually
+    # meaningful rather than trivially true.
+    config_path = tmp_path / "protected_branches.yaml"
+    config_path.write_text(
+        "default_protected_branches: [main, master]\n"
+        "protected_branches:\n"
+        "  https://github.com/insightfinder/InfrastructureCore: [canary]\n"
+    )
+    monkeypatch.setattr(protected_branches_module, "config_file", lambda name: config_path)
+    protected_branches_module._load.cache_clear()
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git" / "info").mkdir(parents=True)
+    try:
+        write_config(
+            str(repo_dir),
+            {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"},
+            {"url": "https://github.com/insightfinder/InfrastructureCore", "pat": "ghp_x"},
+        )
+        path = write_config(
+            str(repo_dir), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, {"url": "https://github.com/x/y", "pat": "t"}
+        )
+
+        cfg = json.loads(Path(path).read_text())
+        publish_bash = cfg["agent"]["ari-publish"]["permission"]["bash"]
+        assert not any("canary" in pattern for pattern in publish_bash)
+        assert publish_bash["git push origin main*"] == "deny"
+    finally:
+        protected_branches_module._load.cache_clear()
+
+
+def test_ari_change_cannot_commit_or_push():
     # Only ari-publish should be able to mutate git state (commit/push/
-    # branch) — analyze is read-only by design, and change's job is
-    # editing files, not staging/committing them (that's publish_pr's
-    # instruction to ari-publish: "Stage and commit exactly these files").
-    for name in ("ari-analyze", "ari-change"):
-        bash_perms = _AGENT_DEFS[name]["permission"]["bash"]
-        assert "git *" not in bash_perms, f"{name} must not have blanket git access"
-        assert bash_perms["*"] == "deny"
-        # Only read-only git subcommands may be allowed.
-        for pattern, mode in bash_perms.items():
-            if pattern == "*":
-                continue
-            assert mode == "allow"
-            assert pattern.split()[1].rstrip("*") in {"diff", "status", "log", "show", "blame"}
+    # branch) — ari-change's job is investigating and editing files, not
+    # staging/committing them (that's publish_pr's instruction to
+    # ari-publish: "Stage and commit exactly these files").
+    bash_perms = _AGENT_DEFS["ari-change"]["permission"]["bash"]
+    assert "git *" not in bash_perms, "ari-change must not have blanket git access"
+    assert bash_perms["*"] == "deny"
+    # Only read-only git subcommands may be allowed.
+    for pattern, mode in bash_perms.items():
+        if pattern == "*":
+            continue
+        assert mode == "allow"
+        assert pattern.split()[1].rstrip("*") in {"diff", "status", "log", "show", "blame"}

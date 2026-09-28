@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_agent.api.schemas import RequestConfig  # noqa: E402
+from ari_oncall_agent.schemas import RequestConfig  # noqa: E402
 
 
 def test_request_config_parses_sample_payload():
