@@ -12,10 +12,16 @@ guard in case the planner includes a step it shouldn't have.
 
 import json
 
+import structlog
+from pydantic import ValidationError
+
 from common.agent_meta import get_agent_meta
 from common.capabilities_registry import catalog
 from common.llm.client import complete
+from common.llm_json import extract
 from common.models.plan import Plan
+
+logger = structlog.get_logger()
 
 _SHARED_TEMPLATE = """You are the planning stage of an autonomous {description}. \
 Given a user's prompt (and, for a multi-turn chat, prior conversation history) \
@@ -49,17 +55,52 @@ async def create_plan(prompt: str, config: dict, history: list[dict] | None = No
     )
 
     raw = await complete(config["llm"], system_prompt, user_prompt)
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # Fall back to this agent kind's own default pipeline rather than
-        # failing the request outright — a malformed planner response
-        # shouldn't be fatal. Real capabilities from *this agent's own*
-        # catalog (see agent_meta.py) — a different agent kind's fallback
-        # would reference capabilities that don't exist in this one's
-        # registry at all and fail immediately.
-        data = {
+    plan = _parse(raw)
+    if plan is not None:
+        return plan
+
+    # Fall back to this agent kind's own default pipeline rather than
+    # failing the request outright — an unusable planner response
+    # shouldn't be fatal. Real capabilities from *this agent's own*
+    # catalog (see agent_meta.py) — a different agent kind's fallback
+    # would reference capabilities that don't exist in this one's
+    # registry at all and fail immediately.
+    #
+    # Logged, and loudly, because this degrades silently by design: the
+    # fallback is a plan, so the run completes and `respond` writes a
+    # confident answer about a pipeline that never ran what the user
+    # asked for. On 2026-10-05 that cost a live stg investigation (see
+    # docs/MEMORY.md) and the raw response was unrecoverable afterwards,
+    # because this branch used to discard it.
+    logger.warning(
+        "planner_output_unusable",
+        fallback=[step.get("capability") for step in meta.planner_fallback_steps],
+        raw=raw[:4000],
+    )
+    return Plan.model_validate(
+        {
             "steps": meta.planner_fallback_steps,
-            "rationale": "planner output was not valid JSON; used default pipeline",
+            "rationale": "planner output was not a usable plan; used default pipeline",
         }
-    return Plan.model_validate(data)
+    )
+
+
+def _parse(raw: str) -> Plan | None:
+    """The model's answer as a Plan, or None if it is not one.
+
+    Two separate failures, both of which used to end the same way. A
+    model that wraps its object in a ```json fence or a sentence of
+    preamble is answering correctly in bad packaging — `extract` reads
+    through that, where `json.loads` could not. A model that returns
+    well-formed JSON of the wrong shape is not answering at all, and used
+    to raise straight out of `create_plan` and fail the activity; it now
+    falls back like any other unusable response.
+    """
+    try:
+        data = extract(raw)
+    except RuntimeError:
+        return None
+    try:
+        return Plan.model_validate(data)
+    except ValidationError:
+        return None
