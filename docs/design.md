@@ -398,9 +398,8 @@ the on-call agent's `generate_change`) → `propose_action` (resolves a
 requested change into a `pending_action`, never executes) → `execute_action`
 (the only capability allowed to actually trigger or stop a build).
 
-**The confirm-before-execute gate is enforced at least twice,
-independently, for every action — and a third time, specifically for
-`trigger_build`:**
+**The confirm-before-execute gate is enforced three times,
+independently, for every action the agent can propose:**
 
 1. **Structurally, in opencode's own permission scoping.** Every
    capability except `execute_action` runs as the `ari-jenkins-read`
@@ -411,15 +410,11 @@ independently, for every action — and a third time, specifically for
 2. **Structurally, in `execute_action.py`'s own code.** It refuses to run
    at all unless `ctx.params` already carries a concrete, non-stale
    (< 30 minutes old) confirmed `action`/`job`/`parameters` — never
-   inferred from a bare "yes". For `stop_build`, carrying a prior
-   `propose_action`'s exact `pending_action` fields into a later
-   confirmation turn's params is the planner's job (its domain guidance
-   says so explicitly) — a conversational "yes, go ahead" is enough, same
-   as it always was; if there's nothing concrete to confirm,
+   inferred from a bare "yes". If there's nothing concrete to confirm,
    `execute_action` should never have been scheduled, and it fails loudly
    rather than guessing.
-3. **For `trigger_build` only — a hard, protocol-level gate, not an LLM's
-   inference.** `propose_action` flags a `trigger_build` proposal with
+3. **A hard, protocol-level gate, not an LLM's inference.**
+   `propose_action` flags every proposal with
    `requires_approval: true`; `orchestration/workflow.py`'s step loop
    turns that into `status: "needs_approval"`, which
    `a2a_server/executor.py` maps onto the real A2A `TASK_STATE_

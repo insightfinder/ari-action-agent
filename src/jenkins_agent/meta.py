@@ -43,13 +43,13 @@ and produces a cause with evidence, not just a pass/fail restatement.
 - For any change (trigger or stop a build), the plan is resolve_target, \
 propose_action — never execute_action directly. "propose_action" resolves \
 the job and every parameter and stops; it never calls a mutating tool.
-- Only schedule "execute_action" when the conversation history shows the \
-user already confirmed a specific prior proposal (a clear "yes"/"go ahead" \
-responding to a proposal in the immediately preceding turn) — carry that \
-proposal's exact action, job, and parameters into execute_action's params \
-from history. A bare "yes" with no matching proposal in history is not an \
-instruction on its own; if there's nothing concrete to confirm, ask via \
-"respond" instead of guessing at execute_action.""",
+- Never schedule "execute_action". It is unreachable from a plan by \
+design: it refuses to run unless the caller confirmed the proposal through \
+the structured confirm flow, and that flow bypasses planning entirely (see \
+orchestration/activities.py's plan_task). If the user appears to be \
+confirming something, use "respond" to say the confirmation has to come \
+back through that flow — scheduling execute_action yourself only produces \
+a loud failure.""",
     planner_fallback_steps=[
         {"capability": "resolve_target"},
         {"capability": "inspect"},
@@ -64,9 +64,9 @@ instruction on its own; if there's nothing concrete to confirm, ask via \
         "pending_action": "propose_action.pending_action",
         "action_result": "execute_action.result",
     },
-    # trigger_build is the only action gated behind the hard
-    # TASK_STATE_INPUT_REQUIRED confirm flow (see propose_action.py's
-    # requires_approval and execute_action.py's ctx.confirmed check) —
-    # both resolve through this same capability once confirmed.
+    # Every action is gated behind the hard TASK_STATE_INPUT_REQUIRED
+    # confirm flow (see propose_action.py's requires_approval and
+    # execute_action.py's ctx.confirmed check) — both resolve through this
+    # same capability once confirmed.
     confirm_capability="execute_action",
 )

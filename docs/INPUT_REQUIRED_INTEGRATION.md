@@ -7,11 +7,12 @@ explains *why* this exists and how it's built; this doc is the
 integration contract — what you will see on the wire, and exactly what
 to send back.
 
-**Scope today: only the Jenkins agent's `trigger_build` action uses
-this.** Every other action (`stop_build`, the on-call agent's whole
-pipeline) never produces `TASK_STATE_INPUT_REQUIRED` — see the
-[comparison table](#trigger_build-vs-everything-else) at the end if
-you're integrating against both. Read `docs/DEVELOPER_GUIDE.md` first if
+**Scope today: every action the Jenkins agent proposes uses this** —
+`trigger_build` and `stop_build` alike (since 2026-09-30; see the
+[note on the old split](#why-this-covers-every-action) at the end). The
+on-call agent's pipeline never produces `TASK_STATE_INPUT_REQUIRED`, so if
+you integrate against both agents, expect the pause from the Jenkins one
+only. Read `docs/DEVELOPER_GUIDE.md` first if
 you haven't already — this doc assumes you know `message/send`, the
 three response patterns, and how multi-turn `context_id`/`task_id`
 continuation works.
@@ -258,13 +259,19 @@ a real paused task, so this shouldn't come up in normal use.
   will be refused, not silently re-open the proposal. Propose it again
   fresh if you change your mind, same as any other stale/resolved id.
 
-## `trigger_build` vs. everything else
+## Why this covers every action
 
-| | `trigger_build` | `stop_build` (and everything else) |
-|---|---|---|
-| Pause mechanism | Hard: real `TASK_STATE_INPUT_REQUIRED` | Soft: task completes normally, message asks for confirmation in plain language |
-| How you confirm | Structured `confirm_pending_action: {"id": ...}` field, same `task_id` | Plain "yes, go ahead" text, same `context_id` |
-| Who decides it's a confirmation | Deterministic server-side artifact lookup, no LLM | The planner's LLM, reading conversation history |
-| Free-text "yes" alone | Does nothing | Works, as it always has |
+`trigger_build` and `stop_build` behave identically: both pause at
+`TASK_STATE_INPUT_REQUIRED`, both are confirmed by the structured
+`confirm_pending_action` field on the same `task_id`, and for both a
+free-text "yes" alone does nothing.
 
-See `docs/design.md` §5b for why only `trigger_build` got the hard gate.
+It was not always so. `stop_build` originally completed its proposal
+instead of pausing, on the basis that the planner could recognise a
+conversational "yes, go ahead" in the same `context_id` from conversation
+history. That path was unreachable: a completed task cannot be continued
+(the SDK rejects it as terminal), and a fresh task in the same context
+arrives with empty history, because history is read from the *task*, not
+the context. So the softer flow could never fire, and it was replaced by
+the gate documented here rather than repaired. Verified end to end — see
+`docs/MEMORY.md`, 2026-09-30.

@@ -79,10 +79,18 @@ async def run(ctx: StepContext) -> dict:
         "jenkins_url": ctx.config["jenkins"]["base_url"],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    # trigger_build is the one action guarded by the hard
+    # Every proposed action is guarded by the hard
     # TASK_STATE_INPUT_REQUIRED confirm flow (see docs/design.md §5b) —
     # orchestration/workflow.py's step loop turns this into a genuine A2A
-    # pause, never a conversational "yes". stop_build keeps the existing
-    # softer flow unchanged.
-    requires_approval = pending_action["action"] == "trigger_build"
+    # pause, never a conversational "yes".
+    #
+    # This used to be `action == "trigger_build"`, leaving stop_build on a
+    # softer conversational flow. That flow could not run: a proposal that
+    # does not pause completes the task, a completed task cannot be
+    # continued (the SDK rejects it, "terminal state"), and a new task in
+    # the same context_id starts with empty history — so the planner had
+    # nothing to recognize a "yes, go ahead" against. Confirmed live
+    # 2026-09-30 (docs/MEMORY.md). One gate for both actions is also
+    # simply the smaller thing to reason about.
+    requires_approval = True
     return {"pending_action": pending_action, "requires_approval": requires_approval, "trace": result["trace"]}

@@ -4,15 +4,20 @@ Two independent layers make this safe, not one:
 1. Structural, in the tool registry / opencode permissions: only this
    capability runs as "ari-jenkins-act" (tools/opencode_cli.py), the only
    opencode agent with mutating `jenkins_*` MCP tools enabled at all.
-2. Structural, in this module's own code (`_require_confirmed_action`
-   below): refuses to run at all unless `ctx.params` already carries a
-   concrete, non-stale confirmed action — never inferred from a bare
-   "yes". The planner is responsible for carrying a prior propose_action's
-   exact `pending_action` fields into these params from conversation
-   history (common/planner.py's jenkins domain guidance says so
-   explicitly) — if there's nothing concrete there, this capability
-   should never have been scheduled, and it fails loudly rather than
-   guessing.
+2. Structural, in this module's own code: refuses to run at all unless
+   `ctx.params` already carries a concrete, non-stale confirmed action
+   (`_require_confirmed_action`) AND `ctx.confirmed` is set — the latter
+   only ever by a2a_server/executor.py's structured
+   `confirm_pending_action` resume, which is not reachable from anything
+   the planner can emit. A bare "yes, go ahead" therefore cannot execute
+   anything, for either action.
+
+   Both parts matter: the first rejects a confirmation with nothing
+   concrete behind it, the second rejects a concrete action that no
+   human confirmed through the protocol. Before 2026-09-30 only
+   `trigger_build` had the second check; `stop_build` relied on the
+   planner recognizing a conversational "yes" from history, a path that
+   turned out to be unreachable (see docs/MEMORY.md, 2026-09-30).
 
 Stopping a build goes through a direct REST call (tools/jenkins_rest.py),
 not opencode+MCP — the Jenkins MCP plugin's own documented tool list
@@ -66,18 +71,20 @@ async def run(ctx: StepContext) -> dict:
     confirmed = _require_confirmed_action(ctx)
     jenkins = ctx.config["jenkins"]
 
-    if confirmed["action"] == "trigger_build" and not ctx.confirmed:
-        # The hard gate: trigger_build may only run via a2a_server/
-        # executor.py's structured confirm_pending_action resume (which
-        # sets StepContext.confirmed via orchestration/activities.py's
-        # plan_task bypass branch), never via the planner's own inferred
-        # "yes, go ahead" scheduling of this step. ctx.confirmed is not
-        # reachable from ctx.params, so nothing in the planner's own JSON
-        # output can set it — see docs/design.md §5b.
+    if not ctx.confirmed:
+        # The hard gate, for every mutating action: this capability may
+        # only run via a2a_server/executor.py's structured
+        # confirm_pending_action resume (which sets StepContext.confirmed
+        # via orchestration/activities.py's plan_task bypass branch),
+        # never via the planner's own inferred "yes, go ahead" scheduling
+        # of this step. ctx.confirmed is not reachable from ctx.params, so
+        # nothing in the planner's own JSON output can set it — see
+        # docs/design.md §5b.
         raise RuntimeError(
-            "execute_action: trigger_build requires the structured confirm_pending_action "
-            "flow (a follow-up message/send confirming this task's pending_action id), not "
-            "a conversational reply. Propose it again and confirm via that flow."
+            f"execute_action: {confirmed['action']} requires the structured "
+            "confirm_pending_action flow (a follow-up message/send confirming this task's "
+            "pending_action id), not a conversational reply. Propose it again and confirm "
+            "via that flow."
         )
 
     if confirmed["action"] == "stop_build":

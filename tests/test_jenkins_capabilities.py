@@ -152,7 +152,12 @@ async def test_propose_action_flags_trigger_build_as_requiring_approval():
 
 
 @pytest.mark.asyncio
-async def test_propose_action_does_not_flag_stop_build_as_requiring_approval():
+async def test_propose_action_flags_stop_build_as_requiring_approval_too():
+    """Changed 2026-09-30. stop_build used to complete instead of pausing,
+    on the theory that a conversational "yes" could confirm it. It could
+    not: a completed task cannot be continued and a new task in the same
+    context starts with no history, so nothing could recognise the "yes".
+    Both actions now take the same hard gate."""
     opencode = AsyncMock(
         return_value={
             "text": (
@@ -166,7 +171,7 @@ async def test_propose_action_does_not_flag_stop_build_as_requiring_approval():
 
     result = await propose_action.run(ctx)
 
-    assert result["requires_approval"] is False
+    assert result["requires_approval"] is True
 
 
 @pytest.mark.asyncio
@@ -243,9 +248,10 @@ async def test_execute_action_refuses_trigger_build_without_the_structural_confi
 
 
 @pytest.mark.asyncio
-async def test_execute_action_stop_build_is_unaffected_by_the_confirmed_flag():
-    # "all other actions should be fine" -- stop_build must keep working
-    # exactly as before regardless of ctx.confirmed.
+async def test_execute_action_refuses_stop_build_without_the_structural_confirmed_flag():
+    # Same hard gate as trigger_build since 2026-09-30: well-formed params
+    # alone are not enough, because the planner can produce those from a
+    # conversational "yes" but cannot set ctx.confirmed.
     stop_build = AsyncMock()
     ctx = _ctx(
         "execute_action",
@@ -255,10 +261,44 @@ async def test_execute_action_stop_build_is_unaffected_by_the_confirmed_flag():
         confirmed=False,
     )
 
+    with pytest.raises(RuntimeError, match="requires the structured confirm_pending_action"):
+        await execute_action.run(ctx)
+    stop_build.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_action_stops_a_build_once_structurally_confirmed():
+    stop_build = AsyncMock()
+    ctx = _ctx(
+        "execute_action",
+        results={},
+        tools={"jenkins_stop_build": stop_build},
+        params={"action": "stop_build", "job": "deploy/checkout-service", "build_number": 42},
+        confirmed=True,
+    )
+
     result = await execute_action.run(ctx)
 
     stop_build.assert_awaited_once_with(_JENKINS_CONFIG, "deploy/checkout-service", 42)
     assert result["result"]["action"] == "stop_build"
+
+
+@pytest.mark.asyncio
+async def test_no_mutating_action_can_run_on_params_alone():
+    """The property the gate exists for, stated once over every action the
+    agent can propose: concrete params are never sufficient -- only the
+    structured confirm resume sets ctx.confirmed."""
+    for params in (
+        {"action": "trigger_build", "job": "deploy/checkout-service", "parameters": {"ENV": "staging"}},
+        {"action": "stop_build", "job": "deploy/checkout-service", "build_number": 42},
+    ):
+        tools = {"opencode_config": Mock(), "opencode": AsyncMock(), "jenkins_stop_build": AsyncMock()}
+        ctx = _ctx("execute_action", results={}, tools=tools, params=params, confirmed=False)
+        with pytest.raises(RuntimeError, match="requires the structured confirm_pending_action"):
+            await execute_action.run(ctx)
+        for tool in tools.values():
+            if isinstance(tool, AsyncMock):
+                tool.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -269,6 +309,7 @@ async def test_execute_action_stops_via_direct_rest_not_opencode():
         results={},
         tools={"jenkins_stop_build": stop_build},
         params={"action": "stop_build", "job": "deploy/checkout-service", "build_number": 42},
+        confirmed=True,
     )
 
     result = await execute_action.run(ctx)

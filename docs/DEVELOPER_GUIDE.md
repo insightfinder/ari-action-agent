@@ -373,13 +373,15 @@ carries a `pending_action` artifact:
 }
 ```
 
-**How you confirm it differs by action** (see `docs/design.md` §5b for
-the full three-layer gate):
+**Confirming is the same for every action** — both `trigger_build` and
+`stop_build` take the hard gate (see `docs/design.md` §5b). Until
+2026-09-30 `stop_build` was meant to be confirmable conversationally; that
+path could not run at all, so there is now one mechanism rather than two
+(see `docs/MEMORY.md`, 2026-09-30).
 
-- **`trigger_build`** — a hard gate, not a chat reply. The Task's status
-  is genuinely `TASK_STATE_INPUT_REQUIRED` (not `COMPLETED`) — this agent
-  *does* implement that state for this one action, unlike the on-call
-  agent (§3). See
+- **A hard gate, not a chat reply.** The Task's status is genuinely
+  `TASK_STATE_INPUT_REQUIRED` (not `COMPLETED`) — this agent *does*
+  implement that state, unlike the on-call agent (§3). See
   [`docs/INPUT_REQUIRED_INTEGRATION.md`](INPUT_REQUIRED_INTEGRATION.md)
   for the full integration contract (detecting it across all three
   response patterns, edge cases, a runnable snippet); summary: send a
@@ -392,15 +394,11 @@ the full three-layer gate):
   task — the server resolves it deterministically from the task's own
   history, never from an LLM's reading of a "yes." A wrong/stale/unknown
   id fails clearly rather than silently doing nothing. There is no
-  free-text way to confirm a `trigger_build` — a plain "yes, go ahead" on
-  its own does not execute it.
-- **`stop_build`** — unchanged, conversational. Send a follow-up
-  `message/send` in the same `context_id` with a plain "yes, go ahead"
-  reply; the planner reads history and, recognizing a confirmation of a
-  specific prior proposal, schedules `execute_action` with those exact
-  fields itself. A bare "yes" with no matching proposal in history does
-  nothing, and a confirmation more than 30 minutes after the proposal is
-  rejected as stale either way.
+  free-text way to confirm either action — a plain "yes, go ahead" on its
+  own does not execute anything.
+- **Staleness applies either way.** A confirmation more than 30 minutes
+  after the proposal is rejected; ask for the action again and confirm the
+  fresh proposal.
 
 Once genuinely confirmed, `execute_action` runs and the Task's status
 returns to a normal terminal state, carrying an `action_result` artifact

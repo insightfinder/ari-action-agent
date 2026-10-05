@@ -71,4 +71,14 @@ async def stop_build(jenkins: dict, job_full_name: str, build_number: int) -> No
             what=f"Jenkins API stop build {job_full_name}#{build_number}",
             headers=headers,
         )
-        resp.raise_for_status()
+        # Jenkins answers a *successful* /stop with a 302 back to the
+        # build page, not a 2xx. `raise_for_status()` raises on 3xx when
+        # redirects weren't followed, so it reported every successful stop
+        # as a failure — confirmed live 2026-09-30 against
+        # jenkins.insightfinder.com: the build went to ABORTED and this
+        # function raised `Redirect response '302 Found'` anyway. Only
+        # 4xx/5xx is a real failure here (a missing build is 404, a
+        # permission problem 403). Following the redirect instead would
+        # work too, at the cost of fetching a page of HTML nobody reads.
+        if resp.status_code >= 400:
+            resp.raise_for_status()

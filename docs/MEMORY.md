@@ -2506,3 +2506,232 @@ Jenkins — doing so means triggering a real build on a production
 controller, which is a decision, not a test step. The read path is proven
 end to end through the deployed agent; the write path is proven only in
 unit tests.
+
+## 2026-09-30 — `execute_action` finally proven: a real build triggered end to end, on a Jenkins job built for the purpose
+
+The 2026-09-28 entry closed the read path and said plainly that the write
+path was proven only in unit tests, because verifying it meant triggering
+a real build on a production controller. That objection was about the
+*target*, not the action — so the target was removed: a throwaway
+`ARI-Agent-Test-Pipeline` now exists on `jenkins.insightfinder.com`,
+created over `createItem` with a CSRF crumb. It is a Pipeline job that
+does no real work (echo, two short sleeps) and carries three parameters
+chosen to exercise the agent rather than to deploy anything:
+`ENVIRONMENT` (choice: staging/production), `SERVICE_VERSION` (string),
+and `SHOULD_FAIL` (boolean) so a failing build can be produced on demand.
+Seeded with #1 SUCCESS and #2 FAILURE before any agent ran, so diagnosis
+had real console output to read. Delete the job when Jenkins work is done.
+
+**The write path, verified against Jenkins' own record.** `propose`
+returned `TASK_STATE_INPUT_REQUIRED` with a `pending_action` resolving
+`ENVIRONMENT=staging` and `SERVICE_VERSION=2.1.0` from the prompt and
+leaving `SHOULD_FAIL` at its job default, each choice explained in
+`reasoning`. Confirmation then went back on the **same `task_id`** as
+`{"confirm_pending_action": {"id": ...}}` — the structured field, since
+there is deliberately no free-text route to a `trigger_build`
+(DEVELOPER_GUIDE §9). `execute_action` ran, the task returned to
+`TASK_STATE_COMPLETED` with an `action_result`, and Jenkins recorded:
+
+```
+build #3  SUCCESS  3951ms
+cause: Triggered via MCP Client from 54.177.168.200
+cause: Started by user Hai Chao | userId=haichao
+param: ENVIRONMENT = staging / SERVICE_VERSION = 2.1.0 / SHOULD_FAIL = False
+```
+
+That first cause line is the part worth keeping: Jenkins itself attributes
+the build to the MCP client, from the worker pod's node address, with
+exactly the parameters the proposal had promised. The proposal and the
+build agree field for field.
+
+All four sample-client modes now pass against this job. `chat` and
+`task-poll` both worked out that the only failure was synthetic — they
+read `SHOULD_FAIL=true` off build #2's parameters, quoted the canned
+error lines, and cross-checked against #1 and #3 being green rather than
+reporting a deploy-controller outage that never happened. Distinguishing a
+seeded failure from a real one was not asked for and is the more useful
+behaviour.
+
+**A deployment trap that cost a rebuild.** The chart pins
+`ariJenkinsAgent.worker.image.tag` to a literal `2609190017-test`, so the
+`kubectl set image` used on 09-28 was silently reverted by the next
+`helm upgrade` and the worker went back to running the bug. CI had already
+built the fix as `2609281628-test` (from `ec87b49`, the commit that carries
+both the http_retry work and the permission fix), so this round only needed
+re-pointing — but the pin means any helm operation resurrects the old image
+until the chart's values are bumped. That is the real fix, and it is in
+`insightfinder/charts`, not here.
+
+The test client that drives the confirmation turn is deliberately **not**
+in this repo: `docs/examples/jenkins_sample_client.py` stops at the
+proposal on purpose, and that posture is worth more than the convenience
+of an example that mutates. It lives on the bastion at
+`/work/confirm_client.py` and refuses to run without `CONFIRM=yes`.
+
+## 2026-09-30 — There is no multi-turn memory, and that makes the documented `stop_build` confirmation unreachable
+
+Found while testing the Jenkins agent conversationally rather than through
+the fixed-prompt sample client. Asking a question, then asking a follow-up
+that refers back to it ("what was that build number again?"), gets the
+agent insisting the conversation just started. Two source facts explain it,
+and together they close off a path the docs describe as working.
+
+**History comes from the task, not the context.**
+`a2a_server/executor.py:_extract_history` reads `context.current_task`.
+A `message/send` without a `task_id` creates a *new* task, so
+`current_task` is empty and the planner receives `history: []` — even
+though `context_id` is present and correct on every message. Confirmed
+live: same `context_id` across two turns (`a008219d-…`), and the second
+task came back with `history` length 0 and a reply saying no earlier
+message exists.
+
+**A finished task cannot be continued.** Re-sending with the previous
+`task_id` is rejected by the SDK:
+
+```
+400 INVALID_ARGUMENT: Task 65025b30-… is in terminal state: 3
+```
+
+So the only turn that ever carries history is one continuing a task that is
+still paused — which in practice means `TASK_STATE_INPUT_REQUIRED`.
+
+**Consequence: `stop_build` can never be confirmed.**
+`propose_action` sets `requires_approval = pending_action["action"] ==
+"trigger_build"`, so a `stop_build` proposal completes instead of pausing.
+DEVELOPER_GUIDE §9 and INPUT_REQUIRED_INTEGRATION.md both describe
+confirming it with a plain "yes, go ahead" in the same `context_id`, on the
+stated basis that "the planner reads history and, recognizing a
+confirmation of a specific prior proposal, schedules `execute_action`".
+There is no history to read. Verified end to end: turn 1 proposed
+`stop_build` and completed; turn 2's "yes, go ahead" in the same context
+produced a task with no artifacts and the reply *"it looks like it wasn't
+carried through to this session"*; turn 3 reusing the task_id got the 400
+above. Every route is closed.
+
+`trigger_build` is unaffected — it pauses at `INPUT_REQUIRED`, stays
+non-terminal, and its structured `confirm_pending_action` turn continues
+that same task. That path was verified working the same day.
+
+Worth deciding rather than leaving implicit, because the two halves of the
+gate were designed to differ and only one half works: either `stop_build`
+gets the same `requires_approval` treatment (one-line change, and the
+softer conversational flow stops being a special case), or history is
+sourced from the context rather than the current task, or the docs stop
+describing a flow that cannot run. Not fixed here — the fix is a design
+choice, not a typo.
+
+Minor, noticed in the same run: the proposal reported
+`build_number: 4.0` for build 4 — a float where Jenkins uses an integer,
+somewhere in the JSON round-trip.
+
+## 2026-09-30 — `stop_build` now takes the same hard gate as `trigger_build`
+
+Direct consequence of the entry above: the conversational confirmation
+`stop_build` relied on was unreachable, so rather than repair that path it
+was removed. One gate, both actions.
+
+`propose_action.py` previously flagged only one action:
+
+```python
+requires_approval = pending_action["action"] == "trigger_build"
+```
+
+It is now unconditionally `True`. Any proposal pauses the task at
+`TASK_STATE_INPUT_REQUIRED`, and `execute_action.py`'s check widened from
+`action == "trigger_build" and not ctx.confirmed` to plain
+`not ctx.confirmed`, so concrete params alone are never enough for either
+action. `ctx.confirmed` is only ever set by `a2a_server/executor.py`'s
+structured resume via `activities.py`'s `plan_task` bypass, and nothing the
+planner can emit reaches it.
+
+**Nothing in the resume path needed changing**, which is the part worth
+recording: `plan_task`'s bypass already passes the whole resolved
+`confirmed_action` dict through as `params` with `confirmed: True`, so
+`build_number` (which `stop_build` requires and `trigger_build` ignores)
+travelled correctly already. The gate was the only action-specific thing
+in the chain.
+
+**The planner's guidance was actively wrong, not merely stale.**
+`jenkins_agent/meta.py` still told it to *"only schedule execute_action
+when the conversation history shows the user already confirmed a specific
+prior proposal"* — a plan that, after this change, can only ever fail at
+the `ctx.confirmed` check. And the history it was told to read is always
+empty (previous entry). It now says never to schedule `execute_action` at
+all, and to answer through `respond` if the user seems to be confirming
+something, because the confirm flow bypasses planning by construction.
+Worth stating plainly: the previous wording asked the planner to do
+something the code would reject.
+
+**Tests.** Two asserted the old behaviour and were rewritten rather than
+deleted (`..._does_not_flag_stop_build_as_requiring_approval` →
+`..._flags_stop_build_as_requiring_approval_too`, and
+`..._stop_build_is_unaffected_by_the_confirmed_flag` →
+`..._refuses_stop_build_without_the_structural_confirmed_flag`). A third,
+`..._stops_via_direct_rest_not_opencode`, needed `confirmed=True` added —
+it was exercising the stop path, not the gate. Two new: stopping a build
+once structurally confirmed, and `test_no_mutating_action_can_run_on_params_alone`,
+which asserts the property over every action the agent can propose rather
+than naming one, so a third action added later is covered without an edit.
+Full suite **247 passed** inside the deployed `ari-oncall-agent-worker:test`
+image.
+
+**Docs corrected in three places** rather than left describing the old
+split: `DEVELOPER_GUIDE.md` §9 ("how you confirm differs by action" — it no
+longer does), `INPUT_REQUIRED_INTEGRATION.md` (its scope paragraph and the
+`trigger_build` vs. everything-else comparison table, now a short note on
+why the split is gone), and `design.md` §5b (layer 3 was "for
+`trigger_build` only"). Leaving those would have reproduced exactly the
+problem that started this: a documented flow nobody had run.
+
+Still open, unchanged by this: `stop_build`'s execution path itself has
+never been run against a real Jenkins, because that needs a build running
+long enough to catch. The gate in front of it is tested; the direct-REST
+stop behind it is covered only by `tests/test_jenkins_rest.py`.
+
+## 2026-09-30 — `stop_build` reported every successful stop as a failure
+
+Found while trying to verify the stop path end to end against the
+throwaway test job, and worth separating from the gate change above: this
+one predates it. `jenkins_rest.stop_build` ended with a bare
+`resp.raise_for_status()`, present since `ef263db` created the module.
+
+**Jenkins answers a successful `POST /job/X/N/stop` with a 302** back to
+the build page, not a 2xx, and `raise_for_status()` raises on 3xx when
+redirects were not followed. So the call did its job and then reported
+failure. Run against `jenkins.insightfinder.com` with a real 300-second
+build:
+
+```
+httpx.HTTPStatusError: Redirect response '302 Found' for url '.../6/stop'
+Redirect location: '/job/ARI-Agent-Test-Pipeline/6/'
+```
+
+and the build, checked immediately after: `building: false,
+result: "ABORTED", duration: 110297`. Stopped, then declared broken.
+`execute_action` would have surfaced that as a failed stop to the user
+while the build was already gone.
+
+Now only `>= 400` raises. A missing build is still a 404 and a token
+without permission still a 403, so the failure cases that matter are
+unaffected. Following the redirect instead would also work, at the cost of
+fetching a page of HTML nobody reads.
+
+**Why four HTTP-level tests missed it:** `tests/test_jenkins_rest.py`
+(added 2026-09-28, the first HTTP coverage this function ever had) mocks
+the stop POST as `httpx.Response(200)` in every one of them. The retry
+behaviour they were written to check is real and still passes; the status
+code they chose simply is not what Jenkins sends. Two tests added: a 302
+must not raise, and a 404 still must. Re-verified live afterwards with
+build #7 — `stop_build returned without error`, build `ABORTED`.
+
+The lesson generalises past this function: a mocked status code is a guess
+about the server unless something has checked it against the real one.
+The crumb handling in the same function was verified live back on
+2026-09-18; the stop response never was.
+
+**Still not verified:** the agent driving this through
+`execute_action` — propose, confirm, execute — against a real Jenkins. The
+Anthropic key hit its usage limit mid-test (*"You will regain access on
+2026-10-01 at 00:00 UTC"*), and every capability needs the planner. What
+is proven is the tool underneath it, called directly inside the deployed
+worker pod. The gate in front of it is covered by unit tests only.

@@ -113,3 +113,39 @@ async def test_a_persistent_failure_still_raises(monkeypatch):
 
     with pytest.raises(httpx.HTTPStatusError):
         await stop_build(_JENKINS, "job", 1)
+
+
+@pytest.mark.asyncio
+async def test_a_302_back_to_the_build_page_is_success_not_failure(monkeypatch):
+    """What real Jenkins actually answers a successful /stop with. Every
+    other test here mocks a 200, which is why this went unnoticed until it
+    was run against jenkins.insightfinder.com on 2026-09-30: the build
+    aborted and stop_build raised `Redirect response '302 Found'` anyway,
+    so the caller was told the stop had failed."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"crumbRequestField": "Jenkins-Crumb", "crumb": "abc"})
+        return httpx.Response(302, headers={"Location": "/job/job/1/"})
+
+    monkeypatch.setattr(
+        "jenkins_agent.tools.jenkins_rest.httpx.AsyncClient", _mock_async_client_factory(handler)
+    )
+
+    await stop_build(_JENKINS, "job", 1)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_a_404_on_stop_still_raises(monkeypatch):
+    """The other side of accepting 3xx: a build that does not exist, or a
+    token without permission, must still surface as a failure."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"crumbRequestField": "Jenkins-Crumb", "crumb": "abc"})
+        return httpx.Response(404)
+
+    monkeypatch.setattr(
+        "jenkins_agent.tools.jenkins_rest.httpx.AsyncClient", _mock_async_client_factory(handler)
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await stop_build(_JENKINS, "job", 1)
