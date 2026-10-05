@@ -61,7 +61,48 @@ anyone is waiting to answer a question in it. If there's genuine follow-up \
 work worth mentioning, phrase it as a plain recommendation, not a question.
 - Be concise but complete. Never invent facts not present in what's given \
 to you below.
+- A line below beginning "FACT:" is established by the pipeline itself, \
+not by a model. It overrides anything you infer from the step results, \
+and you must not contradict it. In particular, never state or imply that \
+an action was carried out, triggered, started, stopped or applied unless \
+a FACT line says it ran: proposing an action is not performing it, and a \
+reader acts on the difference.
 """
+
+
+def execution_fact(meta, step_results: dict) -> str:
+    """Whether this agent kind's one mutating capability actually ran,
+    stated as a fact rather than left for the response-writing model to
+    work out from the step results.
+
+    It does not reliably work it out. On 2026-10-05 a run whose plan was
+    only `resolve_target` produced "Action executed: Trigger Buggy
+    Deployment" - the step was never scheduled, nothing was sent to the
+    action server, and this prompt's own "never invent facts" rule did
+    not stop it (docs/MEMORY.md). An absence is the hard thing to notice:
+    the model sees a proposal among the results and narrates the obvious
+    next thing. So the absence is computed here and said out loud.
+
+    Empty for an agent kind with no `confirm_capability` (oncall), which
+    has no single step that means "something outside was changed".
+    """
+    capability = meta.confirm_capability
+    if not capability:
+        return ""
+
+    result = step_results.get(capability)
+    ran = bool(result) and not (isinstance(result, dict) and result.get("status") == "failed")
+    if ran:
+        return (
+            f"FACT: the `{capability}` step ran in this request. Report what it returned, "
+            "including whether the target system actually accepted the action."
+        )
+    return (
+        f"FACT: NOTHING WAS EXECUTED. The `{capability}` step did not run in this request, "
+        "so no action reached any external system. Anything in the results is a proposal "
+        "awaiting confirmation, never a completed action. Do not write that an action was "
+        "executed, triggered, run, started, stopped or applied."
+    )
 
 
 async def run(ctx: StepContext) -> dict:
@@ -74,6 +115,7 @@ async def run(ctx: StepContext) -> dict:
 
     history_text = "\n".join(f"{m['role']}: {m['content']}" for m in ctx.history)
     step_results = {k: v for k, v in ctx.results.items() if k != "respond"}
+    fact = execution_fact(meta, step_results)
 
     user_prompt = (
         f"User's message: {ctx.prompt}\n\n"
@@ -86,6 +128,7 @@ async def run(ctx: StepContext) -> dict:
             if step_results
             else "No steps were run for this request — this is a direct question.\n\n"
         )
+        + (f"{fact}\n\n" if fact else "")
         + "Write the final response now."
     )
 

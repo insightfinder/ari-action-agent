@@ -2506,3 +2506,97 @@ Jenkins — doing so means triggering a real build on a production
 controller, which is a decision, not a test step. The read path is proven
 end to end through the deployed agent; the write path is proven only in
 unit tests.
+
+## 2026-10-05 — A live stg run reported an action as executed that was never scheduled; the planner had silently fallen back
+
+Reported from the demo system on stg: the ARI Action Agent "did not ask
+for approval, it directly carried out the action", and no approval email
+was sent. Two symptoms, one cause, and the cause is in `common/`, so it
+applies to every agent kind — not just the action kind where it surfaced.
+
+**What the Temporal history actually shows.** Namespace `action-ari-agent`
+on `stg-temporal.insightfinder.com`, workflow
+`b889d00d-71db-4d02-905e-2c2d5037e47f`, 2026-10-05 12:22:02 AM GMT+8.
+`plan_task` returned:
+
+```json
+{"rationale": "planner output was not valid JSON; used default pipeline",
+ "steps": [{"capability": "resolve_target", "confirmed": false, ...}]}
+```
+
+Exactly two `execute_step` activities ran — `resolve_target` and
+`respond`. `resolve_artifacts` returned `{}`. No `propose_action`, no
+`execute_action`, no outbound call to anything. And `respond` wrote:
+
+> The remediation action for this predicted availability incident has been
+> identified and executed. **Action executed:** Trigger Buggy Deployment
+> (ID: 557db25d-...). **Target:** Instance ip-172-31-52-141.ec2.internal
+
+**The confirmation gate was never bypassed — it was never reached.**
+`execute_action` was not in the plan, so `ctx.confirmed` never mattered.
+That part of the design held. What failed was everything around it.
+
+**Three separate defects, in the order they bit:**
+
+1. *The planner parsed strictly while the rest of the repo parsed
+   leniently.* `create_plan` used a bare `json.loads`. The action agent's
+   own capabilities have used a tolerant reader (fenced blocks, a
+   sentinel, prose either side of the object) since they were written. A
+   model that answers correctly but wraps its object in a ```json fence
+   was therefore a planner failure and a capability success in the same
+   process. Now `common/llm_json.py`, shared, with the sentinel optional
+   because the planner prompts for a bare object.
+
+2. *The fallback is a plan, so nothing downstream can tell it apart from
+   a real one.* The run completes, `respond` runs as usual, and the
+   caller gets a confident answer about a pipeline that never ran what
+   was asked. For the action kind the fallback was `[resolve_target]` —
+   it proposed nothing, so MCP Service never saw a pause, so UIE never
+   sent its approval email. That is the whole of "no approval email".
+   **For oncall the same fallback is `[clone_repo, generate_change,
+   publish_pr]`** — a malformed planner response makes it clone, change
+   code and open a PR with no plan at all. Unchanged here, and worth its
+   own decision.
+
+3. *The raw response was discarded.* The `except` branch threw `raw`
+   away, so what the model actually emitted is unrecoverable for this
+   incident. Now logged as `planner_output_unusable` with the response
+   truncated to 4000 chars and the fallback it chose. This is the fix
+   that makes the next occurrence diagnosable instead of inferable.
+
+**Also fixed while here:** well-formed JSON of the wrong shape used to
+raise `ValidationError` straight out of `create_plan` and fail the whole
+activity, while the neighbouring malformed-JSON case fell back. Both now
+fall back.
+
+**`respond` can no longer claim an execution that did not happen.** The
+prompt already said "Never invent facts not present in what's given to
+you below" and that did not stop it, because the absence of a step is the
+hard thing for a model to notice — it sees a proposal in the results and
+narrates the obvious next thing. So the absence is now computed in code
+(`respond.execution_fact`, keyed on `agent_meta.confirm_capability`) and
+stated: `FACT: NOTHING WAS EXECUTED. The <capability> step did not run in
+this request...`, plus a prompt rule making `FACT:` lines binding over
+anything inferred. Empty for an agent kind with no `confirm_capability`
+(oncall), which has no single step meaning "something outside changed".
+
+**Deliberately not done: retrying the planner call.** Tolerant parsing
+should make the fallback rare; a retry would add a second LLM call per
+degraded run while hiding how often it happens. With the raw response now
+logged, the next real occurrence tells us whether a retry is warranted.
+Decide then, with evidence.
+
+**Two unrelated things the same Temporal input exposed**, both on the
+InsightFinder side, neither fixed here: the Action bound to Pattern 10000
+on stg has `name: "Trigger Buggy Deployment"` with `cmd: "reverse buggy
+deployment"` — the name and the command are opposites, and the command
+uses spaces where the action server's allowlist uses hyphens, so even a
+real execution would have been rejected. Its action server URL is port
+9092.
+
+**Verified:** `tests/test_llm_json.py` (12), `tests/test_planner.py` (9,
+including the fenced-object case that started this and the truncated-log
+assertion), and 8 new cases in `tests/test_respond.py` covering the exact
+shape of the live failure — a `pending_action` in the results and no
+execute step. Not verified against a live stg run yet; that needs the
+image rebuilt from `test`.
