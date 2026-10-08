@@ -6,7 +6,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_oncall_agent.capabilities import clone_repo, generate_change as opencode_change, publish_pr, verify  # noqa: E402
+from ari_oncall_agent.capabilities import (  # noqa: E402
+    clone_repo,
+    generate_change as opencode_change,
+    propose_pr,
+    publish_pr,
+    verify,
+)
 from common.capabilities_base import StepContext  # noqa: E402
 
 # Stub `run_opencode()`'s trace field (tools/opencode_cli.py) — every
@@ -23,8 +29,9 @@ def _ctx(
     results: dict,
     tools: dict,
     params: dict | None = None,
-    capability: str = "publish_pr",
+    capability: str = "propose_pr",
     include_clone_repo: bool = True,
+    confirmed: bool = False,
 ) -> StepContext:
     # generate_change/verify/publish_pr all now hard-require clone_repo to
     # have run first (StepContext.require_cloned_repo) -- included by
@@ -47,6 +54,7 @@ def _ctx(
         params=params or {},
         results=results,
         tools=tools,
+        confirmed=confirmed,
     )
 
 
@@ -78,185 +86,109 @@ def test_branch_name_is_deterministic_and_collision_resistant():
     assert " " not in name
 
 
-def test_extract_pr_from_opencode_result_uses_structured_tool_output():
-    result = {
-        "text": "done",
-        "tool_calls": [
-            {
-                "tool": "github_create_pull_request",
-                "input": {"head": "ari/fix-1"},
-                "output": {"html_url": "https://github.com/x/y/pull/42"},
-            }
-        ],
+def _approved_proposal(**overrides) -> dict:
+    """What plan_task puts in the step's params when a caller confirms a
+    propose_pr proposal: the artifact itself, verbatim."""
+    proposal = {
+        "id": "11111111-2222-3333-4444-555555555555",
+        "action": "open_pull_request",
+        "repo": "x/y",
+        "repo_url": "https://github.com/x/y",
+        "branch": "ari/fix-the-cart-bug-req-1234",
+        "base_ref": "main",
+        "title": "ARI: fix the cart bug",
+        "body": "the cart was empty",
+        "changed_files": ["a.py"],
     }
-    pr = publish_pr._extract_pr_from_opencode_result(result)
-    assert pr == {"url": "https://github.com/x/y/pull/42", "branch": "ari/fix-1"}
-
-
-def test_extract_pr_from_opencode_result_falls_back_to_text_regex():
-    result = {"text": "Opened it here: https://github.com/x/y/pull/7 — done.", "tool_calls": []}
-    pr = publish_pr._extract_pr_from_opencode_result(result)
-    assert pr["url"] == "https://github.com/x/y/pull/7"
-
-
-def test_extract_pr_from_opencode_result_returns_none_when_nothing_found():
-    assert publish_pr._extract_pr_from_opencode_result({"text": "no pr here", "tool_calls": []}) is None
+    proposal.update(overrides)
+    return proposal
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_primary_path_stages_commits_pushes_and_opens_pr():
+async def test_publish_pr_refuses_a_step_that_was_not_confirmed():
+    # The gate itself. `confirmed` is set only by plan_task's confirmation
+    # bypass and lives outside `params`, so a planner that scheduled this
+    # step anyway -- or a future default_step_policy appending it by
+    # mistake -- must not reach GitHub.
     tools = _publish_pr_tools()
-    ctx = _ctx(
-        results={"generate_change": {"summary": "fixed it", "changed_files": ["cart_service.py"]}},
-        tools=tools,
-    )
+    ctx = _ctx(results={}, tools=tools, params=_approved_proposal(), capability="publish_pr")
 
-    result = await publish_pr.run(ctx)
-
-    tools["git_add"].assert_awaited_once_with("/tmp/ws/repo", ["cart_service.py"])
-    tools["git_commit"].assert_awaited_once()
-    tools["git_push"].assert_awaited_once()
-    tools["github_create_pr"].assert_awaited_once()
-    tools["opencode"].assert_not_awaited()  # primary path succeeded -- no fallback
-    assert result == {"pr": {"url": "https://github.com/x/y/pull/1", "branch": "ari/x"}}
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_create_pr_call_uses_repo_slug_title_body_branch_and_base():
-    tools = _publish_pr_tools()
-    ctx = _ctx(
-        results={"generate_change": {"summary": "fixed the bug", "changed_files": ["a.go"]}},
-        tools=tools,
-    )
-    ctx.config["repo"]["url"] = "https://github.com/neyaadeez/go-script"
-
-    await publish_pr.run(ctx)
-
-    args = tools["github_create_pr"].await_args.args
-    repo_config, owner_repo, title, body, head, base = args
-    assert owner_repo == "neyaadeez/go-script"
-    assert "fixed the bug" in title or "fixed the bug" in body
-    assert head.startswith("ari/")
-    assert base == "main"
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_base_ref_param_overrides_repo_default():
-    tools = _publish_pr_tools()
-    ctx = _ctx(
-        results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}},
-        tools=tools,
-        params={"base_ref": "staging"},
-    )
-
-    await publish_pr.run(ctx)
-
-    assert tools["github_create_pr"].await_args.args[5] == "staging"
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_base_ref_defaults_to_clone_repo_ref_when_unset():
-    tools = _publish_pr_tools()
-    ctx = _ctx(
-        results={
-            "clone_repo": {"cloned_path": "/tmp/ws/repo", "ref": "dev"},
-            "generate_change": {"summary": "fixed it", "changed_files": ["a.py"]},
-        },
-        tools=tools,
-    )
-
-    await publish_pr.run(ctx)
-
-    assert tools["github_create_pr"].await_args.args[5] == "dev"
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_raises_when_generate_change_reports_no_changed_files():
-    tools = _publish_pr_tools()
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": []}}, tools=tools)
-
-    with pytest.raises(RuntimeError, match="no changed files"):
+    with pytest.raises(RuntimeError, match="was not confirmed"):
         await publish_pr.run(ctx)
 
-    tools["git_add"].assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_skips_when_options_skip_pr_is_set():
-    # Belt-and-suspenders alongside meta.py's default_step_policy (which
-    # normally wouldn't schedule this step at all in that case) -- in case
-    # the planner includes it anyway despite an explicit opt-out.
-    tools = _publish_pr_tools()
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
-    ctx.config["options"] = {"skip_pr": True}
-
-    result = await publish_pr.run(ctx)
-
-    assert result == {"status": "skipped"}
-    tools["git_add"].assert_not_awaited()
     tools["github_create_pr"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_falls_back_to_opencode_when_primary_path_fails():
-    # The safety net this whole design keeps: an unusual repo/auth state a
-    # fixed git/REST sequence can't handle should still get a real
-    # attempt via the more flexible opencode+MCP path, not just fail.
-    tools = _publish_pr_tools(
-        git_push=AsyncMock(side_effect=RuntimeError("git push failed: permission denied")),
-        opencode=AsyncMock(
-            return_value={
-                "text": "ok",
-                "tool_calls": [
-                    {
-                        "tool": "github_create_pull_request",
-                        "input": {"head": "b"},
-                        "output": {"html_url": "https://github.com/x/y/pull/9"},
-                    }
-                ],
-            }
-        ),
-    )
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"action": "trigger_build", "job": "deploy"},
+        _approved_proposal(branch=""),
+        _approved_proposal(title=""),
+    ],
+    ids=["empty", "another-agents-proposal", "no-branch", "no-title"],
+)
+async def test_publish_pr_refuses_a_confirmation_that_is_not_one_of_its_own_proposals(params):
+    # Being confirmed is not enough: the resolved artifact has to be an
+    # open_pull_request proposal with everything a pull request needs.
+    # A stale one, or one matched against some other artifact, fails here
+    # rather than opening half a pull request.
+    tools = _publish_pr_tools()
+    ctx = _ctx(results={}, tools=tools, params=params, capability="publish_pr", confirmed=True)
+
+    with pytest.raises(RuntimeError, match="not an open_pull_request proposal"):
+        await publish_pr.run(ctx)
+
+    tools["github_create_pr"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_pr_opens_the_pr_from_the_confirmed_proposal_verbatim():
+    # What a person approved is what gets opened. Nothing is recomputed --
+    # `_branch_name` is derived from the request id and the resume runs as
+    # a different workflow execution, so recomputing would open a pull
+    # request for a branch nobody approved and nothing pushed.
+    tools = _publish_pr_tools()
+    proposal = _approved_proposal()
+    ctx = _ctx(results={}, tools=tools, params=proposal, capability="publish_pr", confirmed=True)
 
     result = await publish_pr.run(ctx)
 
-    tools["opencode"].assert_awaited_once()
-    instruction = tools["opencode"].await_args.args[1]
-    assert "permission denied" in instruction
-    assert "a.py" in instruction
-    assert result == {"pr": {"url": "https://github.com/x/y/pull/9", "branch": "b"}}
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_raises_clearly_when_both_primary_and_fallback_fail():
-    tools = _publish_pr_tools(
-        git_push=AsyncMock(side_effect=RuntimeError("git push failed: permission denied")),
-        opencode=AsyncMock(return_value={"text": "I could not open a PR either", "tool_calls": []}),
+    assert result == {"pr": {"url": "https://github.com/x/y/pull/1", "branch": "ari/x"}}
+    args = tools["github_create_pr"].await_args.args
+    assert args[1:] == (
+        "x/y",
+        "ARI: fix the cart bug",
+        "the cart was empty",
+        "ari/fix-the-cart-bug-req-1234",
+        "main",
     )
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
-
-    with pytest.raises(RuntimeError, match="primary path failed"):
-        await publish_pr.run(ctx)
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_refuses_to_push_a_protected_branch_without_even_trying(monkeypatch):
-    # Hard veto: unreachable in practice today (_branch_name always
-    # generates a fresh ari/... name), but if a protected branch were ever
-    # about to be pushed to, this must refuse outright -- not touch git at
-    # all, and not fall back to opencode either (a different mechanism
-    # must never be allowed to "work around" the veto).
-    monkeypatch.setattr(publish_pr, "is_protected", lambda repo_url, branch: True)
+async def test_publish_pr_needs_no_repo_working_tree():
+    # The point of splitting publish_pr out of propose_pr. The resume runs
+    # after `cleanup_workspace` removed the sandbox, in a workflow whose
+    # plan is this one step -- there is no clone_repo result and no
+    # checked-out repo. If this step ever regained a require_cloned_repo()
+    # or a git call, every approval would fail here instead.
     tools = _publish_pr_tools()
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
+    ctx = _ctx(
+        results={},
+        tools=tools,
+        params=_approved_proposal(),
+        capability="publish_pr",
+        include_clone_repo=False,
+        confirmed=True,
+    )
 
-    with pytest.raises(RuntimeError, match="refusing to push protected branch"):
-        await publish_pr.run(ctx)
+    await publish_pr.run(ctx)
 
+    tools["github_create_pr"].assert_awaited_once()
     tools["git_add"].assert_not_awaited()
     tools["git_push"].assert_not_awaited()
-    tools["opencode"].assert_not_awaited()
 
 
 def _clone_repo_tools(**overrides):
@@ -413,7 +345,10 @@ async def test_verify_raises_clearly_when_clone_repo_never_ran():
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_raises_clearly_when_clone_repo_never_ran():
+async def test_propose_pr_raises_clearly_when_clone_repo_never_ran():
+    # The repo guard moved here with the push itself. publish_pr has the
+    # opposite requirement now -- see
+    # test_publish_pr_needs_no_repo_working_tree.
     tools = _publish_pr_tools()
     ctx = _ctx(
         results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}},
@@ -422,7 +357,7 @@ async def test_publish_pr_raises_clearly_when_clone_repo_never_ran():
     )
 
     with pytest.raises(RuntimeError, match="clone_repo must run before this step"):
-        await publish_pr.run(ctx)
+        await propose_pr.run(ctx)
 
     tools["git_add"].assert_not_awaited()
 
