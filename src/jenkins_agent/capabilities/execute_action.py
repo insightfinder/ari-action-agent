@@ -38,6 +38,31 @@ from common.capabilities_base import StepContext
 _MAX_PROPOSAL_AGE_SECONDS = 30 * 60  # "yes" long after the discussion moved on re-proposes, doesn't fire
 
 
+def _build_number(raw: object) -> int | None:
+    """The build number as an int, or None if there isn't one.
+
+    A2A artifacts round-trip through protobuf `Value`, whose only numeric
+    type is a double, so the integer `propose_action` put in the
+    `pending_action` comes back a float: `10` out, `10.0` back. An
+    f-string then builds `/job/X/10.0/stop` and Jenkins answers 404.
+    Confirmed live 2026-10-08 — the gate, the confirm resume and the REST
+    call were all correct and the build still was not stopped, with the
+    agent reporting a missing job. Coerced here, at the one boundary
+    where confirmed params arrive from that round-trip, rather than at
+    each use; any integer added to `pending_action` later arrives the
+    same way.
+    """
+    if raw is None:
+        return None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"execute_action: build_number is not a number: {raw!r}") from None
+    if number != int(number):
+        raise RuntimeError(f"execute_action: build_number is not a whole number: {raw!r}")
+    return int(number)
+
+
 def _require_confirmed_action(ctx: StepContext) -> dict:
     action = ctx.params.get("action")
     job = ctx.params.get("job")
@@ -63,7 +88,7 @@ def _require_confirmed_action(ctx: StepContext) -> dict:
         "action": action,
         "job": job,
         "parameters": ctx.params.get("parameters") or {},
-        "build_number": ctx.params.get("build_number"),
+        "build_number": _build_number(ctx.params.get("build_number")),
     }
 
 

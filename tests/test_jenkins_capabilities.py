@@ -284,6 +284,47 @@ async def test_execute_action_stops_a_build_once_structurally_confirmed():
 
 
 @pytest.mark.asyncio
+async def test_a_build_number_that_came_back_as_a_float_still_builds_an_integer_url():
+    """The shape a confirmed stop_build actually arrives in. A2A artifacts
+    round-trip through protobuf `Value`, whose only numeric type is a
+    double, so `10` is published and `10.0` comes back -- and `/job/X/10.0/stop`
+    is a 404. Live failure 2026-10-08; everything else about the path was
+    already correct, which is what made it hard to see."""
+    stop_build = AsyncMock()
+    ctx = _ctx(
+        "execute_action",
+        results={},
+        tools={"jenkins_stop_build": stop_build},
+        params={"action": "stop_build", "job": "deploy/checkout-service", "build_number": 42.0},
+        confirmed=True,
+    )
+
+    await execute_action.run(ctx)
+
+    passed = stop_build.await_args.args[2]
+    assert passed == 42 and isinstance(passed, int), f"got {passed!r} ({type(passed).__name__})"
+
+
+@pytest.mark.asyncio
+async def test_a_build_number_that_is_not_a_whole_number_is_refused():
+    """Coercion must not quietly round. A fractional build number means
+    something upstream is wrong, and silently stopping build 42 because the
+    request said 42.5 would be worse than failing."""
+    stop_build = AsyncMock()
+    ctx = _ctx(
+        "execute_action",
+        results={},
+        tools={"jenkins_stop_build": stop_build},
+        params={"action": "stop_build", "job": "deploy/checkout-service", "build_number": 42.5},
+        confirmed=True,
+    )
+
+    with pytest.raises(RuntimeError, match="not a whole number"):
+        await execute_action.run(ctx)
+    stop_build.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_no_mutating_action_can_run_on_params_alone():
     """The property the gate exists for, stated once over every action the
     agent can propose: concrete params are never sufficient -- only the

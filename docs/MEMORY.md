@@ -2735,3 +2735,95 @@ Anthropic key hit its usage limit mid-test (*"You will regain access on
 2026-10-01 at 00:00 UTC"*), and every capability needs the planner. What
 is proven is the tool underneath it, called directly inside the deployed
 worker pod. The gate in front of it is covered by unit tests only.
+
+## 2026-10-08 — `stop_build` proven end to end, after two blockers that each looked like something else
+
+The gate change of 2026-09-30 was correct and still did not work, for two
+reasons that had nothing to do with it. Both are worth recording for the
+shape of the mistake rather than the fix.
+
+**The planner looked incapable; it was the parser.** Running the agent on
+`claude-haiku-4-5-20251001`, every change request came back as a read-only
+answer: *"I cannot stop the build because my standing instructions prohibit
+triggering or stopping actions."* That is a confident, plausible, entirely
+invented explanation. Temporal's workflow history gave the real one —
+`"planner output was not valid JSON; used default pipeline"` — so the model
+had been bypassed and `planner_fallback_steps` (resolve_target, inspect)
+had run instead.
+
+The natural next conclusion, that a smaller model cannot emit the plan
+schema, was also wrong. Calling the model directly with the real planner
+prompt showed exactly what it returns:
+
+```
+'```json
+{
+  "steps": [
+    {"capability": "resolve_target", ...},
+
+   {"capability": "propose_action", ...}
+  ],
+  "rationale": "User wants
+   to stop a running build... then propose the stop action for confirmation
+   before execution."
+}
+```'
+```
+
+A correct plan, valid JSON, wrapped in a markdown fence. `json.loads` fails
+on the leading backtick and nothing else was tried. This is precisely what
+`common/llm_json.extract` was added for on 2026-10-05 — that fix was on
+`test`, this branch is behind it, and the symptom here is the same class as
+the stg investigation that prompted it. **Probe the raw model output before
+concluding anything about the model**; the fallback path is designed to be
+survivable, which also makes it quiet.
+
+**`build_number` arrives as a float and 404s the stop.** Noted on 09-30 as
+a cosmetic oddity (`4.0`), which was a misreading: A2A artifacts round-trip
+through protobuf `Value`, whose only numeric type is a double, so `10` is
+published and `10.0` comes back, and the f-string builds
+`/job/ARI-Agent-Test-Pipeline/10.0/stop`. Jenkins answers 404 and the agent
+reports a missing job. Every other part of the path — the gate, the
+`INPUT_REQUIRED` pause, the structured confirm resume, the crumb, the
+302 handling — was already correct, which is what made it hard to see.
+
+Coerced in `_build_number`, at the single boundary where confirmed params
+arrive from that round-trip. It refuses a fractional value rather than
+rounding: stopping build 42 because the request said 42.5 is worse than
+failing. Two tests, both describing the real shape rather than an invented
+one — a float that must become an int, and a non-integer that must be
+refused. Any integer added to `pending_action` later arrives the same way.
+
+**Verified end to end** against `jenkins.insightfinder.com`, on Haiku, with
+an image built from this branch plus `llm_json`/`planner`/`respond` from
+`test`:
+
+- propose → `TASK_STATE_INPUT_REQUIRED` with `pending_action(stop_build)`,
+  build still running
+- `"yes, go ahead"` → nothing happens, build still running
+- structured `confirm_pending_action` → `TASK_STATE_COMPLETED` with
+  `action_result`, and Jenkins build #10 `ABORTED` after 55s of a 480s sleep
+
+That closes the gap the 09-30 entry left open.
+
+**Folder-nested jobs too.** `job_url()`'s nesting (`a/b` ->
+`/job/a/job/b`) had unit coverage but had never been exercised live, so a
+throwaway `ARI-Agent-Test-Folder` with one `Nested-Pipeline` inside it was
+created for the purpose. Same three steps, same result: proposal carried
+`"job": "ARI-Agent-Test-Folder/Nested-Pipeline"`, a plain "yes" did
+nothing, and the structured confirm aborted build #1 after 32s of a 480s
+sleep. Worth noting the harness, not the agent, was what broke first here
+— `stop_e2e.py` was composing `/job/a/b/...` when talking to Jenkins
+directly and got a 404, which is exactly the bug `job_url()` exists to
+avoid. Delete the folder along with the root-level test job when Jenkins
+work is done.
+
+**Operational note.** The test cluster's pods egress as their node's public
+IP and the node set keeps changing; the Jenkins allowlist went stale three
+times in ten days, each time presenting as "no Jenkins connection". The
+worker Deployment is pinned with
+`nodeSelector: kubernetes.io/hostname=ip-10-1-17-214...` as a stopgap.
+Remove the pin once the egress is stable — a NAT gateway, or peering the
+two VPCs, which would also stop the Jenkins Basic-auth header crossing the
+public internet in cleartext (`base_url` is `http://`; the instance serves
+no TLS at all).
