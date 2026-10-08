@@ -500,6 +500,44 @@ assumed, and the full unit-test suite covers every new code path in
 isolation — but no real HTTP round-trip against a live instance has
 exercised it end to end yet.
 
+## 5c. The same gate, for the on-call agent's pull requests
+
+The on-call agent reuses §5b's three layers verbatim for the one thing it
+does that reaches outside the sandbox: opening a pull request. Nothing in
+`common/` changed to allow it — the mechanism was already generic, and
+turning it on for this agent kind is four lines of `ari_oncall_agent/meta.py`
+plus a capability.
+
+- **Pausing.** `propose_pr` returns `requires_approval`, which the step
+  loop turns into `status: "needs_approval"` → `TASK_STATE_INPUT_REQUIRED`.
+- **Resuming.** `AgentMeta.confirm_capability` is `"publish_pr"`, so
+  `plan_task`'s bypass runs that one step with the approved proposal as its
+  params and `confirmed: True`, skipping the planner entirely.
+- **The gate.** `publish_pr` refuses any step where `ctx.confirmed` is
+  false, and refuses a confirmed proposal that is not an
+  `open_pull_request` one with every field a pull request needs.
+
+Two things differ from the Jenkins case, both consequences of this agent
+owning a working tree:
+
+**The branch is pushed before the pause, not after the approval.** The
+approval is human-speed, and the resume is a *separate* Temporal workflow
+execution: `workflow.py` runs `cleanup_workspace` on the way out of the
+pausing run, and the sandbox root is on no persistent volume, so a worker
+restart during the approval window would take the change with it. Pushing
+first leaves the approval as one idempotent REST call that needs no
+working tree. The accepted cost is a branch visible on the target
+repository before anyone approved it — quieter than a pull request, but
+not nothing on a repository that builds every pushed branch.
+
+**`publish_pr` is `internal: true`.** The planner must not be able to
+schedule it at all; §5b's Jenkins gate relies on `execute_action` being
+plannable but refusing unconfirmed work, which leaves prompt guidance as
+the only thing discouraging a plan from trying. Here the capability is
+simply absent from `catalog()`, so there is nothing to discourage.
+`get_capability()` — which the confirmation bypass uses — does not filter
+internal capabilities, so the resume still resolves it.
+
 ## 6. Repo caching & dynamic branches (on-call agent)
 
 On-call-agent-specific — the Jenkins agent has no repo of its own, so

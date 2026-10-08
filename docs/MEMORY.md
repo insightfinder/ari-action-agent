@@ -2600,3 +2600,110 @@ assertion), and 8 new cases in `tests/test_respond.py` covering the exact
 shape of the live failure — a `pending_action` in the results and no
 execute step. Not verified against a live stg run yet; that needs the
 image rebuilt from `test`.
+
+## 2026-10-08 — A pull request now needs a person's approval, reusing the Jenkins gate unchanged (II-25090)
+
+Asked for two things at once: whether the action agent's II-25052 defect
+(`ari-agent-demo` `d896ae62` — "never asks for approval and falsely
+reports the action as executed") also exists here, and the leader's
+requirement that this agent email the change for approval before opening
+a pull request. They turn out to be the same work.
+
+**Does II-25052's defect exist in on-call? Both halves, yes.**
+
+*The planner half* is shared code and was already fixed here —
+`common/llm_json.py`, `planner.py`, `respond.py` are byte-identical on
+`test`/`staging`/`main`. But **prod was running `2609282209-main`
+(2026-09-28), which predates it**: probed live, `lenient parse: False /
+logs raw: False / fact guard: False`. The fix reaches prod only when
+someone runs `helm upgrade` — prod pins a timestamped tag, so merging and
+rebuilding does not move it. Left for the deployment that ships this
+feature; noted here because it is easy to assume a merged fix is a
+deployed one.
+
+*The "falsely reports" half* was present but **inert**:
+`respond.execution_fact` returns `""` for an agent kind with no
+`confirm_capability`, and oncall had none. So nothing stopped `respond`
+claiming a pull request had been opened when no `publish_pr` step ran —
+the same shape of failure, one capability name away. Setting
+`confirm_capability` for the gate below turns that guard on as a side
+effect; no extra code.
+
+**The gate itself is §5b's, reused with nothing in `common/` changed.**
+`propose_pr` returns `requires_approval`; `confirm_capability =
+"publish_pr"`; `publish_pr` refuses anything `ctx.confirmed` is false for.
+That `common/` stayed untouched also kept this out of
+`ari-agent-demo`'s vendoring sync — one repo, one branch.
+
+**The decision that shaped everything: the branch is pushed *before* the
+pause.** The resume is a separate Temporal workflow execution whose plan
+is a single `publish_pr` step, and by then two things are gone —
+`workflow.py` runs `cleanup_workspace` on the way out of the pausing run,
+and `sandboxRoot` is on no persistent volume (the chart persists only the
+repo and build caches). Anything still needing `git add`/`commit`/`push`
+after a human-speed approval would be publishing a change that no longer
+exists on disk, and a worker restart inside the approval window is not a
+remote possibility. Two alternatives were weighed and rejected:
+*re-cloning and re-applying a patch on resume* (needs `plan_task`'s
+single-step bypass to become multi-step — a `common/` change and a
+vendoring sync — and can conflict on a base that moved), and *keeping the
+sandbox alive across the pause* (also `common/`, and unreliable for
+exactly the reason above, besides contradicting the deliberately small,
+LRU-evicted caches). The accepted cost, stated plainly rather than
+discovered later: **the branch is visible on the target repository before
+anyone approves it.** That is far quieter than a pull request, but a
+repository that builds every pushed branch will build it.
+
+**`publish_pr` is `internal: true`.** Jenkins' `execute_action` stays
+plannable and refuses unconfirmed work, which leaves prompt guidance as
+the only thing discouraging a plan from scheduling it. Here the
+capability is simply absent from `catalog()`, so there is nothing to
+discourage — `get_capability()`, which the bypass uses, does not filter
+internal capabilities. Structural, not advisory.
+
+**`planner_fallback_steps` now ends at `propose_pr`** — this is the
+decision the 2026-10-05 entry left open ("worth its own decision"). A
+degraded run still does the safe *whole* job: the change is made, pushed,
+and put in front of a person. It used to end at `publish_pr`, so a
+malformed planner response opened a pull request with no plan behind it.
+
+**The approval email gets a summary plus key hunks, not the whole diff.**
+Chosen deliberately: the email renders the agent's prose
+(`pause["question"]`), never the artifact, so an unbounded diff would be
+both unreadable and past a mail server's limits. `key_hunks()` is
+deterministic — no LLM — because what a person approves has to be the
+change, not a model's description of it. The full diff is one click away
+via `compare_url`, which is only possible *because* the branch is already
+pushed.
+
+**Removed: the opencode + GitHub MCP fallback in `publish_pr`.** It drove
+commit/push/PR against the sandbox working tree, which does not exist
+after the pause, so it could not run even if left wired. Deleting it beat
+keeping a branch that can never execute. The push it used to guard now
+happens in `propose_pr`, while the sandbox is still there.
+
+**Verified:** full suite **286 passed**, run inside the deployed
+`ari-oncall-agent-worker:test` image with `src/` and `tests/` mounted over
+it — so the 11 modules that cannot be collected on Windows (`a2a`,
+`fcntl`), including `test_activities.py`, `test_ari_oncall_meta.py`,
+`test_a2a_executor.py` and `test_respond.py`, actually ran. 16 new cases
+in `tests/test_propose_pr.py` (the pause, the proposal's contract with
+`publish_pr`, id uniqueness, `key_hunks` bounds, the opt-outs, the
+protected-branch veto) and 4 rewritten `publish_pr` ones, of which
+`test_publish_pr_needs_no_repo_working_tree` is the regression guard for
+the whole design — if that step ever regains a `require_cloned_repo()`,
+every approval breaks after a human-speed round trip.
+
+Two existing tests failed in a way worth recording, because both were
+*correct* failures: `test_plan_task_raises_clearly_when_agent_kind_has_no_
+confirm_capability` used oncall as its example of a kind without one, and
+every shipped kind now has one — rewritten to stub the meta instead of
+pinning itself to whichever kind happens to lack the field.
+`test_respond_is_excluded_from_planner_catalog` asserted `publish_pr` was
+in the catalog; it now asserts the opposite, which is the new guarantee.
+
+**Not verified:** the live pause → approval email → confirm → pull request
+round trip. Every piece is covered by unit tests against the real SDK
+contract, and §5b's own round trip has never been exercised live either
+(2026-09-18 says so). This needs a deployed image plus UIE's approval path
+pointed at it, and `requireHumanApproval` enabled for the system.

@@ -7,11 +7,20 @@ explains *why* this exists and how it's built; this doc is the
 integration contract — what you will see on the wire, and exactly what
 to send back.
 
-**Scope today: only the Jenkins agent's `trigger_build` action uses
-this.** Every other action (`stop_build`, the on-call agent's whole
-pipeline) never produces `TASK_STATE_INPUT_REQUIRED` — see the
-[comparison table](#trigger_build-vs-everything-else) at the end if
-you're integrating against both. Read `docs/DEVELOPER_GUIDE.md` first if
+**Scope today: the Jenkins agent's `trigger_build` action, and every
+on-call run that is about to open a pull request.** On-call pauses at
+`propose_pr`, after the change is made and its branch is pushed, and
+opens the pull request only once you confirm. Everything else
+(`stop_build`, an on-call request that asked for no PR, a plain
+question) completes without ever producing
+`TASK_STATE_INPUT_REQUIRED` — see the
+[comparison table](#what-pauses-and-what-does-not) at the end if you're
+integrating against both agents.
+
+The wire contract below is identical for both: same task state, same
+`pending_action` artifact, same structured confirmation. Only the
+contents of the artifact differ, and you do not need to understand them
+— you echo the `id` back. Read `docs/DEVELOPER_GUIDE.md` first if
 you haven't already — this doc assumes you know `message/send`, the
 three response patterns, and how multi-turn `context_id`/`task_id`
 continuation works.
@@ -258,13 +267,23 @@ a real paused task, so this shouldn't come up in normal use.
   will be refused, not silently re-open the proposal. Propose it again
   fresh if you change your mind, same as any other stale/resolved id.
 
-## `trigger_build` vs. everything else
+## What pauses, and what does not
 
-| | `trigger_build` | `stop_build` (and everything else) |
+| | `trigger_build` (jenkins) and `propose_pr` (on-call) | `stop_build`, and anything with nothing to approve |
 |---|---|---|
 | Pause mechanism | Hard: real `TASK_STATE_INPUT_REQUIRED` | Soft: task completes normally, message asks for confirmation in plain language |
 | How you confirm | Structured `confirm_pending_action: {"id": ...}` field, same `task_id` | Plain "yes, go ahead" text, same `context_id` |
 | Who decides it's a confirmation | Deterministic server-side artifact lookup, no LLM | The planner's LLM, reading conversation history |
 | Free-text "yes" alone | Does nothing | Works, as it always has |
 
-See `docs/design.md` §5b for why only `trigger_build` got the hard gate.
+See `docs/design.md` §5b for the design behind the hard gate.
+
+**One difference worth knowing about on-call**, even though it changes
+nothing you send back: by the time you are asked, the branch already
+exists on the target repository. `propose_pr` pushes it before pausing,
+because the approval is human-speed and the resume runs as a separate
+workflow execution with no sandbox left — a change that still needed
+committing afterwards would be gone. The proposal carries a
+`compare_url` for exactly this reason: it is the whole diff, where the
+`key_hunks` field is only an excerpt sized for an email. Declining
+(§6) leaves that branch behind; nothing deletes it.

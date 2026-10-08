@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -62,7 +63,7 @@ async def test_plan_task_normal_branch_marks_every_planner_step_unconfirmed(jenk
 @pytest.mark.asyncio
 async def test_plan_task_applies_oncalls_default_step_policy(monkeypatch):
     # oncall's own default_step_policy (ari_oncall_agent/meta.py) appends
-    # publish_pr whenever generate_change ran and the planner's own step
+    # propose_pr whenever generate_change ran and the planner's own step
     # list omitted it -- exercised here through the real plan_task
     # activity, not just the policy function in isolation.
     monkeypatch.setenv("AGENT_KIND", "oncall")
@@ -77,7 +78,7 @@ async def test_plan_task_applies_oncalls_default_step_policy(monkeypatch):
 
         result = await activities.plan_task({"prompt": "fix it", "config": {"options": {}}, "history": []})
 
-        assert [s["capability"] for s in result["steps"]] == ["clone_repo", "generate_change", "publish_pr"]
+        assert [s["capability"] for s in result["steps"]] == ["clone_repo", "generate_change", "propose_pr"]
     finally:
         get_settings.cache_clear()
         get_agent_meta.cache_clear()
@@ -127,20 +128,20 @@ async def test_plan_task_attaches_verifys_timeout_seconds_from_the_capability_re
 
 @pytest.mark.asyncio
 async def test_plan_task_raises_clearly_when_agent_kind_has_no_confirm_capability(monkeypatch):
-    # oncall's AgentMeta.confirm_capability is None (it never pauses for
-    # human-in-the-loop confirmation) -- a confirmed_action reaching
-    # plan_task for that agent kind is a bug, not something to silently
-    # fall through to the LLM planner for.
-    monkeypatch.setenv("AGENT_KIND", "oncall")
-    get_settings.cache_clear()
-    get_agent_meta.cache_clear()
-    capabilities_registry._load_specs.cache_clear()
-    try:
-        with pytest.raises(RuntimeError, match="no confirm_capability"):
-            await activities.plan_task(
-                {"prompt": "yes", "config": {}, "history": [], "confirmed_action": {"action": "trigger_build"}}
-            )
-    finally:
-        get_settings.cache_clear()
-        get_agent_meta.cache_clear()
-        capabilities_registry._load_specs.cache_clear()
+    # A confirmed_action reaching plan_task for an agent kind that has no
+    # confirm_capability is a bug, not something to silently fall through
+    # to the LLM planner for.
+    #
+    # Stubbed rather than pointed at a real agent kind: this used to use
+    # oncall, which had no confirm_capability until its own PR approval
+    # gate was added, and every shipped kind now has one. Pinning the
+    # guard to whichever kind happens to lack the field makes the test
+    # quietly stop testing anything the moment that changes -- which is
+    # exactly what happened here.
+    meta = SimpleNamespace(confirm_capability=None)
+    monkeypatch.setattr(activities, "get_agent_meta", lambda: meta)
+
+    with pytest.raises(RuntimeError, match="no confirm_capability"):
+        await activities.plan_task(
+            {"prompt": "yes", "config": {}, "history": [], "confirmed_action": {"action": "trigger_build"}}
+        )

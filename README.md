@@ -3,7 +3,16 @@
 A standalone agent that receives an incident/prompt + full configuration in
 a single request, autonomously clones a repo, analyzes the problem, generates
 and verifies a fix (via [opencode](https://github.com/sst/opencode) running
-in a sandbox), and opens a pull request — then reports back.
+in a sandbox), pushes it to a branch, and asks a person to approve the pull
+request before opening it — then reports back.
+
+**A pull request is never opened without a human saying so.** The run pauses
+in A2A's `TASK_STATE_INPUT_REQUIRED` carrying everything needed to judge the
+change (title, target branch, files, an excerpt of the diff, and a compare
+link to the pushed branch), and the pull request is opened only once the
+caller confirms. See
+[`docs/INPUT_REQUIRED_INTEGRATION.md`](docs/INPUT_REQUIRED_INTEGRATION.md)
+for that contract.
 
 It's a **genuine A2A (Agent2Agent) protocol server**, built on the official
 [`a2a-sdk`](https://pypi.org/project/a2a-sdk/) (Linux Foundation project) —
