@@ -135,9 +135,13 @@ this project's own generic webhook-logging tool for local testing.
 
 ## Testing
 
-`pytest tests/` covers every capability against mocked tools. Run it in the
-worker image rather than on a laptop — 11 modules need `a2a`/`fcntl` and
-cannot even be collected on Windows:
+Two layers, and they catch different things. Only the first one needs Docker.
+
+### Unit tests
+
+`pytest tests/` covers every capability against mocked tools. Docker is not a
+preference here — 11 modules need `a2a`/`fcntl` and cannot even be *collected*
+on Windows, so run them in the worker image:
 
 ```bash
 docker run --rm -v "$PWD:/work" -w /work insightfinderinc/ari-oncall-agent-worker:test   sh -lc 'pip install -q pytest pytest-asyncio; PYTHONPATH=/work/src python -m pytest tests/ -q'
@@ -150,19 +154,39 @@ that accumulates across retries, and a brand-new file that `git diff HEAD`
 cannot see. All three shipped past a passing suite; see `docs/MEMORY.md`,
 2026-10-09.
 
-`scripts/oncall_live_test.py` closes that gap by driving a **deployed** agent
-over its real A2A surface and asserting on what comes back:
+### Live scenarios against a deployed agent
+
+`scripts/oncall_live_test.py` closes that gap. It is a plain HTTP client — no
+Docker, no local agent, nothing to stand up. Its only dependency is `httpx`:
 
 ```bash
-export ARI_BASE_URL=https://...        ARI_API_KEY=...
-export LLM_PROVIDER=anthropic LLM_API_KEY=... LLM_MODEL=claude-haiku-4-5
-export GITHUB_PAT=...                  REPO_URL=https://github.com/<org>/<repo>
+pip install httpx
 
-python scripts/oncall_live_test.py --list      # the six scenarios
-python scripts/oncall_live_test.py             # all of them, no writes
-python scripts/oncall_live_test.py budget      # just one
+export ARI_BASE_URL=...  ARI_API_KEY=...
+export LLM_PROVIDER=anthropic LLM_API_KEY=... LLM_MODEL=claude-haiku-4-5
+export GITHUB_PAT=...    REPO_URL=https://github.com/<org>/<repo>  REPO_REF=<branch>
+
+python scripts/oncall_live_test.py --list           # the six scenarios
+python scripts/oncall_live_test.py                  # all of them, no writes
+python scripts/oncall_live_test.py budget           # just one
 python scripts/oncall_live_test.py --allow-writes   # include the one that opens a PR
 ```
+
+`ARI_BASE_URL` is wherever the agent actually answers. An environment that
+publishes an ingress can be hit directly (`https://<host>`); one that does not
+is reached the same way its own callers reach it, through the in-cluster
+Service:
+
+```bash
+kubectl -n <ns> port-forward svc/ari-oncall-api 18001:80 &
+export ARI_BASE_URL=http://127.0.0.1:18001
+```
+
+That second form is worth preferring even when an ingress exists: it is the
+path MCP Service itself uses (`ARI_ONCALL_AGENT_URL=http://ari-oncall-api`), so
+it tests what production traffic traverses rather than an edge the product does
+not use. `ARI_API_KEY` is the agent's own `AGENT_API_KEYS` for that
+environment.
 
 | scenario | what it proves |
 |---|---|
@@ -183,6 +207,11 @@ Two things it assumes, both learned the hard way (`docs/MEMORY.md`): assert on
 that text is an LLM writing for a human and is paraphrased differently every
 run. And each confirm scenario pauses its own task, because a confirm (valid
 or bogus) moves a task to a terminal state that A2A cannot return from.
+
+Neither layer sees everything. Both are per-request: they assert on what one
+call returns. Anything that only shows up by accumulating inside a
+long-running worker — leaked child processes, growing caches — is invisible to
+both, and is found by looking at the process, not at a response.
 
 See `docs/MEMORY.md` for what's been verified against real infrastructure
 (and real gaps found and fixed along the way: Temporal persists request
