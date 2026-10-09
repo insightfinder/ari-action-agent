@@ -60,7 +60,7 @@ capabilities:
       trusted from opencode's own report of what it changed — publish_pr
       uses the file list to scope staging and avoid sweeping in scratch
       files a later step (e.g. verify) may have left behind.
-    tools: [opencode, git_diff, git_changed_files]
+    tools: [opencode, git_diff, git_changed_files, git_untracked_files, git_intent_to_add]
     retry:
       max_attempts: 2
       backoff_seconds: 10

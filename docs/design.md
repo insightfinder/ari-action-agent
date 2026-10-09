@@ -16,6 +16,18 @@ A2A-protocol agent kinds can sit on top of. Today there are two:
 | `oncall` | Clones a repo, diagnoses a bug/feature request, fixes it, opens a PR | `ari_oncall_agent/` |
 | `jenkins` | Reads/diagnoses a Jenkins job or build, proposes and (once confirmed) executes a change | `jenkins_agent/` |
 
+> **Where the Jenkins kind lives.** `jenkins_agent/` is *not* on `main`,
+> `test` or `staging` — it is developed and released from its own
+> `jenkins-agent` branch, which builds `ari-jenkins-agent-worker` from its
+> own copy of `.github/workflows/docker-build-push.yml`. The two kinds
+> ship on independent cadences and the on-call agent's pull requests stay
+> reviewable without an unrelated agent's diff in them. Everything §0
+> describes about the framework still holds: the split is in release
+> management, not in the design, and nothing in `common/` knows about it.
+> The rest of this document (§3's tables, §5b, §7) describes both kinds as
+> one codebase, which is what you see once the `jenkins-agent` branch is
+> checked out.
+
 **Package layout** (`src/`):
 
 - **`common/`** — everything agent-kind-agnostic: the A2A server
@@ -242,6 +254,20 @@ new capabilities/tools/catalog entries, not a rewrite. Adding a whole new
    `{"status": "failed"}` return) is caught the same way, so any hard
    capability failure still reaches `cleanup_workspace` and `respond`
    instead of aborting the workflow with no explanation.
+   **Every bound in `capabilities.yaml` is per-attempt**, so on their own
+   they bound nothing: `timeout_seconds` caps one attempt,
+   `retry.max_attempts` multiplies it, and the `on_failure` loop
+   multiplies that again. For the on-call agent's `verify` plan the
+   product is roughly 3.2 hours. `workflow.py` therefore also carries a
+   whole-pipeline ceiling (`_DEFAULT_PIPELINE_BUDGET_SECONDS`, 1 hour;
+   override per request with `options.pipeline_budget_seconds`), measured
+   from `workflow.info().start_time` so it covers planning and workspace
+   setup too. It is applied as each step's `schedule_to_close_timeout`
+   rather than as a check between steps, because the case that needs it
+   is the step that is *already* overrunning — confirmed live on stg
+   (workflow `9b32a817`, 2026-10-08: 45m56s, no single step ever past its
+   own timeout). When the remainder is too small to be worth scheduling
+   anything, the loop stops and says so; `respond` still runs.
 5. Every step happens against one ephemeral sandbox workspace
    (`tools/sandbox.py`, keyed by `request_id`), cleaned up when the
    workflow ends — one request's bad patch/hung test can't affect another.

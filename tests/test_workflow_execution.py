@@ -11,6 +11,7 @@ its own) used to abort the *entire* pipeline outright, skipping the exact
 same on_failure retry loop a normally-reported verify failure already gets.
 """
 
+import asyncio
 import sys
 import uuid
 from pathlib import Path
@@ -42,7 +43,7 @@ async def _resolve_artifacts(results: dict) -> dict:
     return {}
 
 
-async def _run_workflow(plan: dict, execute_step) -> dict:
+async def _run_workflow(plan: dict, execute_step, config: dict | None = None) -> dict:
     @activity.defn(name="plan_task")
     async def plan_task(payload: dict) -> dict:
         return plan
@@ -56,7 +57,7 @@ async def _run_workflow(plan: dict, execute_step) -> dict:
         ):
             return await env.client.execute_workflow(
                 AriAgentWorkflow.run,
-                {"prompt": "fix it", "history": [], "config": {}, "confirmed_action": None},
+                {"prompt": "fix it", "history": [], "config": config or {}, "confirmed_action": None},
                 id=f"test-{uuid.uuid4()}",
                 task_queue=_TASK_QUEUE,
             )
@@ -148,3 +149,169 @@ async def test_raised_activity_error_without_on_failure_still_aborts_immediately
     assert calls["analyze"] == 1
     assert result["status"] == "failed"
     assert "final:failed" in result["message"]
+
+
+
+# --- pipeline wall-clock budget -------------------------------------------
+#
+# Regression coverage for stg workflow 9b32a817 (2026-10-08): a single
+# request ran 45m56s without any one step ever exceeding its own
+# configured timeout. Every bound in capabilities.yaml is per-*attempt*;
+# `retry.max_attempts` multiplied them, the `on_failure` loop multiplied
+# that again, and nothing capped the product.
+#
+# These drive the clock with retry backoff rather than a sleeping
+# activity. The time-skipping environment only skips while nothing is
+# running, so an activity that blocks for the budget costs that budget in
+# real seconds; backoff between attempts is a server-side timer and is
+# skipped instantly. It also exercises the stronger claim directly — that
+# the budget binds *across* a step's retries, not just one attempt.
+
+_BUDGET_SECONDS = 600
+_BUDGET = {"options": {"pipeline_budget_seconds": _BUDGET_SECONDS}}
+
+# 50 attempts backing off from 10s at coefficient 2.0 runs for days if
+# nothing stops it. The budget is what has to stop it.
+_RUNAWAY_RETRY = {"max_attempts": 50, "backoff_seconds": 10}
+
+
+def _step(capability: str, **overrides) -> dict:
+    step = {
+        "capability": capability,
+        "params": {},
+        "retry": {"max_attempts": 1, "backoff_seconds": 0},
+        "on_failure": None,
+        "timeout_seconds": None,
+        "confirmed": False,
+    }
+    step.update(overrides)
+    return step
+
+
+@pytest.mark.asyncio
+async def test_the_budget_caps_a_step_across_all_of_its_retries():
+    plan = {"steps": [_step("generate_change", retry=_RUNAWAY_RETRY)], "rationale": "test"}
+    calls = {"n": 0}
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        if payload["capability"] == "respond":
+            return {"message": f"final:{payload['params'].get('pipeline_status')}"}
+        calls["n"] += 1
+        raise RuntimeError("simulated: attempt failed")
+
+    result = await _run_workflow(plan, execute_step, config=_BUDGET)
+
+    assert result["status"] == "failed"
+    assert "final:failed" in result["message"]
+    # Cut off by the clock, not by exhausting max_attempts -- which is the
+    # whole point, since max_attempts was never the binding constraint.
+    assert 0 < calls["n"] < _RUNAWAY_RETRY["max_attempts"]
+
+
+@pytest.mark.asyncio
+async def test_the_on_failure_loop_stops_once_the_budget_is_spent():
+    # The loop's own `max_attempts: 3` bounds how many times it repeats,
+    # not how long those repeats take -- exactly the gap that let
+    # 9b32a817 run 45m56s. Budget and backoff are sized here so the clock
+    # runs out before that loop cap would have, which is the case the cap
+    # alone cannot cover.
+    plan = {
+        "steps": [
+            _step("generate_change"),
+            _step(
+                "verify",
+                retry={"max_attempts": 50, "backoff_seconds": 1},
+                on_failure={"goto": "generate_change", "max_attempts": 3, "then": "fail_needs_human"},
+            ),
+        ],
+        "rationale": "test",
+    }
+    calls = {"generate_change": 0, "verify": 0}
+    reason = {}
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        capability = payload["capability"]
+        if capability == "respond":
+            reason["text"] = payload["params"].get("failure_reason") or ""
+            return {"message": f"final:{payload['params'].get('pipeline_status')}"}
+        calls[capability] += 1
+        if capability == "verify":
+            raise RuntimeError("simulated: verify failed")
+        return {"status": "ok"}
+
+    # Backoff has to stay small relative to the budget: Temporal will not
+    # sleep past an activity's schedule_to_close, so a backoff longer than
+    # the budget's remainder ends that attempt without the clock moving,
+    # and the budget would never actually be spent.
+    result = await _run_workflow(plan, execute_step, config={"options": {"pipeline_budget_seconds": 200}})
+
+    assert result["status"] == "failed"
+    # The run must end because the clock ran out, not because the loop hit
+    # its own attempt cap -- and must say which, since the two call for
+    # completely different follow-up.
+    assert "budget" in reason["text"], reason
+    assert "generate_change" in reason["text"], "must name the step that never got to run"
+    # Without the budget this loop runs generate_change 4 times (see the
+    # on_failure test above).
+    assert calls["generate_change"] < 4
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_finishes_inside_the_budget_is_untouched_by_it():
+    # The cap must be invisible to every healthy request -- a guard that
+    # fires on normal work is worse than no guard.
+    plan = {"steps": [_step("generate_change"), _step("propose_pr")], "rationale": "test"}
+    seen = []
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        if payload["capability"] == "respond":
+            return {"message": f"final:{payload['params'].get('pipeline_status')}"}
+        seen.append(payload["capability"])
+        return {"status": "ok"}
+
+    result = await _run_workflow(plan, execute_step, config=_BUDGET)
+
+    assert seen == ["generate_change", "propose_pr"]
+    assert result["status"] == "completed"
+    assert "final:completed" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_the_budget_still_lets_respond_run_so_the_caller_learns_why():
+    # Cutting the pipeline off must not cut off the explanation: a caller
+    # that waited out the budget deserves a real message, not the SDK's
+    # generic error. `respond` runs on every exit path.
+    plan = {"steps": [_step("generate_change", retry=_RUNAWAY_RETRY)], "rationale": "test"}
+    responded = {"ran": False}
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        if payload["capability"] == "respond":
+            responded["ran"] = True
+            return {"message": "explained"}
+        raise RuntimeError("simulated: attempt failed")
+
+    result = await _run_workflow(plan, execute_step, config=_BUDGET)
+
+    assert responded["ran"] is True
+    assert result["message"] == "explained"
+
+
+@pytest.mark.asyncio
+async def test_without_an_override_the_default_budget_leaves_normal_runs_alone():
+    # The override is a convenience; the shipped default must not be so
+    # tight that an ordinary pipeline trips it.
+    plan = {"steps": [_step("clone_repo"), _step("generate_change"), _step("propose_pr")], "rationale": "test"}
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        if payload["capability"] == "respond":
+            return {"message": f"final:{payload['params'].get('pipeline_status')}"}
+        return {"status": "ok"}
+
+    result = await _run_workflow(plan, execute_step)
+
+    assert result["status"] == "completed"

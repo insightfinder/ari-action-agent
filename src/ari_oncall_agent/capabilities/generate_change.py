@@ -113,6 +113,14 @@ async def run(ctx: StepContext) -> dict:
 
     opencode = ctx.tool("opencode")
     git_diff = ctx.tool("git_diff")
+    untracked_files = ctx.tool("git_untracked_files")
+
+    # Everything untracked *before* opencode runs, so a file it creates can
+    # be told apart from one that was already lying around — which on an
+    # `on_failure` loop back from `verify` includes whatever scratch files
+    # that verify run left behind. See git_ops.intent_to_add for what goes
+    # wrong without this.
+    untracked_before = set(await untracked_files(ctx.repo_dir))
 
     prior_failure = ctx.results.get("verify", {}).get("failure")
 
@@ -161,8 +169,43 @@ async def run(ctx: StepContext) -> dict:
         trace = merge_traces(trace, followup["trace"])
     if not title:
         title = _safe_title(summary)
+    # A brand-new file is untracked, and `git diff HEAD` cannot see one at
+    # all; staging just the ones that appeared during this call makes both
+    # the diff and the file list below complete without ever sweeping in a
+    # scratch file. Only files, not the whole tree.
+    created = sorted(set(await untracked_files(ctx.repo_dir)) - untracked_before)
+    await ctx.tool("git_intent_to_add")(ctx.repo_dir, created)
+
     diff = await git_diff(ctx.repo_dir)
     changed_files = await ctx.tool("git_changed_files")(ctx.repo_dir)
+    # An empty working tree means opencode edited nothing, whatever its
+    # prose says. It is never a legitimate outcome here: this capability
+    # is only ever scheduled to make a change, and on an `on_failure` loop
+    # back from `verify` the earlier attempt's edits are still uncommitted
+    # in this same tree, so a clean tree means *nothing at all* was done.
+    #
+    # Confirmed live (stg workflow 9b32a817, 2026-10-08): opencode made
+    # exactly one tool call, which was invalid, finished in 20s with an
+    # empty diff — and still returned success carrying a confident,
+    # entirely fabricated summary ("now includes exponential backoff retry
+    # logic, DNS resolution validation, circuit breaker pattern..."). The
+    # empty-change guard lived only in propose_pr/publish_pr, which run
+    # *after* `verify`, so `verify` was sent to build and test a change
+    # that did not exist, timed out at its full 480s, looped back here,
+    # and did it again — 45 minutes to discover that nothing happened in
+    # the first 20 seconds.
+    #
+    # Raised, not reported as a soft `{"status": "failed"}`: this step has
+    # no `on_failure` policy, so the raise is retried once by its own
+    # retry policy (a second genuine attempt at the edit) and then ends
+    # the run with this message as the stated reason, instead of handing
+    # an empty change downstream.
+    if not changed_files:
+        raise RuntimeError(
+            "generate_change: opencode reported a change but left the working tree "
+            f"unmodified — nothing was edited. Tool calls: {trace.get('tool_call_counts') or 'none'}. "
+            f"Its own summary claimed: {summary[:500]!r}"
+        )
     return {
         "root_cause": {"summary": summary, "evidence": []},
         "title": title,

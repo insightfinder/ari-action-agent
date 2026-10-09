@@ -15,11 +15,17 @@ from common.settings import get_settings  # noqa: E402
 
 
 @pytest.fixture
-def jenkins_agent_kind(monkeypatch):
+def oncall_agent_kind(monkeypatch):
     # plan_task's bypass branch reads get_agent_meta().confirm_capability,
-    # which is agent-kind-scoped -- flip the whole process to "jenkins" for
+    # which is agent-kind-scoped -- flip the whole process to "oncall" for
     # the duration of the test, same pattern as test_agent_meta.py.
-    monkeypatch.setenv("AGENT_KIND", "jenkins")
+    #
+    # These two bypass tests used to be written against the jenkins kind,
+    # purely because it was the first kind to have a confirm_capability.
+    # They were nearly lost when that kind moved to its own branch, which
+    # would have left the confirmation bypass -- the mechanism the whole
+    # email-approval flow resumes through -- with no coverage at all.
+    monkeypatch.setenv("AGENT_KIND", "oncall")
     get_settings.cache_clear()
     get_agent_meta.cache_clear()
     capabilities_registry._load_specs.cache_clear()
@@ -30,30 +36,42 @@ def jenkins_agent_kind(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_plan_task_bypass_branch_skips_the_llm_planner_entirely(jenkins_agent_kind, monkeypatch):
+async def test_plan_task_bypass_branch_skips_the_llm_planner_entirely(oncall_agent_kind, monkeypatch):
+    # An approved proposal must go straight to the confirm capability. If
+    # the planner ran again here it could plan something other than what
+    # the person actually approved, which is the entire thing the gate
+    # exists to prevent.
     create_plan = AsyncMock()
     monkeypatch.setattr(activities, "create_plan", create_plan)
 
-    confirmed_action = {"action": "trigger_build", "job": "deploy/checkout-service", "id": "b2c1"}
+    confirmed_action = {
+        "action": "open_pull_request",
+        "repo": "insightfinder/x",
+        "branch": "ari/fix-1",
+        "id": "b2c1",
+    }
     result = await activities.plan_task(
-        {"prompt": "yes", "config": {}, "history": [], "confirmed_action": confirmed_action}
+        {"prompt": "approved", "config": {}, "history": [], "confirmed_action": confirmed_action}
     )
 
     create_plan.assert_not_awaited()
     assert len(result["steps"]) == 1
     step = result["steps"][0]
-    assert step["capability"] == "execute_action"
+    assert step["capability"] == "publish_pr"  # oncall's meta.confirm_capability
     assert step["params"] == confirmed_action
     assert step["confirmed"] is True
-    assert step["retry"]["max_attempts"] == 1  # configs/jenkins/capabilities.yaml's execute_action policy
+    assert step["retry"]["max_attempts"] == 3  # configs/oncall/capabilities.yaml's publish_pr policy
 
 
 @pytest.mark.asyncio
-async def test_plan_task_normal_branch_marks_every_planner_step_unconfirmed(jenkins_agent_kind, monkeypatch):
-    create_plan = AsyncMock(return_value=Plan(steps=[Step(capability="resolve_target", params={})], rationale="r"))
+async def test_plan_task_normal_branch_marks_every_planner_step_unconfirmed(oncall_agent_kind, monkeypatch):
+    # The contrast case, and the reason StepContext.confirmed cannot be
+    # spoofed by a planner: nothing the planner produces is ever born
+    # confirmed.
+    create_plan = AsyncMock(return_value=Plan(steps=[Step(capability="clone_repo", params={})], rationale="r"))
     monkeypatch.setattr(activities, "create_plan", create_plan)
 
-    result = await activities.plan_task({"prompt": "how's the build?", "config": {}, "history": []})
+    result = await activities.plan_task({"prompt": "what changed?", "config": {}, "history": []})
 
     create_plan.assert_awaited_once()
     assert len(result["steps"]) == 1
@@ -86,18 +104,32 @@ async def test_plan_task_applies_oncalls_default_step_policy(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_artifacts_resolves_declared_artifacts_from_results(jenkins_agent_kind):
-    # jenkins' own agent_meta.artifacts: {"pending_action": "propose_action.pending_action", ...}
-    results = {"propose_action": {"pending_action": {"id": "abc"}, "trace": {}}}
+async def test_resolve_artifacts_resolves_declared_artifacts_from_results(monkeypatch):
+    # oncall's own agent_meta.artifacts: {"root_cause": "generate_change.root_cause", ...}
+    monkeypatch.setenv("AGENT_KIND", "oncall")
+    get_settings.cache_clear()
+    get_agent_meta.cache_clear()
+    try:
+        results = {"generate_change": {"root_cause": "off-by-one in the retry loop", "diff": {}}}
 
-    found = await activities.resolve_artifacts(results)
+        found = await activities.resolve_artifacts(results)
 
-    assert found == {"pending_action": {"id": "abc"}}
+        assert found == {"root_cause": "off-by-one in the retry loop"}
+    finally:
+        get_settings.cache_clear()
+        get_agent_meta.cache_clear()
 
 
 @pytest.mark.asyncio
-async def test_resolve_artifacts_omits_artifacts_whose_capability_never_ran(jenkins_agent_kind):
-    assert await activities.resolve_artifacts({}) == {}
+async def test_resolve_artifacts_omits_artifacts_whose_capability_never_ran(monkeypatch):
+    monkeypatch.setenv("AGENT_KIND", "oncall")
+    get_settings.cache_clear()
+    get_agent_meta.cache_clear()
+    try:
+        assert await activities.resolve_artifacts({}) == {}
+    finally:
+        get_settings.cache_clear()
+        get_agent_meta.cache_clear()
 
 
 @pytest.mark.asyncio

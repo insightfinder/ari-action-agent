@@ -27,6 +27,14 @@ tools:
     module: ari_oncall_agent.tools.git_ops
     function: changed_files
 
+  git_untracked_files:
+    module: ari_oncall_agent.tools.git_ops
+    function: untracked_files
+
+  git_intent_to_add:
+    module: ari_oncall_agent.tools.git_ops
+    function: intent_to_add
+
   git_set_origin:
     module: ari_oncall_agent.tools.git_ops
     function: set_origin
