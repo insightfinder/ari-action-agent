@@ -22,6 +22,20 @@ from common.capabilities_base import StepContext  # noqa: E402
 _STUB_TRACE = {"elapsed_s": 0.0, "tool_call_counts": {}, "tool_call_total": 0, "slowest_gaps": []}
 
 
+def _change_tools(opencode, diff: str, changed: list[str], untracked: list[list[str]] | None = None):
+    """The tool set generate_change asks for. `untracked` is the sequence of
+    `git_untracked_files` results — it is called once before opencode and
+    once after, so a two-element list expresses "this appeared during the
+    call" (see git_ops.intent_to_add for why that difference matters)."""
+    return {
+        "opencode": opencode,
+        "git_diff": AsyncMock(return_value=diff),
+        "git_changed_files": AsyncMock(return_value=changed),
+        "git_untracked_files": AsyncMock(side_effect=list(untracked or [[], []])),
+        "git_intent_to_add": AsyncMock(return_value=None),
+    }
+
+
 _CLONE_REPO_RESULT = {"cloned_path": "/tmp/ws/repo", "ref": "main"}
 
 
@@ -280,11 +294,7 @@ async def test_generate_change_returns_only_the_marked_summary_not_raw_narration
     )
     ctx = _ctx(
         results={},
-        tools={
-            "opencode": opencode,
-            "git_diff": AsyncMock(return_value="diff --git a/models.go b/models.go"),
-            "git_changed_files": AsyncMock(return_value=["models.go"]),
-        },
+        tools=_change_tools(opencode, "diff --git a/models.go b/models.go", ["models.go"]),
         capability="generate_change",
     )
 
@@ -304,11 +314,7 @@ async def test_generate_change_also_returns_root_cause_from_the_same_summary():
     )
     ctx = _ctx(
         results={},
-        tools={
-            "opencode": opencode,
-            "git_diff": AsyncMock(return_value="diff"),
-            "git_changed_files": AsyncMock(return_value=["models.go"]),
-        },
+        tools=_change_tools(opencode, "diff", ["models.go"]),
         capability="generate_change",
     )
 
@@ -379,11 +385,7 @@ async def test_generate_change_issues_enforcement_followup_when_marker_missing()
     )
     ctx = _ctx(
         results={},
-        tools={
-            "opencode": opencode,
-            "git_diff": AsyncMock(return_value="diff --git a/models.go b/models.go"),
-            "git_changed_files": AsyncMock(return_value=["models.go"]),
-        },
+        tools=_change_tools(opencode, "diff --git a/models.go b/models.go", ["models.go"]),
         capability="generate_change",
     )
 
@@ -397,3 +399,186 @@ async def test_generate_change_issues_enforcement_followup_when_marker_missing()
     # would otherwise start a fresh, context-less session.
     _, followup_kwargs = opencode.await_args_list[1]
     assert followup_kwargs == {"continue_session": True}
+
+
+@pytest.mark.asyncio
+async def test_generate_change_refuses_to_report_success_on_an_unmodified_tree():
+    # The live failure this guards (stg workflow 9b32a817, 2026-10-08):
+    # opencode made one tool call, which was invalid, returned in 20s
+    # having edited nothing, and handed back a confident, fabricated
+    # summary. Without this guard that empty change flowed on to `verify`,
+    # which spent its full 480s building a change that did not exist,
+    # looped back here on `on_failure`, and did it all again — 45 minutes
+    # to discover nothing happened in the first 20 seconds.
+    opencode = AsyncMock(
+        return_value={
+            "text": "TITLE: Add retry logic\nSUMMARY:\nThe service now includes exponential backoff.",
+            "trace": {**_STUB_TRACE, "tool_call_counts": {"invalid": 1}, "tool_call_total": 1},
+        }
+    )
+    ctx = _ctx(
+        results={},
+        tools=_change_tools(opencode, "", []),
+        capability="generate_change",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await opencode_change.run(ctx)
+
+    message = str(exc_info.value)
+    assert "the working tree is unmodified" in message
+    # The two things a human needs to tell "the model did nothing" apart
+    # from "the sandbox is broken": what it actually called, and what it
+    # said about it.
+    assert "invalid" in message, "must report the tool calls that were made"
+    assert "exponential backoff" in message, "must quote the account it could not back up"
+
+
+@pytest.mark.asyncio
+async def test_generate_change_accepts_a_tree_with_changes():
+    # Contrast case for the guard above — the normal path must be
+    # untouched by it.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Fix it\nSUMMARY:\nFixed the thing.", "trace": _STUB_TRACE}
+    )
+    ctx = _ctx(
+        results={},
+        tools=_change_tools(opencode, "diff --git a/models.go b/models.go", ["models.go"]),
+        capability="generate_change",
+    )
+
+    result = await opencode_change.run(ctx)
+
+    assert result["changed_files"] == ["models.go"]
+
+
+@pytest.mark.asyncio
+async def test_generate_change_still_fails_on_an_empty_tree_after_a_verify_loopback():
+    # The on_failure loop re-runs this capability in the *same* working
+    # tree, so an earlier attempt's edits are still uncommitted there. A
+    # clean tree on the second pass therefore means nothing was ever done,
+    # not "nothing new was done" — the guard must not be relaxed for it.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Fix it\nSUMMARY:\nFixed the thing.", "trace": _STUB_TRACE}
+    )
+    ctx = _ctx(
+        results={"verify": {"status": "failed", "failure": "tests failed"}},
+        tools=_change_tools(opencode, "", []),
+        capability="generate_change",
+    )
+
+    with pytest.raises(RuntimeError, match="the working tree is unmodified"):
+        await opencode_change.run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_generate_change_stages_a_brand_new_file_so_the_diff_can_see_it():
+    # The live bug this closes (test, 2026-10-09, workflow 979a2b0e):
+    # asked for a CONTRIBUTING.md the repository did not have, opencode
+    # called `write`, the file was created — and because `git diff HEAD`
+    # cannot see an untracked path, the pipeline reported the working tree
+    # unmodified and failed. Every change whose whole content is a new
+    # file was unshippable.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Add guide\nSUMMARY:\nAdded CONTRIBUTING.md.", "trace": _STUB_TRACE}
+    )
+    tools = _change_tools(
+        opencode,
+        "diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md",
+        ["CONTRIBUTING.md"],
+        untracked=[[], ["CONTRIBUTING.md"]],
+    )
+    ctx = _ctx(results={}, tools=tools, capability="generate_change")
+
+    result = await opencode_change.run(ctx)
+
+    tools["git_intent_to_add"].assert_awaited_once_with(ctx.repo_dir, ["CONTRIBUTING.md"])
+    assert result["changed_files"] == ["CONTRIBUTING.md"]
+    # Staging has to happen before the diff is taken, or the diff that
+    # propose_pr turns into the approval email's key hunks is still blank
+    # and a human approves a file they were never shown.
+    assert tools["git_intent_to_add"].await_count == 1
+    assert tools["git_diff"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_change_does_not_stage_files_it_did_not_create():
+    # A file already untracked before opencode ran is not part of this
+    # change. On an on_failure loop back from `verify` that is exactly what
+    # verify's own scratch files are, and sweeping them in would put a
+    # throwaway test script into the pull request.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Fix it\nSUMMARY:\nFixed it.", "trace": _STUB_TRACE}
+    )
+    tools = _change_tools(
+        opencode,
+        "diff --git a/app.py b/app.py",
+        ["app.py"],
+        untracked=[["verify_scratch.py"], ["verify_scratch.py"]],
+    )
+    ctx = _ctx(
+        results={"verify": {"status": "failed", "failure": "tests failed"}},
+        tools=tools,
+        capability="generate_change",
+    )
+
+    result = await opencode_change.run(ctx)
+
+    tools["git_intent_to_add"].assert_awaited_once_with(ctx.repo_dir, [])
+    assert result["changed_files"] == ["app.py"]
+
+
+@pytest.mark.asyncio
+async def test_generate_change_stages_only_the_newly_created_file_among_untracked_ones():
+    # The discriminating case for the before/after snapshot: one scratch
+    # file was already there, one real file appeared during this call.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Add test\nSUMMARY:\nAdded a test.", "trace": _STUB_TRACE}
+    )
+    tools = _change_tools(
+        opencode,
+        "diff --git a/tests/test_new.py b/tests/test_new.py",
+        ["tests/test_new.py"],
+        untracked=[["verify_scratch.py"], ["verify_scratch.py", "tests/test_new.py"]],
+    )
+    ctx = _ctx(results={}, tools=tools, capability="generate_change")
+
+    await opencode_change.run(ctx)
+
+    tools["git_intent_to_add"].assert_awaited_once_with(ctx.repo_dir, ["tests/test_new.py"])
+
+
+@pytest.mark.asyncio
+async def test_the_empty_tree_message_does_not_accuse_an_honest_model_of_lying():
+    # Two different things reach this guard and the message has to be true
+    # of both. Seen live on stg (2026-10-09) one hour after the fabricated
+    # case shipped: opencode read the repo, correctly concluded nothing
+    # needed changing, and said so plainly. The first wording opened with
+    # "opencode reported a change but left the working tree unmodified",
+    # which is simply false here and sends whoever reads the failure
+    # hunting for a lying model that is not there.
+    #
+    # Failing is still right -- telling the two apart would mean trusting
+    # the model's account of itself, which is what this guard exists
+    # because we cannot do -- but the message must only state what was
+    # observed.
+    honest = "Verified that a README.md file exists in the repository root. No changes were required."
+    opencode = AsyncMock(
+        return_value={
+            "text": "TITLE: No change needed\nSUMMARY:\n" + honest,
+            "trace": {**_STUB_TRACE, "tool_call_counts": {"read": 1}, "tool_call_total": 1},
+        }
+    )
+    ctx = _ctx(results={}, tools=_change_tools(opencode, "", []), capability="generate_change")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await opencode_change.run(ctx)
+
+    message = str(exc_info.value)
+    assert "the working tree is unmodified" in message
+    assert honest in message, "must quote the account verbatim, whatever it says"
+    for accusation in ("reported a change", "claimed"):
+        assert accusation not in message, (
+            f"message asserts {accusation!r}, which is false when the model correctly "
+            f"declined to edit anything"
+        )

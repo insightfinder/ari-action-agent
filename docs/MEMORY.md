@@ -2707,3 +2707,411 @@ round trip. Every piece is covered by unit tests against the real SDK
 contract, and §5b's own round trip has never been exercised live either
 (2026-09-18 says so). This needs a deployed image plus UIE's approval path
 pointed at it, and `requireHumanApproval` enabled for the system.
+
+---
+
+## 2026-10-09 — The Jenkins kind moves to its own branch; three bugs found in live Temporal history
+
+Two separate pieces of work, on the same branch because the first is what
+makes the second reviewable.
+
+### The Jenkins agent is no longer on `main`/`test`/`staging`
+
+`jenkins_agent/` and everything that only serves it (`Dockerfile.jenkins`,
+`configs/jenkins/`, its sample client and local-test script, its two test
+modules, its entry in `_AGENT_PACKAGES`, in `pyproject.toml`'s packages,
+and in the CI image matrix) is deleted here and released from the
+`jenkins-agent` branch instead. §0 of design.md now says so, because
+without that note the rest of the document describes files a reader will
+not find.
+
+Verified before deleting anything, which is the only part of this worth
+recording: the Jenkins tree at this branch's tip was **byte-identical** to
+`origin/jenkins-agent`, so nothing was lost. The real exposure was
+somewhere else entirely — `jenkins-agent`'s last two commits (`ea23688`,
+`4de9dac`, 210 lines newer than this branch's copy) were on no remote at
+all. Pushed first, deleted second.
+
+**Two tests were nearly lost with it**, and they are the reason this
+section exists: `test_plan_task_bypass_branch_skips_the_llm_planner_
+entirely` and `test_plan_task_normal_branch_marks_every_planner_step_
+unconfirmed` lived in `test_activities.py` behind a `jenkins_agent_kind`
+fixture, purely because Jenkins was the first kind to have a
+`confirm_capability`. Deleting them would have left the confirmation
+bypass — the exact mechanism an approved pull request resumes through
+(§5c) — with no coverage, on the branch that introduced it. Rewritten
+against the `oncall` kind, where they now also pin
+`confirm_capability == "publish_pr"` and `publish_pr`'s real retry policy.
+Any future kind-scoped test should be written against the kind under
+test, not whichever kind happened to have the feature first.
+
+### Three bugs, all found in Temporal history rather than by reading code
+
+All three are live-confirmed, and the first two are each sufficient on
+their own to explain an incident reported from HQ.
+
+**1. `generate_change` returned success on an unmodified working tree.**
+stg workflow `9b32a817`, 2026-10-08: opencode made exactly one tool call,
+which was *invalid*, returned in 20.16s having edited nothing (`diff: ""`,
+`changed_files: null`) — and still returned success carrying a confident,
+entirely fabricated summary ("now includes exponential backoff retry
+logic, DNS resolution validation, circuit breaker pattern..."). The
+empty-change guard existed only in `propose_pr`/`publish_pr`, which run
+*after* `verify`. So `verify` was sent to build and test a change that did
+not exist, timed out at its full 480s, looped back through
+`on_failure`, and did it all again. 45m56s to discover that nothing
+happened in the first 20 seconds.
+
+Now raised, not returned as a soft failure: this step has no `on_failure`
+policy, so the raise gets one genuine retry from its own policy and then
+ends the run with the reason stated — including the tool-call counts and
+the claim it could not back up, which are what tell "the model did
+nothing" apart from "the sandbox is broken". The guard deliberately does
+*not* relax on an `on_failure` loop-back: the earlier attempt's edits are
+still uncommitted in that same tree, so a clean tree there means nothing
+was ever done, not "nothing new".
+
+**2. No wall-clock ceiling on the pipeline.** The same 45m56s run never
+exceeded a single configured timeout, because every bound in
+`capabilities.yaml` is per-*attempt*. Full accounting from the history:
+
+```
+   0-   5s  prepare_workspace + plan_task + clone_repo          5s
+   5-  53s  generate_change #1  OK                             48s
+  53- 533s  verify #1           TIMEOUT (timeout_seconds: 480) 480s
+ 534-1734s  generate_change #2 attempt 1  TIMEOUT (default)   1200s
+1734-1744s  backoff (backoff_seconds: 10)                      10s
+1744-1764s  generate_change #2 attempt 2  OK — empty diff       20s
+1764-2245s  verify #2           TIMEOUT                       481s
+2246-2752s  generate_change #3 attempt 1 (cancelled by hand)  506s
+2752-2756s  cancel -> cleanup -> resolve_artifacts -> respond    4s
+```
+
+Note the history shows no event for an intermediate activity attempt —
+the 1210s "gap" at 534s is `attempt=2` on the STARTED event, i.e. 1200s
+(attempt 1's `start_to_close`) + 10s backoff, exactly. Reading that gap as
+a stall is the easy mistake here.
+
+The design maximum for that plan is ~3.2 hours. There is now a
+whole-pipeline budget (1 hour default, `options.pipeline_budget_seconds`
+per request), applied as each step's `schedule_to_close_timeout` rather
+than as a between-steps check — a check between steps cannot interrupt the
+step that is already overrunning, which is the entire failure mode.
+Measured from `workflow.info().start_time`, so it covers planning too; a
+confirmation resume is its own workflow and gets its own full budget.
+
+**3. `git push` was held to the 30s local-operation timeout.** It is the
+only non-clone command in `git_ops.py` that talks to a network, and it
+shared `GIT_SUBPROCESS_TIMEOUT_SECONDS` with `diff`/`add`/`commit`. Now a
+third tier (`GIT_NETWORK_TIMEOUT_SECONDS`, 120s). What this cost, on prod
+2026-10-08: three concurrent runs against `ECommerce-Demo-APIServer` all
+lost the deterministic publish path and fell through to the (then still
+present) opencode + GitHub MCP fallback, which lets the LLM invent branch
+names. `git diff timed out after 30s` appears in the same worker-log
+window. Of those three runs, `ec84dcec` created PR #3 — and `64f7cbc6`,
+finishing 28 seconds later, called `github_list_pull_requests`,
+`github_pull_request_read` and **`github_update_pull_request`**, never
+`github_create_pull_request`, then reported `/pull/3` as its own from the
+text-regex fallback (`"branch": ""` is that path's signature). One run's
+change was silently folded into another's pull request. Two of the three
+also called `github_fork_repository` on a company repo.
+
+That fallback is already gone from this branch (2026-10-08 entry), so the
+duplicate-PR path is closed here regardless; `main` and the prod image
+`2609282209-main` still carry it. The timeout fix matters anyway, because
+losing the deterministic path at all is what put an LLM in charge of
+branch naming in the first place.
+
+**Also found, not fixed (out of scope, recorded so it is not re-derived):**
+there is no `activity.heartbeat()` anywhere in this codebase, so Temporal
+cannot deliver cancellation — a timed-out attempt's opencode subprocess
+keeps running in the pod after the workflow has moved on.
+
+**Verified:** full suite **274 passed**, run inside
+`ari-oncall-agent-worker:test` with `src/`, `tests/`, `configs/` and
+`docs/` mounted over it, so the 11 modules that cannot be collected on
+Windows (`a2a`, `fcntl`) actually ran — including the three the Jenkins
+strip modified. 15 new cases: 3 for the empty-tree guard, 3 for the
+timeout tiers, 4 unit cases for budget parsing, 5 behavioural ones in
+`test_workflow_execution.py`.
+
+A note on writing the budget tests, because it cost an hour: the
+time-skipping environment only skips while **nothing is running**, so an
+activity that blocks for the budget costs that budget in real seconds
+(three tests, 120s each, 364s for the file). Driving the clock with retry
+backoff instead is instant — but Temporal will not sleep past an
+activity's `schedule_to_close`, so a backoff longer than the remaining
+budget ends that attempt without the clock moving at all, and the budget
+is never actually spent. Small backoff, many attempts. 4.47s.
+
+### Later the same day — driven live, which found a fourth defect the unit suite could not
+
+`scripts/oncall_live_test.py` (new) drives a deployed agent over its real
+A2A surface and asserts on what comes back. Run by hand against test/stg,
+never in CI: every scenario costs real tokens and two of them write to a
+real repository. Ran against our patched `src/` mounted over
+`ari-oncall-agent-worker:test` on the bastion, on its own task queue
+(`oncall-ari-queue-livetest`) so it never competed with the deployed
+worker, pointed at the test cluster's Temporal.
+
+**The fourth defect: a change whose content is a NEW file was invisible,
+so this agent could not ship one at all.** `changed_files` is `git diff
+--name-only HEAD` and `diff` is `git diff HEAD` — neither can see an
+untracked path. Confirmed live (workflow `979a2b0e`, against
+`OnCall-ARI-InfraCore-testing@dev`): asked for a `CONTRIBUTING.md` the
+repository did not have (GitHub API: 404), opencode called `write` (tool
+trace `read 2, glob 1, grep 1, write 1`), the file was created — and the
+pipeline reported the working tree unmodified. The retry called `edit` on
+that same still-untracked file and said the same thing.
+
+This is pre-existing, but the empty-tree guard above made it *lie*:
+before the guard it surfaced one step later as `plan_pr`'s
+"generate_change reported no changed files to publish", after paying for a
+full verify run; with the guard it fails fast and names a cause that is
+false. "Add a new test / module / config file" is a large share of real
+fixes, so this was worth fixing rather than documenting.
+
+Fixed with `git add -N` on exactly the files that appeared during this
+`generate_change` call: `untracked_files()` is snapshotted before the
+opencode call and again after, and only the difference is staged. The
+before/after snapshot is what keeps verify's scratch files out on an
+`on_failure` loop back — those are already untracked when the second
+generate_change starts, so they are never "new". Measured first rather
+than assumed: `git add -N` puts the path into `git diff --name-only HEAD`
+*and* renders the whole file as additions in `git diff HEAD`, while
+`--exclude-standard` keeps `.gitignore`d paths out. The diff mattering as
+much as the file list is the point — `propose_pr`'s `key_hunks()` reads
+it, so without this a human would approve a new file whose contents the
+approval email never showed them.
+
+**The default pipeline budget is 3000s, not 3600s, and the caller is why.**
+MCP Service's `ONCALL_TASK_AGENT_TIMEOUT_S` is 3600s on test, and its
+`agent_timeout_s()` docstring says plainly that "the task path sets no
+deadline inside the agent itself" — so this budget is the only in-agent
+bound there is. At 3600s the step loop would finish at the exact moment
+the caller gives up, and cleanup/resolve/respond add ~360s after it, so
+the answer would arrive at ~3960s to nobody. MCP also sends
+`"options": {}` (`app/oncall/ari_oncall_agent.py`), so the constant is
+what actually runs — the per-request override never fires in production.
+
+**Live results** (test cluster, 2026-10-09):
+
+| scenario | result |
+|---|---|
+| `card` | `skills=['code_analysis_fix']` |
+| `budget` | FAILED at 131s against a 120s budget. History (`613127ee`): `verify` was scheduled with `stc=44.86s`, not the 480s its own `timeout_seconds` asks for, and was cut at exactly 120.0s; `respond` still ran and explained why |
+| `empty` | FAILED at 76s with no `root_cause` artifact; the workflow result's `data` held `clone_repo` alone, so `verify` never ran |
+| `propose` | 56s, `INPUT_REQUIRED`, branch `ari/...-b17f2793` confirmed pushed via the GitHub API, `pending_action` carrying 597 characters of key hunks |
+| `confirm` | `COMPLETED` in **5s**, PR #13 opened — `added CONTRIBUTING.md +40/-0` |
+| `reject` | a confirm carrying an id the task never proposed → FAILED in 0s with a clear message |
+
+`confirm` closes **§5c's round trip, which this file has recorded as
+unverified since 2026-09-18**. Its 5 seconds are the "push the branch
+before the pause" decision paying off: `publish_pr` had only an API call
+left to make. And PR #13 being an `added` file is the fourth defect's fix
+proven end to end — that change could not have been shipped at all an
+hour earlier.
+
+**Three things the live script itself got wrong, worth not repeating:**
+
+1. `empty` first reported INCONCLUSIVE on a run that had worked perfectly,
+   because it string-matched `respond`'s prose for "unmodified".
+   `respond` is an LLM writing for a human and paraphrased the guard
+   differently on each of two runs ("didn't actually modify any files",
+   then "didn't actually modify the working tree").
+   `docs/INPUT_REQUIRED_INTEGRATION.md` says this outright — "task.status.
+   message's text is for a human to read, not for your code to parse" —
+   and points at the signal that works: `root_cause` resolves from
+   `generate_change.root_cause`, so a `generate_change` that raised leaves
+   it absent. Assert on artifacts and state, never on the message.
+2. `reject` ran before `confirm` and shared its paused task. A confirm,
+   valid or bogus, moves that task to a terminal state and A2A has no way
+   back, so `confirm` died on a bare HTTP 400 that said nothing about the
+   cause. Each scenario now pauses its own task.
+3. The budget's workflow tests cost 364s before they cost 4s. Temporal's
+   time-skipping environment only skips while **nothing is running**, so
+   an activity that blocks for the budget burns that budget in real
+   seconds. Driving the clock with retry backoff is instant instead — but
+   Temporal will not sleep past an activity's `schedule_to_close`, so a
+   backoff longer than the remaining budget ends that attempt without the
+   clock moving and the budget is never spent. Small backoff, many
+   attempts.
+
+**Verified:** full suite **281 passed** in
+`ari-oncall-agent-worker:test`, plus the six live scenarios above. 7 more
+cases for the new-file fix (3 in `test_capabilities.py`, including one
+pinning that an already-untracked file is *not* treated as part of this
+change; 4 in `test_git_ops.py`).
+
+**Still not verified:** the approval *email* itself, and MCP Service
+driving this pause end to end. `scenario_confirm` sends exactly what
+`app/tasks/a2a_resume.py:confirm_message` builds (same `task_id` +
+`context_id`, original config DataPart plus `confirm_pending_action`), so
+the agent side of that contract is now exercised — what remains is UIE
+rendering the mail and MCP relaying the click.
+
+**A limit worth knowing before trusting email approval:** the A2A
+`TaskStore` is in memory, and `_find_pending_action` scans
+`context.current_task`, so an API pod restart loses every pending
+approval. `publish_pr` has no staleness window of its own (the 30-minute
+check the integration guide describes was `execute_action`'s, and that
+kind is gone), and MCP waits `ONCALL_TASK_APPROVAL_TIMEOUT_S` = 86400s —
+24 hours. So the protocol permits approving a day later while the pod's
+lifetime decides whether it works. Untested, and email approval is by
+nature the slow-human case.
+
+### Same day, one hour later — the empty-tree message was accusing an honest model
+
+The guard above shipped with the wording *"opencode reported a change but left
+the working tree unmodified"*, written against the only case we had seen: a
+model that fabricated a change. An hour after it went live on stg a second
+case appeared, and the wording is false for it. opencode read the repository,
+correctly concluded nothing needed changing, and said so:
+
+```
+Tool calls: {'read': 1}
+'Verified that a README.md file exists in the repository root directory. No
+ changes were required as per the instructions to only create a minimal README
+ if none exists.'
+```
+
+It reported no change. The message told whoever read the failure to go looking
+for a lying model that was not there.
+
+**Still a failure, and that part is not in question** — this step is only ever
+scheduled to produce a change, and distinguishing "lied" from "correctly
+declined" would mean trusting the model's account of itself, which is the one
+thing this guard exists because we cannot do. What changed is only the wording:
+state the tree, the tool calls and the account verbatim, and let a person
+judge. `test_the_empty_tree_message_does_not_accuse_an_honest_model_of_lying`
+pins both halves — the guard still fires, and the message contains neither
+"reported a change" nor "claimed".
+
+Worth generalising: an error message written from one observed instance tends
+to encode that instance's *cause* rather than its *symptom*. The symptom here
+("the tree is unmodified") was always safe to state; the cause ("it claimed
+otherwise") was only true once.
+
+**Verified:** 282 passed in `ari-oncall-agent-worker:test`.
+
+### Same day — the worker was pid 1, and pid 1 was not reaping
+
+Found by looking at the bastion rather than at any test output: a worker up
+3h35m had 15 `[git] <defunct>` processes, all parented to
+`python -m api.worker` running as pid 1 in its container. All 15 disappeared
+the moment that container was removed, which is what confirmed the parent.
+
+**The first explanation was wrong and is worth recording as such.** The obvious
+suspect was `git_ops._communicate`, which on timeout calls `proc.kill()` and
+raises without ever awaiting `proc.wait()`. That reads like a leak, but it is
+not one: asyncio's default `ThreadedChildWatcher` runs a thread per subprocess
+that blocks in `os.waitpid()`, so anything *we* spawn is reaped regardless.
+
+The real chain has nothing to do with our subprocess handling. **opencode
+spawns its own `git` children.** When an activity is cancelled or times out and
+opencode goes away, those grandchildren are orphaned and reparented to pid 1 —
+and `CMD ["python", "-m", "api.worker"]` with no ENTRYPOINT makes the worker
+itself pid 1. Python reaps only the pids its watcher knows about, so an
+inherited orphan is never waited on.
+
+Fixed with `tini` as `ENTRYPOINT` in `Dockerfile.oncall` (`/usr/bin/tini`,
+0.19.0 in `python:3.12-slim`, path verified in the base image before writing
+it). Reaping from Python instead would mean a SIGCHLD handler calling
+`os.waitpid(-1, ...)`, which races the watcher threads for the exit status of
+processes we *do* own and makes `proc.wait()` raise `ChildProcessError` — an
+init is the mechanism built for exactly this.
+
+`test_the_worker_image_runs_an_init_as_pid_1` guards it, because the failure is
+silent, cumulative, and structurally invisible to the rest of the suite: every
+other test asserts on what one call returns, and this one only ever shows up in
+`ps`. Same blind spot the live scenarios have — they are per-request too.
+
+Deployed workers showed 0 zombies when checked, but they had been restarted
+1–2 hours earlier and served a dozen runs; that is not evidence of absence.
+
+**Verified:** 283 passed in `ari-oncall-agent-worker:test`. The image change
+itself only takes effect on the next build.
+
+**Correction, same day:** the tini ENTRYPOINT above is **inert in every
+deployment that uses the `oncallari` chart**, which is all of them. Kubernetes
+maps a container's `command:` onto the image's ENTRYPOINT and replaces it, and
+that chart hardcodes `command: ["python", "-m", "api.worker"]` in all six of
+its deployment templates with no values hook. Verified live on stg right after
+deploying the fix: the image reported
+`Entrypoint=[/usr/bin/tini --] Cmd=[python -m api.worker]` while the running
+container's `/proc/1/cmdline` was `python -m api.worker`.
+
+So the image half is done and the zombies are **not** fixed in production. The
+remaining half is a change to `insightfinder/charts` (drop the `command:`
+override, or make it `["/usr/bin/tini", "--", "python", "-m", "api.worker"]`),
+which needs its own Chart.yaml version bump.
+
+`test_the_worker_image_runs_an_init_as_pid_1` now says this in its own body,
+because a green test that only checks the Dockerfile reads as "zombies fixed"
+and is not. Worth generalising past this instance: a guard that asserts on an
+artifact this repo produces says nothing about how another repo deploys it, and
+the gap is invisible precisely because the assertion passes.
+
+**Resolved, 2026-10-10:** `insightfinder/charts` commit `004bb1b` deletes the
+`command:` line from `ari-oncall-agent-worker-deployment.yaml`, published as
+chart `0.3.1`, and `test-fluxcd` pins both ARI releases to it. Verified on test
+and stg after the upgrade: `/proc/1/cmdline` is now `/usr/bin/tini --`.
+
+Only that one template was changed, deliberately. The other five overrides are
+still there and are fine: the three API deployments run `uvicorn` and spawn
+nothing, and the action worker's image carries no opencode, no git and no build
+toolchain, so neither has orphans to inherit.
+
+## 2026-10-10 — the approval email said "Custom action"
+
+Reported from stg (Ayush, after the first live approval mail): the email's
+**Proposed action** read *Custom action* instead of naming what the agent
+wanted to do.
+
+Not a UIE bug. MCP Service's `approval_labels()`
+(`app/tasks/loop.py`, `origin/test`) resolves that label by scanning the paused
+task's artifacts for `data.action_name`, and returns `CUSTOM_ACTION_LABEL` when
+no artifact names the action. Our `pending_action` carried `action:
+"open_pull_request"` — the machine identifier `publish_pr` checks — and nothing
+a person reads. The action agent's own `pending_action`
+(`ari-agent-demo`, `propose_action.py`) carries both; this one carried one.
+
+Fixed by adding `"action_name": "Open pull request"` beside `action`. Two
+constraints in that function, both now asserted by
+`test_proposal_names_the_action_for_the_approval_email`: the name must be
+non-empty, and it must not equal the agent's display name — `approval_labels()`
+skips that case on purpose ("the agent's name is never sent as the action"), so
+`"ARI On-Call Agent"` would have produced *Custom action* all the same.
+
+Chosen as the kind of action, not the pull request's title: the title, root
+cause, changed files and key hunks are all already in the body of that mail,
+and this is a one-line label in a table.
+
+Path verified end to end in source rather than inferred, since the label is
+produced two repos away: `propose_pr` dict → `_publish_result`'s
+`add_artifact` data part → MCP `interrupt_payload()` `{"name", "data"}` →
+`approval_labels()` reading `data.action_name`.
+
+## 2026-10-10 — the approval window is now 3 hours
+
+`ONCALL_ARI_APPROVAL_WINDOW_SECONDS` was 1500 (25 minutes), which expired
+before an on-call engineer had read the mail. Raised to 10800 in `test-fluxcd`
+(`values/uie.yaml`) and `eks-fluxcd` (`apps/stg/insightfinder-values.yaml`).
+
+Nothing in this repo had to change, and that is worth recording because the
+reason is not obvious: `publish_pr` accepts a confirmation by proposal id with
+**no age limit**. UIE's own javadoc justifies the 1500s default as "kept under
+the remote agents' own limit: the Jenkins agent refuses a confirmation older
+than 30 minutes (`_MAX_PROPOSAL_AGE_SECONDS`)" — that agent is decommissioned
+and its code is no longer on this branch, so the constraint it documented is
+gone with it.
+
+Downstream the window only widens deadlines: UIE's `isAbandoned()` budget is
+investigation timeout **plus** approval window, and MCP derives
+`work_timeout_s = timeout_seconds + approval_timeout_s` per request, so neither
+clips the other.
+
+The real cost, unchanged by this but three hours wider: the paused A2A task
+lives in the API pod's `InMemoryTaskStore`. An API restart inside the window
+loses it, and the confirmation then fails with "no such pending action". One
+replica, so no split-brain — just the restart.

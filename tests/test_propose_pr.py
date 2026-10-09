@@ -123,6 +123,26 @@ async def test_proposal_carries_everything_publish_pr_will_need():
 
 
 @pytest.mark.asyncio
+async def test_proposal_names_the_action_for_the_approval_email():
+    # Reported from stg, 2026-10-09: the first live approval email read
+    # "Proposed action: Custom action". MCP Service's `approval_labels()`
+    # (app/tasks/loop.py, origin/test) scans the pause's artifacts for
+    # `data.action_name` and returns CUSTOM_ACTION_LABEL when no artifact
+    # names the action -- and this proposal named none.
+    #
+    # Two conditions there, both asserted here: the name has to be
+    # non-empty, and it must not be the agent's own display name, which
+    # that function skips ("the agent's name is never sent as the
+    # action"). `action` stays the machine identifier publish_pr checks;
+    # this is the human label beside it.
+    proposal = (await propose_pr.run(_ctx(_tools())))["pending_action"]
+
+    name = proposal["action_name"]
+    assert name.strip()
+    assert name.strip().lower() != "ari on-call agent"
+
+
+@pytest.mark.asyncio
 async def test_proposal_id_is_unique_per_proposal():
     # executor.py's _find_pending_action and MCP Service's
     # pending_action_id() both resolve a confirmation by this id. Two

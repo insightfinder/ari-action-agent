@@ -283,3 +283,108 @@ def test_only_clone_gets_the_long_deadline():
     assert len(long_tier) == 1, f"exactly one long-tier call expected, got {long_tier}"
     assert '"git clone"' in long_tier[0]
     assert len(calls) >= 8, "all git call sites should be routed through the helper"
+
+
+@pytest.mark.asyncio
+async def test_push_gets_the_network_tier_not_the_local_one(remote_and_clone, monkeypatch):
+    # `push` is the only non-clone command here that talks to a remote, and
+    # it used to share the 30s local-operation budget with diff/add/commit.
+    # Confirmed live (prod, 2026-10-08): `git diff timed out after 30s` in
+    # the same worker-log window where three concurrent runs all lost the
+    # deterministic publish path and fell through to the opencode + GitHub
+    # MCP fallback, which then reported one run's pull request as another's.
+    remote, work = remote_and_clone
+    seen = {}
+
+    real_communicate = git_ops._communicate
+
+    async def recording(proc, what, timeout=None):
+        seen[what] = timeout
+        return await real_communicate(proc, what, timeout=timeout)
+
+    monkeypatch.setattr(git_ops, "_communicate", recording)
+    (work / "a.py").write_text("x = 2\n")
+    await git_ops.add(str(work), ["a.py"])
+    await git_ops.commit(str(work), "Fix the thing")
+    await git_ops.push(str(work), {"url": str(remote)}, "ari/net-tier")
+
+    assert seen["git push"] == git_ops._NETWORK_TIMEOUT_SECONDS
+    assert git_ops._NETWORK_TIMEOUT_SECONDS > git_ops._DEFAULT_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_local_only_git_calls_keep_the_short_tier(repo, monkeypatch):
+    # Contrast case: widening the budget for the network must not widen it
+    # for the operations the short tier was measured against (diff and
+    # changed_files are both well under a second on a real monorepo), or
+    # the deadlock guard stops guarding anything.
+    seen = {}
+    real_communicate = git_ops._communicate
+
+    async def recording(proc, what, timeout=None):
+        seen[what] = timeout
+        return await real_communicate(proc, what, timeout=timeout)
+
+    monkeypatch.setattr(git_ops, "_communicate", recording)
+    await diff(str(repo))
+    await changed_files(str(repo))
+
+    assert seen["git diff"] is None, "must fall through to _DEFAULT_TIMEOUT_SECONDS"
+    assert seen["git changed files"] is None
+
+
+def test_the_three_timeout_tiers_are_env_overridable_and_ordered():
+    # Each tier has its own env var so a slow target repo can be given more
+    # room without loosening the other two.
+    assert git_ops._DEFAULT_TIMEOUT_SECONDS < git_ops._NETWORK_TIMEOUT_SECONDS < git_ops._CLONE_TIMEOUT_SECONDS
+    import inspect
+    source = inspect.getsource(git_ops)
+    for var in ("GIT_SUBPROCESS_TIMEOUT_SECONDS", "GIT_NETWORK_TIMEOUT_SECONDS", "GIT_CLONE_TIMEOUT_SECONDS"):
+        assert var in source, f"{var} must stay overridable without a redeploy"
+
+
+@pytest.mark.asyncio
+async def test_untracked_files_lists_new_files_and_honours_gitignore(repo):
+    (repo / "brandnew.md").write_text("new content\n")
+    (repo / "scratch.tmp").write_text("junk\n")
+    (repo / ".gitignore").write_text("scratch.tmp\n")
+    _run("add", ".gitignore", cwd=repo)
+    _run("-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "-q", "-m", "ignore", cwd=repo)
+
+    found = await git_ops.untracked_files(str(repo))
+
+    assert "brandnew.md" in found
+    assert "scratch.tmp" not in found, "--exclude-standard must honour .gitignore"
+
+
+@pytest.mark.asyncio
+async def test_intent_to_add_makes_a_new_file_visible_to_diff_and_changed_files(repo):
+    # The whole point: `git diff HEAD` cannot see an untracked path, so a
+    # change whose entire content is a new file read as "nothing changed"
+    # (live: test workflow 979a2b0e, 2026-10-09).
+    (repo / "brandnew.md").write_text("new content\n")
+    assert await changed_files(str(repo)) == []
+    assert await diff(str(repo)) == ""
+
+    await git_ops.intent_to_add(str(repo), ["brandnew.md"])
+
+    assert "brandnew.md" in await changed_files(str(repo))
+    # The body has to be in the diff too -- propose_pr's key_hunks() reads
+    # it for the approval email, so without this a human would be approving
+    # a new file whose contents they were never shown.
+    assert "new content" in await diff(str(repo))
+
+
+@pytest.mark.asyncio
+async def test_intent_to_add_is_a_no_op_for_an_empty_list(repo):
+    # Called unconditionally by generate_change, which usually has nothing
+    # new to stage; `git add -N --` with no paths is an error, not a no-op.
+    await git_ops.intent_to_add(str(repo), [])
+
+    assert await changed_files(str(repo)) == []
+
+
+@pytest.mark.asyncio
+async def test_intent_to_add_raises_clearly_on_a_bad_path(repo):
+    with pytest.raises(RuntimeError, match="git add -N failed"):
+        await git_ops.intent_to_add(str(repo), ["no/such/file.md"])
