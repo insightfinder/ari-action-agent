@@ -245,17 +245,26 @@ async def test_kill_failing_because_the_child_already_exited_is_not_an_error():
 
 
 @pytest.mark.asyncio
-async def test_every_git_call_goes_through_the_deadline_helper(repo):
-    # A new git helper added later must not reintroduce a bare
-    # communicate() -- that is exactly how this bug shipped.
-    import inspect
-    source = inspect.getsource(git_ops)
-    bare = [
-        line.strip()
-        for line in source.splitlines()
-        if "await proc.communicate()" in line and not line.strip().startswith("#")
-    ]
-    assert bare == [], f"bare communicate() without a deadline: {bare}"
+async def test_no_module_anywhere_reintroduces_a_bare_communicate():
+    # A new subprocess call added later must not reintroduce a bare
+    # communicate() -- that is exactly how this bug shipped, twice.
+    #
+    # This used to read `inspect.getsource(git_ops)`: one module. It was
+    # green the whole time `common/opencode_runtime.py` carried an
+    # unbounded `await proc.communicate()`, which on 2026-10-09 sat for 14
+    # minutes on stg with no child process left alive (workflow 5a0f4506).
+    # A guard that only looks where the last bug was cannot catch the next
+    # one, so this walks the whole package.
+    src = Path(__file__).resolve().parents[1] / "src"
+    offenders = []
+    for path in sorted(src.rglob("*.py")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "await proc.communicate()" in stripped and "wait_for" not in stripped:
+                offenders.append(f"{path.relative_to(src)}:{number}")
+    assert offenders == [], f"bare communicate() without a deadline: {offenders}"
 
 
 def test_deadlines_are_tiered_to_what_each_operation_actually_costs():
