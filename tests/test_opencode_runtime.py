@@ -233,6 +233,19 @@ def test_the_worker_image_runs_an_init_as_pid_1():
     # Guarded here rather than left to review because the failure is silent,
     # cumulative, and invisible to every other test in this suite: they all
     # assert on what one call returns, and this shows up only in `ps`.
+    #
+    # WHAT THIS TEST DOES NOT PROVE, and the reason is worth knowing before
+    # trusting it green: an image ENTRYPOINT is defeated by any `command:`
+    # in the pod spec, because Kubernetes maps `command` onto ENTRYPOINT and
+    # replaces it outright. The `oncallari` chart (insightfinder/charts)
+    # hardcodes `command: ["python", "-m", "api.worker"]` in every one of its
+    # six deployment templates, with no values hook, so under that chart pid
+    # 1 is the worker again and tini never runs. Confirmed live on stg,
+    # 2026-10-09: the image had `Entrypoint=[/usr/bin/tini --]` while the
+    # running container's /proc/1/cmdline was `python -m api.worker`.
+    #
+    # This test can only guard the half that lives in this repo. The other
+    # half is a chart change, and nothing here can see it.
     from pathlib import Path
 
     dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile.oncall"

@@ -130,6 +130,18 @@ async def run(ctx: StepContext) -> dict:
     pending_action = {
         "id": str(uuid.uuid4()),
         "action": "open_pull_request",
+        # What the approver reads in UIE's email under "Proposed action".
+        # MCP's `approval_labels()` scans this artifact for `action_name` and
+        # falls back to "Custom action" when nothing names the action — which
+        # is exactly what the first live approval email said (reported from
+        # stg, 2026-10-09). `action` above is the machine identifier
+        # `publish_pr` checks; this is the human sentence beside it, the same
+        # split the action agent's own `pending_action` uses.
+        #
+        # Deliberately the kind of action, not the pull request's title: the
+        # title, root cause, changed files and key hunks are already in the
+        # body of that email, and this is a one-line label in a table.
+        "action_name": "Open pull request",
         "repo": plan["repo_slug"],
         "repo_url": plan["repo_url"],
         "branch": plan["branch"],

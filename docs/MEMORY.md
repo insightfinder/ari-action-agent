@@ -3031,3 +3031,87 @@ Deployed workers showed 0 zombies when checked, but they had been restarted
 
 **Verified:** 283 passed in `ari-oncall-agent-worker:test`. The image change
 itself only takes effect on the next build.
+
+**Correction, same day:** the tini ENTRYPOINT above is **inert in every
+deployment that uses the `oncallari` chart**, which is all of them. Kubernetes
+maps a container's `command:` onto the image's ENTRYPOINT and replaces it, and
+that chart hardcodes `command: ["python", "-m", "api.worker"]` in all six of
+its deployment templates with no values hook. Verified live on stg right after
+deploying the fix: the image reported
+`Entrypoint=[/usr/bin/tini --] Cmd=[python -m api.worker]` while the running
+container's `/proc/1/cmdline` was `python -m api.worker`.
+
+So the image half is done and the zombies are **not** fixed in production. The
+remaining half is a change to `insightfinder/charts` (drop the `command:`
+override, or make it `["/usr/bin/tini", "--", "python", "-m", "api.worker"]`),
+which needs its own Chart.yaml version bump.
+
+`test_the_worker_image_runs_an_init_as_pid_1` now says this in its own body,
+because a green test that only checks the Dockerfile reads as "zombies fixed"
+and is not. Worth generalising past this instance: a guard that asserts on an
+artifact this repo produces says nothing about how another repo deploys it, and
+the gap is invisible precisely because the assertion passes.
+
+**Resolved, 2026-10-10:** `insightfinder/charts` commit `004bb1b` deletes the
+`command:` line from `ari-oncall-agent-worker-deployment.yaml`, published as
+chart `0.3.1`, and `test-fluxcd` pins both ARI releases to it. Verified on test
+and stg after the upgrade: `/proc/1/cmdline` is now `/usr/bin/tini --`.
+
+Only that one template was changed, deliberately. The other five overrides are
+still there and are fine: the three API deployments run `uvicorn` and spawn
+nothing, and the action worker's image carries no opencode, no git and no build
+toolchain, so neither has orphans to inherit.
+
+## 2026-10-10 — the approval email said "Custom action"
+
+Reported from stg (Ayush, after the first live approval mail): the email's
+**Proposed action** read *Custom action* instead of naming what the agent
+wanted to do.
+
+Not a UIE bug. MCP Service's `approval_labels()`
+(`app/tasks/loop.py`, `origin/test`) resolves that label by scanning the paused
+task's artifacts for `data.action_name`, and returns `CUSTOM_ACTION_LABEL` when
+no artifact names the action. Our `pending_action` carried `action:
+"open_pull_request"` — the machine identifier `publish_pr` checks — and nothing
+a person reads. The action agent's own `pending_action`
+(`ari-agent-demo`, `propose_action.py`) carries both; this one carried one.
+
+Fixed by adding `"action_name": "Open pull request"` beside `action`. Two
+constraints in that function, both now asserted by
+`test_proposal_names_the_action_for_the_approval_email`: the name must be
+non-empty, and it must not equal the agent's display name — `approval_labels()`
+skips that case on purpose ("the agent's name is never sent as the action"), so
+`"ARI On-Call Agent"` would have produced *Custom action* all the same.
+
+Chosen as the kind of action, not the pull request's title: the title, root
+cause, changed files and key hunks are all already in the body of that mail,
+and this is a one-line label in a table.
+
+Path verified end to end in source rather than inferred, since the label is
+produced two repos away: `propose_pr` dict → `_publish_result`'s
+`add_artifact` data part → MCP `interrupt_payload()` `{"name", "data"}` →
+`approval_labels()` reading `data.action_name`.
+
+## 2026-10-10 — the approval window is now 3 hours
+
+`ONCALL_ARI_APPROVAL_WINDOW_SECONDS` was 1500 (25 minutes), which expired
+before an on-call engineer had read the mail. Raised to 10800 in `test-fluxcd`
+(`values/uie.yaml`) and `eks-fluxcd` (`apps/stg/insightfinder-values.yaml`).
+
+Nothing in this repo had to change, and that is worth recording because the
+reason is not obvious: `publish_pr` accepts a confirmation by proposal id with
+**no age limit**. UIE's own javadoc justifies the 1500s default as "kept under
+the remote agents' own limit: the Jenkins agent refuses a confirmation older
+than 30 minutes (`_MAX_PROPOSAL_AGE_SECONDS`)" — that agent is decommissioned
+and its code is no longer on this branch, so the constraint it documented is
+gone with it.
+
+Downstream the window only widens deadlines: UIE's `isAbandoned()` budget is
+investigation timeout **plus** approval window, and MCP derives
+`work_timeout_s = timeout_seconds + approval_timeout_s` per request, so neither
+clips the other.
+
+The real cost, unchanged by this but three hours wider: the paused A2A task
+lives in the API pod's `InMemoryTaskStore`. An API restart inside the window
+loses it, and the confirmation then fails with "no such pending action". One
+replica, so no split-brain — just the restart.
