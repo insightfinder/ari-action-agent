@@ -216,3 +216,34 @@ async def test_run_opencode_extra_env_overrides_state_isolation_defaults(tmp_pat
     )
 
     assert captured_env["XDG_DATA_HOME"] == "/custom/data"
+
+
+def test_the_worker_image_runs_an_init_as_pid_1():
+    # opencode spawns its own `git` children. When an activity is cancelled
+    # or times out and opencode goes away, any still running are orphaned
+    # and reparented to pid 1. Python reaps only what it spawned itself --
+    # asyncio's child watcher tracks those by pid -- so an inherited orphan
+    # is never waited on and stays a zombie for the life of the pod.
+    #
+    # Measured on the bastion, 2026-10-09: a worker up 3h35m had 15
+    # `[git] <defunct>` entries parented to `python -m api.worker` as pid 1,
+    # and all 15 went away when that container was removed. The end state is
+    # pid exhaustion, slowly enough that nobody would connect it to this.
+    #
+    # Guarded here rather than left to review because the failure is silent,
+    # cumulative, and invisible to every other test in this suite: they all
+    # assert on what one call returns, and this shows up only in `ps`.
+    from pathlib import Path
+
+    dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile.oncall"
+    source = dockerfile.read_text(encoding="utf-8")
+
+    entrypoints = [line for line in source.splitlines() if line.startswith("ENTRYPOINT")]
+    assert entrypoints, (
+        "Dockerfile.oncall has no ENTRYPOINT, so CMD becomes pid 1 and nothing reaps the "
+        "orphaned git children opencode leaves behind"
+    )
+    assert any("tini" in line for line in entrypoints), (
+        f"pid 1 must be an init that reaps orphans; got {entrypoints}"
+    )
+    assert "tini" in source.split("ENTRYPOINT")[0], "tini must also be installed, not just invoked"

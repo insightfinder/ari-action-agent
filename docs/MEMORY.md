@@ -2959,3 +2959,75 @@ kind is gone), and MCP waits `ONCALL_TASK_APPROVAL_TIMEOUT_S` = 86400s —
 24 hours. So the protocol permits approving a day later while the pod's
 lifetime decides whether it works. Untested, and email approval is by
 nature the slow-human case.
+
+### Same day, one hour later — the empty-tree message was accusing an honest model
+
+The guard above shipped with the wording *"opencode reported a change but left
+the working tree unmodified"*, written against the only case we had seen: a
+model that fabricated a change. An hour after it went live on stg a second
+case appeared, and the wording is false for it. opencode read the repository,
+correctly concluded nothing needed changing, and said so:
+
+```
+Tool calls: {'read': 1}
+'Verified that a README.md file exists in the repository root directory. No
+ changes were required as per the instructions to only create a minimal README
+ if none exists.'
+```
+
+It reported no change. The message told whoever read the failure to go looking
+for a lying model that was not there.
+
+**Still a failure, and that part is not in question** — this step is only ever
+scheduled to produce a change, and distinguishing "lied" from "correctly
+declined" would mean trusting the model's account of itself, which is the one
+thing this guard exists because we cannot do. What changed is only the wording:
+state the tree, the tool calls and the account verbatim, and let a person
+judge. `test_the_empty_tree_message_does_not_accuse_an_honest_model_of_lying`
+pins both halves — the guard still fires, and the message contains neither
+"reported a change" nor "claimed".
+
+Worth generalising: an error message written from one observed instance tends
+to encode that instance's *cause* rather than its *symptom*. The symptom here
+("the tree is unmodified") was always safe to state; the cause ("it claimed
+otherwise") was only true once.
+
+**Verified:** 282 passed in `ari-oncall-agent-worker:test`.
+
+### Same day — the worker was pid 1, and pid 1 was not reaping
+
+Found by looking at the bastion rather than at any test output: a worker up
+3h35m had 15 `[git] <defunct>` processes, all parented to
+`python -m api.worker` running as pid 1 in its container. All 15 disappeared
+the moment that container was removed, which is what confirmed the parent.
+
+**The first explanation was wrong and is worth recording as such.** The obvious
+suspect was `git_ops._communicate`, which on timeout calls `proc.kill()` and
+raises without ever awaiting `proc.wait()`. That reads like a leak, but it is
+not one: asyncio's default `ThreadedChildWatcher` runs a thread per subprocess
+that blocks in `os.waitpid()`, so anything *we* spawn is reaped regardless.
+
+The real chain has nothing to do with our subprocess handling. **opencode
+spawns its own `git` children.** When an activity is cancelled or times out and
+opencode goes away, those grandchildren are orphaned and reparented to pid 1 —
+and `CMD ["python", "-m", "api.worker"]` with no ENTRYPOINT makes the worker
+itself pid 1. Python reaps only the pids its watcher knows about, so an
+inherited orphan is never waited on.
+
+Fixed with `tini` as `ENTRYPOINT` in `Dockerfile.oncall` (`/usr/bin/tini`,
+0.19.0 in `python:3.12-slim`, path verified in the base image before writing
+it). Reaping from Python instead would mean a SIGCHLD handler calling
+`os.waitpid(-1, ...)`, which races the watcher threads for the exit status of
+processes we *do* own and makes `proc.wait()` raise `ChildProcessError` — an
+init is the mechanism built for exactly this.
+
+`test_the_worker_image_runs_an_init_as_pid_1` guards it, because the failure is
+silent, cumulative, and structurally invisible to the rest of the suite: every
+other test asserts on what one call returns, and this one only ever shows up in
+`ps`. Same blind spot the live scenarios have — they are per-request too.
+
+Deployed workers showed 0 zombies when checked, but they had been restarted
+1–2 hours earlier and served a dozen runs; that is not evidence of absence.
+
+**Verified:** 283 passed in `ari-oncall-agent-worker:test`. The image change
+itself only takes effect on the next build.

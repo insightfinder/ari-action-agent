@@ -426,12 +426,12 @@ async def test_generate_change_refuses_to_report_success_on_an_unmodified_tree()
         await opencode_change.run(ctx)
 
     message = str(exc_info.value)
-    assert "left the working tree unmodified" in message
+    assert "the working tree is unmodified" in message
     # The two things a human needs to tell "the model did nothing" apart
     # from "the sandbox is broken": what it actually called, and what it
-    # claimed to have done.
+    # said about it.
     assert "invalid" in message, "must report the tool calls that were made"
-    assert "exponential backoff" in message, "must quote the claim it could not back up"
+    assert "exponential backoff" in message, "must quote the account it could not back up"
 
 
 @pytest.mark.asyncio
@@ -467,7 +467,7 @@ async def test_generate_change_still_fails_on_an_empty_tree_after_a_verify_loopb
         capability="generate_change",
     )
 
-    with pytest.raises(RuntimeError, match="left the working tree unmodified"):
+    with pytest.raises(RuntimeError, match="the working tree is unmodified"):
         await opencode_change.run(ctx)
 
 
@@ -546,3 +546,39 @@ async def test_generate_change_stages_only_the_newly_created_file_among_untracke
     await opencode_change.run(ctx)
 
     tools["git_intent_to_add"].assert_awaited_once_with(ctx.repo_dir, ["tests/test_new.py"])
+
+
+@pytest.mark.asyncio
+async def test_the_empty_tree_message_does_not_accuse_an_honest_model_of_lying():
+    # Two different things reach this guard and the message has to be true
+    # of both. Seen live on stg (2026-10-09) one hour after the fabricated
+    # case shipped: opencode read the repo, correctly concluded nothing
+    # needed changing, and said so plainly. The first wording opened with
+    # "opencode reported a change but left the working tree unmodified",
+    # which is simply false here and sends whoever reads the failure
+    # hunting for a lying model that is not there.
+    #
+    # Failing is still right -- telling the two apart would mean trusting
+    # the model's account of itself, which is what this guard exists
+    # because we cannot do -- but the message must only state what was
+    # observed.
+    honest = "Verified that a README.md file exists in the repository root. No changes were required."
+    opencode = AsyncMock(
+        return_value={
+            "text": "TITLE: No change needed\nSUMMARY:\n" + honest,
+            "trace": {**_STUB_TRACE, "tool_call_counts": {"read": 1}, "tool_call_total": 1},
+        }
+    )
+    ctx = _ctx(results={}, tools=_change_tools(opencode, "", []), capability="generate_change")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await opencode_change.run(ctx)
+
+    message = str(exc_info.value)
+    assert "the working tree is unmodified" in message
+    assert honest in message, "must quote the account verbatim, whatever it says"
+    for accusation in ("reported a change", "claimed"):
+        assert accusation not in message, (
+            f"message asserts {accusation!r}, which is false when the model correctly "
+            f"declined to edit anything"
+        )

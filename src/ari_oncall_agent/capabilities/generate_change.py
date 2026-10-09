@@ -200,11 +200,26 @@ async def run(ctx: StepContext) -> dict:
     # retry policy (a second genuine attempt at the edit) and then ends
     # the run with this message as the stated reason, instead of handing
     # an empty change downstream.
+    #
+    # The message states only what was observed, and deliberately does not
+    # accuse opencode of having claimed anything. Both of these end up
+    # here and they are not the same thing:
+    #   - it fabricated a change it never made (the 9b32a817 case above)
+    #   - it correctly concluded nothing needed changing and said so
+    #     ("No changes were required as per the instructions..." — seen
+    #     live on stg, 2026-10-09)
+    # An earlier wording opened with "opencode reported a change but left
+    # the working tree unmodified", which is simply false in the second
+    # case and tells whoever is reading the failure to go looking for a
+    # lying model that isn't there. Telling the two apart would mean
+    # trusting the model's own account of itself, which is the one thing
+    # this guard exists because we cannot do. So: report the tree, the
+    # tool calls and the account verbatim, and let a person judge.
     if not changed_files:
         raise RuntimeError(
-            "generate_change: opencode reported a change but left the working tree "
-            f"unmodified — nothing was edited. Tool calls: {trace.get('tool_call_counts') or 'none'}. "
-            f"Its own summary claimed: {summary[:500]!r}"
+            "generate_change: the working tree is unmodified — nothing was edited, so there is "
+            f"no change to verify or publish. Tool calls: {trace.get('tool_call_counts') or 'none'}. "
+            f"opencode's own account: {summary[:500]!r}"
         )
     return {
         "root_cause": {"summary": summary, "evidence": []},
