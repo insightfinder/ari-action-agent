@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -8,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from common.capabilities_base import StepContext  # noqa: E402
+from common import opencode_runtime  # noqa: E402
 from common.opencode_runtime import _build_trace, _parse_events, merge_traces, run_opencode  # noqa: E402
 
 # Captured verbatim (minus the huge nested responseHeaders blob) from a live
@@ -260,3 +262,90 @@ def test_the_worker_image_runs_an_init_as_pid_1():
         f"pid 1 must be an init that reaps orphans; got {entrypoints}"
     )
     assert "tini" in source.split("ENTRYPOINT")[0], "tini must also be installed, not just invoked"
+
+
+# --- the subprocess deadline (stg 2026-10-09, workflow 5a0f4506) ---------
+
+
+class _NeverExits:
+    """A child whose communicate() never returns -- the live hang: opencode
+    had already finished and logged, no process was left in the container,
+    and the activity still sat in communicate() for 14 minutes."""
+
+    pid = 4242
+
+    def __init__(self):
+        self.killed = False
+
+    async def communicate(self):
+        await asyncio.sleep(3600)
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_opencode_raises_instead_of_hanging_forever():
+    proc = _NeverExits()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await opencode_runtime._communicate(proc, "ari-change", timeout=0.05)
+
+    message = str(exc_info.value)
+    assert "ari-change" in message, "must name the agent that stalled"
+    assert "timed out" in message
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_opencode_is_killed_not_left_holding_the_sandbox():
+    # Every attempt of one request shares a workspace keyed by request_id
+    # alone, so a survivor could still be writing the tree the retry reads.
+    proc = _NeverExits()
+
+    with pytest.raises(RuntimeError):
+        await opencode_runtime._communicate(proc, "ari-change", timeout=0.05)
+
+    assert proc.killed
+
+
+@pytest.mark.asyncio
+async def test_kill_failing_because_the_child_already_exited_is_not_an_error():
+    class _Gone(_NeverExits):
+        def kill(self):
+            raise ProcessLookupError
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        await opencode_runtime._communicate(_Gone(), "ari-change", timeout=0.05)
+
+
+def test_the_deadline_tracks_the_step_it_runs_inside():
+    # The two callers are an order of magnitude apart -- a legitimate
+    # generate_change turn was measured at 328s, while verify's whole step
+    # budget is 480s -- so one constant cannot serve both.
+    verify = opencode_runtime._subprocess_deadline(_ctx_with_deadline(480))
+    change = opencode_runtime._subprocess_deadline(_ctx_with_deadline(1200))
+
+    assert verify < 480, "must fire before Temporal kills the attempt blindly"
+    assert change < 1200
+    assert change > verify
+
+
+def test_the_deadline_never_collapses_to_something_that_fires_on_healthy_work():
+    # A step whose remaining budget is already tiny has bigger problems
+    # than a stalled pipe, and Temporal will end it anyway.
+    assert opencode_runtime._subprocess_deadline(_ctx_with_deadline(5)) >= 60
+
+
+def test_without_an_activity_deadline_it_falls_back_to_the_configured_default():
+    # Unit tests and the live-test script drive capabilities outside any
+    # Temporal activity, so there is no start_to_close to derive from.
+    assert (
+        opencode_runtime._subprocess_deadline(_ctx_with_deadline(None))
+        == opencode_runtime._OPENCODE_TIMEOUT_SECONDS
+    )
+
+
+def _ctx_with_deadline(seconds):
+    ctx = _ctx("/tmp/ws")
+    ctx.step_deadline_seconds = seconds
+    return ctx

@@ -71,6 +71,26 @@ _DEFAULT_PIPELINE_BUDGET_SECONDS = 3000
 # almost immediately and the run would report a timeout against a step
 # that never had a chance to do anything. Stopping first gives a clearer
 # failure, and `respond` still runs either way.
+# How long Temporal waits for a beat from `execute_step` before declaring
+# the attempt lost and retrying it. activities.py beats every 20s.
+#
+# This is the only thing that makes a dead worker cheap. Without it the
+# only signal is `start_to_close_timeout`, which is 1200s for
+# `generate_change` and 480s for `verify` — measured on stg 2026-10-09,
+# one OOMKill cost 4m15s of a 50-minute budget and one pod replacement
+# cost the full 20 minutes, both of them spent waiting on a worker that
+# was already gone.
+#
+# 90s, not 30s: a beat is one RPC from an activity that is otherwise busy
+# in a subprocess, and a worker briefly starved of CPU (stg runs on t3/t3a,
+# where hypervisor steal of 50-70% has been measured) must not be declared
+# dead for missing one. Four intervals of headroom.
+#
+# It also opens the channel Temporal delivers cancellation on, which is
+# why a timed-out attempt's opencode subprocess used to keep running in
+# the pod after the workflow had moved on.
+_STEP_HEARTBEAT_TIMEOUT_SECONDS = 90
+
 _MIN_USEFUL_STEP_SECONDS = 30
 
 
@@ -261,6 +281,7 @@ class AriAgentWorkflow:
                     # timeout shown there is the effective one, not the one
                     # in capabilities.yaml.
                     schedule_to_close_timeout=timedelta(seconds=remaining),
+                    heartbeat_timeout=timedelta(seconds=_STEP_HEARTBEAT_TIMEOUT_SECONDS),
                     retry_policy=RetryPolicy(
                         maximum_attempts=retry.get("max_attempts", 1),
                         backoff_coefficient=2.0,
@@ -359,6 +380,7 @@ class AriAgentWorkflow:
                     "history": history,
                 },
                 start_to_close_timeout=timedelta(minutes=2),
+                heartbeat_timeout=timedelta(seconds=_STEP_HEARTBEAT_TIMEOUT_SECONDS),
                 retry_policy=RetryPolicy(maximum_attempts=2, initial_interval=timedelta(seconds=5)),
             )
             message = respond_result["message"]

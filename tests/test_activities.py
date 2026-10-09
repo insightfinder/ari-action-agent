@@ -1,4 +1,6 @@
+import asyncio
 import sys
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -177,3 +179,181 @@ async def test_plan_task_raises_clearly_when_agent_kind_has_no_confirm_capabilit
         await activities.plan_task(
             {"prompt": "yes", "config": {}, "history": [], "confirmed_action": {"action": "trigger_build"}}
         )
+
+
+# --- execute_step: heartbeat and the lost sandbox -----------------------
+
+
+def _step_payload(tmp_path, results):
+    return {
+        "request_id": "req-1",
+        "workspace": str(tmp_path),
+        "prompt": "fix it",
+        "config": {},
+        "capability": "generate_change",
+        "params": {},
+        "results": results,
+    }
+
+
+class _Info:
+    """Enough of `activity.info()` for execute_step."""
+
+    def __init__(self, start_to_close):
+        self.start_to_close_timeout = start_to_close
+
+
+@pytest.mark.asyncio
+async def test_execute_step_heartbeats_while_the_capability_runs(tmp_path, monkeypatch):
+    # Without this there is no way for Temporal to notice a dead worker
+    # before start_to_close -- 1200s for generate_change. Measured on stg
+    # 2026-10-09: one OOMKill cost 4m15s and one pod replacement cost the
+    # full 20 minutes, both spent waiting on a worker already gone.
+    beats = []
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=1200)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: beats.append(1))
+    monkeypatch.setattr(activities, "_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+
+    async def slow(name, ctx):
+        await asyncio.sleep(0.1)
+        return {"ok": True}
+
+    monkeypatch.setattr(activities, "run_capability", slow)
+
+    assert await activities.execute_step(_step_payload(tmp_path, {})) == {"ok": True}
+    assert beats, "the activity never told Temporal it was alive"
+
+
+@pytest.mark.asyncio
+async def test_the_heartbeat_stops_when_the_step_does(tmp_path, monkeypatch):
+    # A leaked beat task would outlive its activity and keep reporting a
+    # step that is long gone.
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=1200)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+    monkeypatch.setattr(activities, "_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+
+    spawned = []
+    real_create_task = asyncio.create_task
+
+    def capture(coro, **kwargs):
+        task = real_create_task(coro, **kwargs)
+        spawned.append(task)
+        return task
+
+    monkeypatch.setattr(activities.asyncio, "create_task", capture)
+
+    async def slow(name, ctx):
+        # Long enough that the beat task is actually scheduled and running
+        # by the time the step finishes -- otherwise this would pass on a
+        # task that never started, which proves nothing.
+        await asyncio.sleep(0.05)
+        return {"ok": True}
+
+    monkeypatch.setattr(activities, "run_capability", slow)
+
+    await activities.execute_step(_step_payload(tmp_path, {}))
+    await asyncio.sleep(0)
+
+    assert spawned, "no heartbeat task was started"
+    assert spawned[0].done(), "the heartbeat outlived the step it was reporting on"
+
+
+@pytest.mark.asyncio
+async def test_the_heartbeat_stops_even_when_the_step_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=1200)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+    monkeypatch.setattr(activities, "_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(activities, "run_capability", AsyncMock(side_effect=RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await activities.execute_step(_step_payload(tmp_path, {}))
+
+
+@pytest.mark.asyncio
+async def test_the_step_is_told_the_activitys_own_deadline(tmp_path, monkeypatch):
+    # opencode_runtime bounds its subprocess below this. It must be the
+    # effective start_to_close, which Temporal clamps down to whatever the
+    # pipeline budget has left -- not capabilities.yaml's timeout_seconds.
+    seen = {}
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=44.86)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+
+    async def capture(name, ctx):
+        seen["deadline"] = ctx.step_deadline_seconds
+        return {}
+
+    monkeypatch.setattr(activities, "run_capability", capture)
+    await activities.execute_step(_step_payload(tmp_path, {}))
+
+    assert seen["deadline"] == 44.86
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_lost_with_its_pod_is_recloned_before_the_step_runs(tmp_path, monkeypatch):
+    # stg workflow c0296796, 2026-10-09: clone_repo ran on one worker pod,
+    # a deployment roll replaced it, and generate_change started on the new
+    # pod to find `.../sandbox/<request>/repo` gone. The sandbox is an
+    # emptyDir, so it belongs to a pod; a Temporal activity belongs to none.
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=1200)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+
+    gone = str(tmp_path / "sandbox" / "req-1" / "repo")
+    recloned = str(tmp_path / "recloned")
+    Path(recloned).mkdir()
+    calls = []
+
+    async def fake_run(name, ctx):
+        calls.append(name)
+        if name == "clone_repo":
+            return {"cloned_path": recloned, "ref": "dev"}
+        return {"repo_dir_seen": ctx.repo_dir}
+
+    monkeypatch.setattr(activities, "run_capability", fake_run)
+
+    result = await activities.execute_step(
+        _step_payload(tmp_path, {"clone_repo": {"cloned_path": gone, "ref": "dev"}})
+    )
+
+    assert calls == ["clone_repo", "generate_change"]
+    assert result["repo_dir_seen"] == recloned, "the step must see the fresh checkout, not the lost path"
+
+
+@pytest.mark.asyncio
+async def test_a_checkout_that_is_still_there_is_not_recloned(tmp_path, monkeypatch):
+    # The healing must be invisible on the overwhelmingly common path --
+    # re-cloning every step would cost a fetch per step for nothing.
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=1200)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+
+    present = tmp_path / "repo"
+    present.mkdir()
+    calls = []
+
+    async def fake_run(name, ctx):
+        calls.append(name)
+        return {}
+
+    monkeypatch.setattr(activities, "run_capability", fake_run)
+    await activities.execute_step(
+        _step_payload(tmp_path, {"clone_repo": {"cloned_path": str(present)}})
+    )
+
+    assert calls == ["generate_change"]
+
+
+@pytest.mark.asyncio
+async def test_a_plan_without_clone_repo_is_left_alone(tmp_path, monkeypatch):
+    # A repo-less chat prompt, or an agent kind with no clone_repo at all.
+    # Inventing one here would turn "no repo needed" into a hard failure.
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=1200)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+    calls = []
+
+    async def fake_run(name, ctx):
+        calls.append(name)
+        return {}
+
+    monkeypatch.setattr(activities, "run_capability", fake_run)
+    await activities.execute_step(_step_payload(tmp_path, {}))
+
+    assert calls == ["generate_change"]

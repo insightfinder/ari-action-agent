@@ -3115,3 +3115,129 @@ The real cost, unchanged by this but three hours wider: the paused A2A task
 lives in the API pod's `InMemoryTaskStore`. An API restart inside the window
 loses it, and the confirmation then fails with "no such pending action". One
 replica, so no split-brain — just the restart.
+
+## 2026-10-10 — four fixes from one stg run, three of them already known
+
+A single sweep-triggered run on stg (workflow `5a0f4506`, image
+`2610091640-staging`, the first on the new build) spent 50 minutes and never
+reached `propose_pr`. Picking it apart found four separate faults. Three of
+them were already written down somewhere in this repo and had simply never
+been paid for.
+
+### 1. `opencode_runtime`'s `communicate()` had no deadline
+
+17:09:05 the opencode call returned normally and logged `opencode_call`
+(328s, 33 tool calls). The activity then sat in `proc.communicate()` until
+17:23:47, when Temporal's 1200s `start_to_close` fired `CancelledError:
+Activity cancelled`. Inspected while stuck: **no opencode process anywhere in
+the container** (pid 1 tini, pid 7 the worker, nothing else), all eight
+threads in `futex_wait`/`ep_poll`, CPU 1m, memory flat at 315Mi for the whole
+twelve minutes. Attempt 2 ran the same step on the same image in 93s.
+
+That is, symptom for symptom, the race `git_ops.py`'s own module comment
+describes against `git diff` — and the guard written for it in 2026-10-05
+was applied to `git_ops` only. **The regression test was the reason nobody
+noticed**: `test_every_git_call_goes_through_the_deadline_helper` read
+`inspect.getsource(git_ops)`, one module, so it was structurally incapable of
+seeing the bare `await proc.communicate()` in `common/opencode_runtime.py`.
+It was green the entire time.
+
+Fixed with the same shape of guard, and the test now walks every `.py` under
+`src/` instead of one module. The deadline is derived per call rather than
+fixed, because the callers are an order of magnitude apart: a healthy
+`generate_change` turn was measured at 328s while `verify`'s whole step
+budget is 480s. `StepContext.step_deadline_seconds` carries the activity's
+**effective** `start_to_close` (Temporal clamps it to the remaining pipeline
+budget, so capabilities.yaml's `timeout_seconds` is the wrong number), minus
+a margin, floored at 60s.
+
+Worth generalising: a guard that only looks where the last bug was cannot
+catch the next one. If a rule is worth asserting, assert it over the whole
+tree.
+
+### 2. Nothing heartbeated
+
+Recorded as a known gap **twice** before it cost anything — "Nothing
+heartbeats… a `heartbeat_timeout` would detect a stall in ~2 minutes instead
+of 20", and "there is no `activity.heartbeat()` anywhere in this codebase, so
+Temporal cannot deliver cancellation". Both left open deliberately.
+
+What it cost in one afternoon: the worker was OOMKilled at 17:29:05 and
+`verify` was not retried until 17:33:20 (4m15s of a 50-minute budget), and in
+workflow `c0296796` a replaced pod cost the full 20 minutes, because
+`generate_change`'s `start_to_close` is 1200s. Both gaps are pure dead time
+waiting on a worker that was already gone.
+
+`execute_step` now beats every 20s with `heartbeat_timeout` at 90s — four
+intervals of headroom, because stg runs on t3/t3a where 50–70% hypervisor
+steal has been measured and a briefly starved worker must not be declared
+dead. This also opens the channel Temporal delivers cancellation on, so a
+timed-out attempt's opencode subprocess no longer keeps running in the pod
+after the workflow has moved on.
+
+### 3. The sandbox belongs to a pod; a Temporal activity belongs to none
+
+Workflow `c0296796` failed with `FileNotFoundError: .../sandbox/c0296796-…/repo`
+and reported to the caller that "the cloned repository directory became
+inaccessible" — true, and useless. The activity identities in its history say
+exactly what happened:
+
+```
+ 5  16:42:56  prepare_workspace   worker=…766fc5765-tr59k    attempt=1
+17  16:42:59  clone_repo          worker=…766fc5765-tr59k    attempt=1
+23  16:43:04  generate_change SCHEDULED
+24  17:03:14  generate_change STARTED  worker=…7c4c9499dd-qq677  attempt=2
+25  17:03:14  FAILED  FileNotFoundError .../sandbox/c0296796-.../repo
+```
+
+`clone_repo` ran on one pod, a deployment roll replaced it (`strategy:
+Recreate`, `sandbox` is an `emptyDir`), and the retry landed on another.
+
+Half of this was already known: `propose_pr`'s module docstring pushes the
+branch before the pause precisely because "the sandbox root is not on a
+persistent volume at all". That reasoning covered losing the sandbox *across
+the approval* and never asked what happens *between two steps of one run*.
+
+`execute_step` now re-clones when the recorded `cloned_path` is no longer a
+directory. Healing rather than persisting the sandbox on purpose: not
+depending on pod affinity is the property actually wanted, and a PVC would
+only move the assumption somewhere harder to see. The re-clone is cheap
+because the shared mirror already is PVC-backed. Deliberately not
+`require_cloned_repo`'s job — that answers "did the planner include
+clone_repo", a planning question, and it runs after the capability has
+already started.
+
+### 4. `verify` OOMKills the worker at the chart's 2Gi default
+
+Three kills in eighteen minutes, every one mid-`verify`, which runs the
+target repository's own build tooling inside the container. Memory went
+981Mi → 1154Mi → killed inside one two-minute scrape window, so the peak is
+above 2Gi and still unmeasured. `charts/oncallari/values.yaml` already called
+these "the frequent OOMKilled restarts this worker was already hitting" in
+its `repoCache` comment — that change moved the cache out of their way and
+left the limit alone. Raised to 6Gi/1Gi in chart `0.3.2`.
+
+### What the same run proved working
+
+Incidentally, and worth recording because the evidence is unusually clean:
+the II-25090 pipeline budget held under four `generate_change` → `verify`
+cycles. `scheduleToCloseTimeout` shrank 2996 → 2989 → 1685 → 1205 → 1169 →
+689 → 652 → 172 → 134s across the steps, and the run ended at **50m03s against
+a 3000s budget** with Temporal's "Not enough time to schedule next retry
+before activity ScheduleToClose timeout, giving up retrying", then ran
+`respond` and completed cleanly. Without it this would have looped
+indefinitely — which is the shape of the 45-minute run that was reported
+against this ticket in the first place.
+
+`tini` is also confirmed live now that chart 0.3.1 dropped the `command:`
+override: `/proc/1/cmdline` on stg is `/usr/bin/tini -- python -m api.worker`.
+
+**Verified:** full suite **297 passed** (from 284) in
+`ari-oncall-agent-worker:test` with `src/`, `tests/`, `configs/`, `docs/` and
+`scripts/` mounted over it. 13 new cases: 4 for the opencode deadline and its
+derivation, 1 rewriting the bare-`communicate()` guard to walk the whole
+package, 4 for the heartbeat (that it beats, that it stops on success, that
+it stops on failure, that the step is told the activity's own deadline), and
+3 for the re-clone (lost checkout is re-cloned and the step sees the fresh
+path, a present checkout is left alone, a plan without `clone_repo` is left
+alone).
