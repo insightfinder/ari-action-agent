@@ -133,6 +133,57 @@ same `message/send` operation) and a runnable sample client at
 the environment, never hardcoded). `scripts/e2e_callback_receiver.py` is
 this project's own generic webhook-logging tool for local testing.
 
+## Testing
+
+`pytest tests/` covers every capability against mocked tools. Run it in the
+worker image rather than on a laptop — 11 modules need `a2a`/`fcntl` and
+cannot even be collected on Windows:
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work insightfinderinc/ari-oncall-agent-worker:test   sh -lc 'pip install -q pytest pytest-asyncio; PYTHONPATH=/work/src python -m pytest tests/ -q'
+```
+
+**A green suite is not enough on its own.** Mocks always return something, so
+they cannot produce the three conditions that have actually broken this agent
+in production: a model that edits nothing while reporting that it did, a clock
+that accumulates across retries, and a brand-new file that `git diff HEAD`
+cannot see. All three shipped past a passing suite; see `docs/MEMORY.md`,
+2026-10-09.
+
+`scripts/oncall_live_test.py` closes that gap by driving a **deployed** agent
+over its real A2A surface and asserting on what comes back:
+
+```bash
+export ARI_BASE_URL=https://...        ARI_API_KEY=...
+export LLM_PROVIDER=anthropic LLM_API_KEY=... LLM_MODEL=claude-haiku-4-5
+export GITHUB_PAT=...                  REPO_URL=https://github.com/<org>/<repo>
+
+python scripts/oncall_live_test.py --list      # the six scenarios
+python scripts/oncall_live_test.py             # all of them, no writes
+python scripts/oncall_live_test.py budget      # just one
+python scripts/oncall_live_test.py --allow-writes   # include the one that opens a PR
+```
+
+| scenario | what it proves |
+|---|---|
+| `card` | the agent card is served where integrations look for it |
+| `budget` | a request given N seconds stops at ~N, instead of running to the plan's design maximum |
+| `empty` | a change that edits nothing fails fast, before `verify` is handed something that does not exist |
+| `propose` | the pause: `INPUT_REQUIRED` + a `pending_action` whose branch is already pushed |
+| `confirm` | approve the proposal and a pull request opens — design.md §5c's round trip |
+| `reject` | a confirm carrying an id the task never proposed is refused, not quietly planned around |
+
+It is deliberately **not** in `tests/`: each scenario costs real LLM tokens and
+real clone/build time, and two of them write a branch and a pull request to
+`REPO_URL`. Run it by hand against a test environment, never in CI, and point
+`REPO_URL` at a repository you do not mind collecting branches in.
+
+Two things it assumes, both learned the hard way (`docs/MEMORY.md`): assert on
+`status.state` and on which artifacts resolved, never on the final message —
+that text is an LLM writing for a human and is paraphrased differently every
+run. And each confirm scenario pauses its own task, because a confirm (valid
+or bogus) moves a task to a terminal state that A2A cannot return from.
+
 See `docs/MEMORY.md` for what's been verified against real infrastructure
 (and real gaps found and fixed along the way: Temporal persists request
 secrets unencrypted in its event history — needs a Payload Codec before any
