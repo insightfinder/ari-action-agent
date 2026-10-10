@@ -144,6 +144,18 @@ async def _beat(interval: float) -> None:
         activity.heartbeat()
 
 
+# Steps that never read the checkout, so a missing one is not a problem to fix.
+#
+# `respond` is the reason this exists. workflow.py runs it *after*
+# `cleanup_workspace`, deliberately and on every ending, so by then the sandbox
+# is gone because something deleted it on purpose — and without this the heal
+# below treated that as a lost pod and cloned the whole repository again to
+# write a summary that only reads `results`. Observed on stg 2026-10-10
+# (dbc75291): `recloning_lost_sandbox capability=respond`, two seconds after
+# cleanup, on an otherwise healthy run.
+_NO_REPO_NEEDED = frozenset({"respond"})
+
+
 async def _reclone_if_the_sandbox_is_gone(ctx: StepContext) -> None:
     """Re-run `clone_repo` when its checkout has vanished from disk.
 
@@ -172,6 +184,8 @@ async def _reclone_if_the_sandbox_is_gone(ctx: StepContext) -> None:
     answers "did the planner include clone_repo at all", a planning
     question, and it runs after the capability has already started.
     """
+    if ctx.capability in _NO_REPO_NEEDED:
+        return
     clone_result = ctx.results.get("clone_repo")
     if not clone_result:
         return
