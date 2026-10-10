@@ -3304,3 +3304,93 @@ build tool's cache. Check each tool's own documented variable.
 workflow loop (`continue` reaches the later steps, `fail_needs_human` still
 stops), 4 on the build-cache env. One existing case was rewritten: it asserted
 `extra_env == {"HOME": ...}`, which pinned the half-working behaviour.
+
+## 2026-10-10 — an unfinished verify and a failed build are not the same thing
+
+The `then: continue` added earlier today let the pipeline reach `propose_pr`
+after `verify` exhausted its retries. It treated two different outcomes
+identically, which was wrong:
+
+- the build ran and reported `RESULT: FAIL` — the change is broken, and
+  proposing it wastes the reviewer's time and makes the gate weaker than it was;
+- verification never completed (subprocess deadline, cancel, heartbeat
+  timeout) — nothing was learned about the change, so "failed" does not mean
+  "broken".
+
+They were already distinguishable at the source and were being flattened:
+`verify.py` returns `{"status": "failed"}` for a real `RESULT: FAIL`, while a
+killed activity raises and `workflow.py`'s `except ActivityError` manufactured
+the same shape. That branch now produces `{"status": "inconclusive"}`, the
+`on_failure` loop retries on either, and `then: continue` applies only to
+`inconclusive`. A genuine `failed` ends the run as it always did.
+
+`pending_action.verification.status` therefore has five values the approver can
+tell apart: `passed`, `failed`, `inconclusive`, `skipped`, `not run`.
+
+Every verify failure seen in production so far has been the second kind
+(`opencode (ari-verify) timed out after 435s and was killed`), which is why
+continuing was right in practice — but the first kind must not inherit it.
+
+**Verified:** full suite **311 passed**, from 308. Three new cases: a real
+`RESULT: FAIL` stops the pipeline and never reaches `propose_pr`; a killed
+activity reaches it; and the proposal reports `inconclusive` separately from
+`failed`. One existing case was changed to raise rather than return
+`{"status": "failed"}`, since it was written to exercise the continue path and
+that path is now reachable only by the raising one.
+
+## 2026-10-10 — a paused approval no longer dies with the API pod
+
+Two incidents were awaiting approval on stg when the `ari-oncall-api` pod
+restarted (our own chart 0.3.3 rollout). Both approvals then failed:
+
+```
+09:24:38 [OnCall-Task] A2A resume: confirming pending action 6c6c8ed4... on task dbc75291...
+09:24:38 [OnCall-Task] A2A resume failed: ARI On-Call Agent rejected the confirmation:
+         POST /message:send returned HTTP 404: Task dbc75291...
+```
+
+The paused A2A task lived in `InMemoryTaskStore`, so the restart lost it. UIE
+had already recorded the decision as `approve`, so the record read as approved
+while nothing was published — and mcp-service's fallback for a 404 is to start
+a **fresh investigation**, which re-ran the whole pipeline and produced a
+second branch for one incident.
+
+That was tolerable at the old 1500s approval window. At 10800s (raised earlier
+the same day) any deploy, eviction or node roll inside three hours does it.
+
+`common/a2a_server/task_store.py` adds a file-backed store: the in-memory store
+is still the hot path, every save also writes the task's protobuf bytes to
+`TASK_STORE_ROOT`, and a `get` that misses memory falls back to disk. Chart
+0.3.4 mounts a 1Gi PVC on the API pod for it.
+
+Deliberate properties, each one a failure mode that must not become a worse
+one than the bug being fixed:
+
+- **Off by default.** An unset `TASK_STORE_ROOT` returns the plain
+  `InMemoryTaskStore`, so nothing changes for a deployment that does not mount
+  the volume.
+- **A write failure never fails the request.** A full or unwritable volume
+  degrades to memory-only; it must not turn into a 500 on an approval.
+- **A corrupt file reads as absent**, not as an exception.
+- Writes are tempfile + `os.replace`, so a restart mid-write cannot leave a
+  half-written task that then fails to parse.
+- Tasks are pruned at startup past `TASK_STORE_MAX_AGE_SECONDS` (7 days), since
+  the volume is small and nothing else ever deletes a finished task.
+
+Owner scoping is preserved by reusing the SDK's own `resolve_user_scope` and
+keying files `<owner>/<task_id>.pb` — the in-memory store is keyed by owner
+first, and a store that ignored that would let one caller read another's task.
+
+**The other half is not fixed and is not in this repo:** mcp-service re-runs
+the investigation on a 404 instead of reporting that the approval could not be
+honoured. Persisting the task makes that path rare, not impossible.
+
+**Verified:** full suite **318 passed**, from 311. Seven new cases in
+`tests/test_task_store.py`: a task survives a new store over the same
+directory, an unknown id is still None, delete removes the file, a write
+failure still serves from memory, a corrupt file is ignored, an unset root
+keeps the in-memory store, and an uncreatable root falls back instead of
+crashing. `OwnerResolver`/`resolve_user_scope` live in
+`a2a.server.tasks.inmemory_task_store`, not `task_store`, and
+`resolve_user_scope` reads `context.user.user_name` — both found by running
+against the installed SDK rather than assuming.

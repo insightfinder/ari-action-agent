@@ -10,12 +10,12 @@ from a2a.server.routes.rest_routes import create_rest_routes
 from a2a.server.tasks import (
     BasePushNotificationSender,
     InMemoryPushNotificationConfigStore,
-    InMemoryTaskStore,
 )
 
 from common.a2a_server.agent_card import build_agent_card
 from common.a2a_server.auth import ApiKeyCallContextBuilder
 from common.a2a_server.executor import AriAgentExecutor
+from common.a2a_server.task_store import build_task_store
 from common.settings import get_settings
 
 
@@ -32,7 +32,7 @@ def create_app() -> FastAPI:
     # config store only needs to survive for that same lifetime (a
     # restart means callers re-register, same as they'd re-submit a lost
     # request against any stateless service).
-    task_store = InMemoryTaskStore()
+    task_store = build_task_store(settings.task_store_root)
     push_config_store = InMemoryPushNotificationConfigStore()
     push_sender = BasePushNotificationSender(
         # The A2A SDK owns the send loop here, so `common.http_retry`

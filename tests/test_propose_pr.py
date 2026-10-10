@@ -320,3 +320,15 @@ async def test_the_verification_detail_cannot_blow_up_the_email():
     proposal = (await propose_pr.run(ctx))["pending_action"]
 
     assert len(proposal["verification"]["detail"]) <= propose_pr._MAX_VERIFICATION_DETAIL_CHARS
+
+
+@pytest.mark.asyncio
+async def test_a_proposal_separates_an_unfinished_verify_from_a_failed_build():
+    tools = _tools()
+    ctx = _ctx(tools)
+    ctx.results["verify"] = {"status": "inconclusive", "failure": "opencode timed out after 435s"}
+
+    proposal = (await propose_pr.run(ctx))["pending_action"]
+
+    assert proposal["verification"]["status"] == "inconclusive"
+    assert "timed out" in proposal["verification"]["detail"]
