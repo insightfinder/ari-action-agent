@@ -99,7 +99,12 @@ capabilities:
     on_failure:
       goto: generate_change
       max_attempts: 3
-      then: fail_needs_human
+      # `continue`, not `fail_needs_human`: when every attempt is spent the
+      # pipeline carries on to propose_pr with the verification recorded as
+      # failed, so the change a person has to judge actually reaches them.
+      # `fail_needs_human` skipped propose_pr and discarded the diff -- see
+      # workflow.py's own comment on this branch for the runs that proved it.
+      then: continue
 
   propose_pr:
     module: ari_oncall_agent.capabilities.propose_pr

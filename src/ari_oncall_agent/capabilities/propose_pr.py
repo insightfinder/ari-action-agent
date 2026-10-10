@@ -95,6 +95,38 @@ def key_hunks(diff: str) -> str:
     return text
 
 
+_VERIFICATION_NOT_RUN = "not run"
+_VERIFICATION_PASSED = "passed"
+_VERIFICATION_SKIPPED = "skipped"
+# Kept short: this is read in a one-line table row in the approval email, and
+# the failure output itself is already in the agent's own message.
+_MAX_VERIFICATION_DETAIL_CHARS = 600
+
+
+def _verification(ctx: StepContext) -> dict:
+    """What `verify` concluded, for the person deciding on the proposal.
+
+    Three outcomes a reader has to be able to tell apart: it passed, it never
+    ran (the planner left it out, or `skip_tests`), and it ran and did not
+    pass. The third is the one that matters -- on a large repo `verify` can
+    spend its whole budget on a cold dependency download and fail without ever
+    saying anything about the change itself, so "failed" here does not mean
+    "the fix is wrong"; it means nobody has checked.
+    """
+    result = ctx.results.get("verify")
+    if not result:
+        return {"status": _VERIFICATION_NOT_RUN, "detail": ""}
+    status = result.get("status")
+    if status == "skipped":
+        return {"status": _VERIFICATION_SKIPPED, "detail": ""}
+    if status == "passed":
+        return {"status": _VERIFICATION_PASSED, "detail": ""}
+    return {
+        "status": "failed",
+        "detail": (result.get("failure") or "")[:_MAX_VERIFICATION_DETAIL_CHARS],
+    }
+
+
 def _compare_url(repo_url: str, base_ref: str, branch: str) -> str:
     """GitHub's own diff view for the pushed branch — the full change,
     for a reviewer who wants more than the excerpt."""
@@ -151,6 +183,17 @@ async def run(ctx: StepContext) -> dict:
         "changed_files": plan["changed_files"],
         "root_cause": change.get("root_cause") or "",
         "key_hunks": key_hunks(change.get("diff") or ""),
+        # Whether the build/test suite actually passed, stated rather than
+        # left to be guessed from its absence.
+        #
+        # This became load-bearing when `verify`'s exhausted retries stopped
+        # ending the run (configs/oncall/capabilities.yaml, `then: continue`).
+        # Before that, a proposal could only exist if verification had passed
+        # or been skipped, so saying nothing was safe. Now a proposal can
+        # carry an unverified change, and an approver who is not told that is
+        # being asked to approve on a false impression -- which would make
+        # this a weaker gate than before rather than a more useful one.
+        "verification": _verification(ctx),
         "compare_url": _compare_url(plan["repo_url"], plan["base_ref"], plan["branch"]),
         # Said plainly rather than left to be inferred from the state: the
         # branch exists on the remote already, the pull request does not.

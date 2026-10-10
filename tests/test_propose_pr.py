@@ -265,3 +265,58 @@ async def test_refuses_a_protected_branch_without_touching_git(monkeypatch):
 
     tools["git_add"].assert_not_awaited()
     tools["git_push"].assert_not_awaited()
+
+
+# --- what the approver is told about verification -----------------------
+
+
+@pytest.mark.asyncio
+async def test_a_proposal_says_when_verification_failed():
+    # `verify`'s exhausted retries no longer end the run (capabilities.yaml,
+    # `then: continue`), so a proposal can now carry an unverified change.
+    # An approver who is not told that is deciding on a false impression --
+    # which would make this gate weaker than it was, not more useful.
+    tools = _tools()
+    ctx = _ctx(tools)
+    ctx.results["verify"] = {"status": "failed", "failure": "mvn: BUILD FAILURE\nmissing artifact x"}
+
+    proposal = (await propose_pr.run(ctx))["pending_action"]
+
+    assert proposal["verification"]["status"] == "failed"
+    assert "BUILD FAILURE" in proposal["verification"]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_proposal_says_when_verification_passed():
+    tools = _tools()
+    ctx = _ctx(tools)
+    ctx.results["verify"] = {"status": "passed"}
+
+    proposal = (await propose_pr.run(ctx))["pending_action"]
+
+    assert proposal["verification"]["status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_verification_not_run_is_distinct_from_verification_failed():
+    # Three outcomes a reader has to be able to tell apart. Collapsing "never
+    # checked" into "failed" would cry wolf on every plan that omits verify;
+    # collapsing it into "passed" would be a lie.
+    plain = (await propose_pr.run(_ctx(_tools())))["pending_action"]
+    assert plain["verification"]["status"] == "not run"
+
+    tools = _tools()
+    skipped = _ctx(tools)
+    skipped.results["verify"] = {"status": "skipped"}
+    assert (await propose_pr.run(skipped))["pending_action"]["verification"]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_the_verification_detail_cannot_blow_up_the_email():
+    tools = _tools()
+    ctx = _ctx(tools)
+    ctx.results["verify"] = {"status": "failed", "failure": "x" * 50000}
+
+    proposal = (await propose_pr.run(ctx))["pending_action"]
+
+    assert len(proposal["verification"]["detail"]) <= propose_pr._MAX_VERIFICATION_DETAIL_CHARS

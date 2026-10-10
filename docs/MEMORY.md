@@ -3241,3 +3241,66 @@ it stops on failure, that the step is told the activity's own deadline), and
 3 for the re-clone (lost checkout is re-cloned and the step sees the fresh
 path, a present checkout is left alone, a plan without `clone_repo` is left
 alone).
+
+## 2026-10-10 — `verify` was silently throwing away finished work
+
+With the memory limit raised, `verify` stopped being OOMKilled and became the
+single reason runs failed: **4 of 4 attempts on stg runs `fc532091` and
+`1c2396a4`, 3 of 4 on `8b650147`**. Two separate defects, one in the control
+flow and one in the cache, and the first is the one that was blocking people.
+
+### 1. An exhausted `on_failure` loop discarded the change
+
+`verify`'s policy ended `then: fail_needs_human`, and workflow.py's handler
+for that sets `final_status = "failed"` and **`break`s the step loop** — so
+`propose_pr` never ran. The change had already been generated and was sitting
+in the sandbox; it was never committed, never pushed, never proposed, and the
+caller was told the investigation failed. Nobody saw the diff.
+
+That is the wrong trade here. The agent does not merge anything; `propose_pr`
+pauses for a person who reads the diff. An unverified change, **labelled**
+unverified, is strictly more useful to that person than nothing — and they can
+run the build themselves, which is precisely what the agent could not finish.
+
+`on_failure.then` now also accepts `continue`, which records the failure and
+carries on to the next step, and `verify` uses it. `fail_needs_human` is
+unchanged for any step whose failure really should stop everything.
+
+Because a proposal can now carry an unverified change, `propose_pr`'s
+`pending_action` gained a `verification` field — `passed` / `failed` (with up
+to 600 chars of output) / `skipped` / `not run`. Without it this change would
+have made the gate *weaker*: an approver who is not told would be deciding on
+a false impression. The four outcomes are deliberately distinct; collapsing
+"never checked" into "failed" would cry wolf on every plan that omits verify.
+
+### 2. Maven's cache was never on the persistent volume
+
+`reserve_build_cache_home()` sets `HOME` to the build-cache PVC for verify's
+opencode call. npm and Go honour that. **The JVM does not** — on Linux OpenJDK
+reads `user.home` from the passwd database, not the environment:
+
+```
+$ HOME=/var/lib/ari-agent/build-cache java -XshowSettings:properties -version
+  user.home = /root
+```
+
+Measured in the stg worker the same day: `/root/.m2/repository` held **1.5 GB**
+downloaded inside a 25-minute-old pod, while the PVC held only `.npm`. So every
+fresh worker paid a full cold Maven download, and on a large Java repo that is
+what spent verify's entire 480s budget — the cache that was supposed to prevent
+exactly this had been inert for Maven since it was written.
+
+Fixed with `-Dmaven.repo.local` (Maven's own override, which does not go
+through `user.home`) and `GRADLE_USER_HOME`, in a new
+`opencode_cli._build_cache_env`. `MAVEN_OPTS` is appended to, not replaced, so
+Dockerfile.oncall's `-Xmx2g` survives.
+
+Worth keeping in mind generally: `HOME` is not a reliable way to relocate a
+build tool's cache. Check each tool's own documented variable.
+
+**Verified:** full suite **307 passed** (from 297) in
+`ari-oncall-agent-worker:test`. 10 new cases: 4 on the proposal's
+`verification` field (failed/passed/not-run vs skipped/truncation), 2 on the
+workflow loop (`continue` reaches the later steps, `fail_needs_human` still
+stops), 4 on the build-cache env. One existing case was rewritten: it asserted
+`extra_env == {"HOME": ...}`, which pinned the half-working behaviour.
