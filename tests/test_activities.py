@@ -357,3 +357,28 @@ async def test_a_plan_without_clone_repo_is_left_alone(tmp_path, monkeypatch):
     await activities.execute_step(_step_payload(tmp_path, {}))
 
     assert calls == ["generate_change"]
+
+
+@pytest.mark.asyncio
+async def test_respond_does_not_reclone_after_cleanup_removed_the_sandbox(tmp_path, monkeypatch):
+    # workflow.py runs `respond` after `cleanup_workspace`, on purpose and on
+    # every ending, so the checkout is always gone by then -- deleted
+    # deliberately, not lost with a pod. Healing it would clone the whole
+    # repository again to write a summary built entirely from `results`.
+    # Observed on stg 2026-10-10 (dbc75291): `recloning_lost_sandbox
+    # capability=respond`, two seconds after cleanup, on a healthy run.
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=120)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+    calls = []
+
+    async def fake_run(name, ctx):
+        calls.append(name)
+        return {}
+
+    monkeypatch.setattr(activities, "run_capability", fake_run)
+    payload = _step_payload(tmp_path, {"clone_repo": {"cloned_path": str(tmp_path / "gone")}})
+    payload["capability"] = "respond"
+
+    await activities.execute_step(payload)
+
+    assert calls == ["respond"]
