@@ -98,6 +98,7 @@ def key_hunks(diff: str) -> str:
 _VERIFICATION_NOT_RUN = "not run"
 _VERIFICATION_PASSED = "passed"
 _VERIFICATION_SKIPPED = "skipped"
+_VERIFICATION_INCONCLUSIVE = "inconclusive"
 # Kept short: this is read in a one-line table row in the approval email, and
 # the failure output itself is already in the agent's own message.
 _MAX_VERIFICATION_DETAIL_CHARS = 600
@@ -122,7 +123,7 @@ def _verification(ctx: StepContext) -> dict:
     if status == "passed":
         return {"status": _VERIFICATION_PASSED, "detail": ""}
     return {
-        "status": "failed",
+        "status": _VERIFICATION_INCONCLUSIVE if status == "inconclusive" else "failed",
         "detail": (result.get("failure") or "")[:_MAX_VERIFICATION_DETAIL_CHARS],
     }
 

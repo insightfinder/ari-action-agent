@@ -360,7 +360,7 @@ async def test_exhausted_on_failure_with_then_continue_still_reaches_the_later_s
         capability = payload["capability"]
         calls[capability] = calls.get(capability, 0) + 1
         if capability == "verify":
-            return {"status": "failed", "failure": "mvn: BUILD FAILURE"}
+            raise RuntimeError("opencode (ari-verify) timed out after 435s and was killed")
         if capability == "propose_pr":
             return {"pending_action": {"id": "p1"}, "requires_approval": True}
         if capability == "respond":
@@ -415,3 +415,106 @@ async def test_then_fail_needs_human_still_stops_the_pipeline():
 
     assert calls["propose_pr"] == 0
     assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_build_that_really_failed_still_stops_the_pipeline():
+    calls = {"generate_change": 0, "verify": 0, "propose_pr": 0}
+    plan = {
+        "steps": [
+            {
+                "capability": "generate_change",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": None,
+                "timeout_seconds": None,
+                "confirmed": False,
+            },
+            {
+                "capability": "verify",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": {"goto": "generate_change", "max_attempts": 1, "then": "continue"},
+                "timeout_seconds": 5,
+                "confirmed": False,
+            },
+            {
+                "capability": "propose_pr",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": None,
+                "timeout_seconds": None,
+                "confirmed": False,
+            },
+        ],
+        "rationale": "test",
+    }
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        capability = payload["capability"]
+        calls[capability] = calls.get(capability, 0) + 1
+        if capability == "verify":
+            return {"status": "failed", "failure": "RESULT: FAIL\ncompilation error"}
+        if capability == "propose_pr":
+            return {"pending_action": {"id": "p1"}, "requires_approval": True}
+        if capability == "respond":
+            return {"message": f"final:{payload['params'].get('pipeline_status')}"}
+        return {"status": "ok"}
+
+    result = await _run_workflow(plan, execute_step)
+
+    assert calls["propose_pr"] == 0
+    assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_verify_that_never_finished_lets_the_pipeline_continue():
+    calls = {"generate_change": 0, "verify": 0, "propose_pr": 0}
+    plan = {
+        "steps": [
+            {
+                "capability": "generate_change",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": None,
+                "timeout_seconds": None,
+                "confirmed": False,
+            },
+            {
+                "capability": "verify",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": {"goto": "generate_change", "max_attempts": 1, "then": "continue"},
+                "timeout_seconds": 5,
+                "confirmed": False,
+            },
+            {
+                "capability": "propose_pr",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": None,
+                "timeout_seconds": None,
+                "confirmed": False,
+            },
+        ],
+        "rationale": "test",
+    }
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        capability = payload["capability"]
+        calls[capability] = calls.get(capability, 0) + 1
+        if capability == "verify":
+            raise RuntimeError("opencode (ari-verify) timed out after 435s and was killed")
+        if capability == "propose_pr":
+            return {"pending_action": {"id": "p1"}, "requires_approval": True}
+        if capability == "respond":
+            return {"message": f"final:{payload['params'].get('pipeline_status')}"}
+        return {"status": "ok"}
+
+    result = await _run_workflow(plan, execute_step)
+
+    assert calls["verify"] == 2
+    assert calls["propose_pr"] == 1
+    assert result["status"] == "needs_approval"

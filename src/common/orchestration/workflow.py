@@ -293,7 +293,7 @@ class AriAgentWorkflow:
                     final_status = "failed"
                     failure_reason = f"{capability} failed: {_activity_failure_detail(exc)}"
                     break
-                step_result = {"status": "failed", "failure": _activity_failure_detail(exc)}
+                step_result = {"status": "inconclusive", "failure": _activity_failure_detail(exc)}
 
             results[capability] = step_result
 
@@ -308,7 +308,7 @@ class AriAgentWorkflow:
                 final_status = "needs_approval"
                 break
 
-            if on_failure and step_result.get("status") == "failed":
+            if on_failure and step_result.get("status") in ("failed", "inconclusive"):
                 attempts = loop_attempts.get(capability, 0) + 1
                 loop_attempts[capability] = attempts
                 if attempts > on_failure["max_attempts"]:
@@ -336,8 +336,11 @@ class AriAgentWorkflow:
                     # a step whose failure really should stop everything.
                     failure_reason = step_result.get("failure")
                     if on_failure["then"] == "continue":
-                        i += 1
-                        continue
+                        if step_result.get("status") == "inconclusive":
+                            i += 1
+                            continue
+                        final_status = "failed"
+                        break
                     final_status = "failed" if on_failure["then"] == "fail_needs_human" else on_failure["then"]
                     break
                 i = next(idx for idx, s in enumerate(steps) if s["capability"] == on_failure["goto"])
