@@ -315,3 +315,103 @@ async def test_without_an_override_the_default_budget_leaves_normal_runs_alone()
     result = await _run_workflow(plan, execute_step)
 
     assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_exhausted_on_failure_with_then_continue_still_reaches_the_later_steps():
+    # The whole point of the change. With `then: fail_needs_human` the loop
+    # broke out here and `propose_pr` never ran, so a change that had already
+    # been generated was pushed nowhere and shown to nobody -- observed on stg
+    # 2026-10-10 (fc532091, 1c2396a4), where verify spent all four attempts on
+    # a cold Maven download and the finished diff was discarded.
+    calls = {"generate_change": 0, "verify": 0, "propose_pr": 0}
+    plan = {
+        "steps": [
+            {
+                "capability": "generate_change",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": None,
+                "timeout_seconds": None,
+                "confirmed": False,
+            },
+            {
+                "capability": "verify",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": {"goto": "generate_change", "max_attempts": 3, "then": "continue"},
+                "timeout_seconds": 5,
+                "confirmed": False,
+            },
+            {
+                "capability": "propose_pr",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": None,
+                "timeout_seconds": None,
+                "confirmed": False,
+            },
+        ],
+        "rationale": "test",
+    }
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        capability = payload["capability"]
+        calls[capability] = calls.get(capability, 0) + 1
+        if capability == "verify":
+            return {"status": "failed", "failure": "mvn: BUILD FAILURE"}
+        if capability == "propose_pr":
+            return {"pending_action": {"id": "p1"}, "requires_approval": True}
+        if capability == "respond":
+            return {"message": f"final:{payload['params'].get('pipeline_status')}"}
+        return {"status": "ok"}
+
+    result = await _run_workflow(plan, execute_step)
+
+    assert calls["verify"] == 4, "the retry loop itself must be unchanged"
+    assert calls["propose_pr"] == 1, "the step after the exhausted loop must still run"
+    assert result["status"] == "needs_approval"
+
+
+@pytest.mark.asyncio
+async def test_then_fail_needs_human_still_stops_the_pipeline():
+    # `continue` is opt-in per capability; a step whose failure really should
+    # end the run keeps doing exactly that.
+    calls = {"verify": 0, "propose_pr": 0}
+    plan = {
+        "steps": [
+            {
+                "capability": "verify",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": {"goto": "verify", "max_attempts": 1, "then": "fail_needs_human"},
+                "timeout_seconds": 5,
+                "confirmed": False,
+            },
+            {
+                "capability": "propose_pr",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": None,
+                "timeout_seconds": None,
+                "confirmed": False,
+            },
+        ],
+        "rationale": "test",
+    }
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        capability = payload["capability"]
+        calls[capability] = calls.get(capability, 0) + 1
+        if capability == "verify":
+            return {"status": "failed", "failure": "boom"}
+        if capability == "respond":
+            return {"message": f"final:{payload['params'].get('pipeline_status')}"}
+        return {"status": "ok"}
+
+    result = await _run_workflow(plan, execute_step)
+
+    assert calls["propose_pr"] == 0
+    assert result["status"] == "failed"

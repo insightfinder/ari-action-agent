@@ -312,8 +312,33 @@ class AriAgentWorkflow:
                 attempts = loop_attempts.get(capability, 0) + 1
                 loop_attempts[capability] = attempts
                 if attempts > on_failure["max_attempts"]:
-                    final_status = "failed" if on_failure["then"] == "fail_needs_human" else on_failure["then"]
+                    # `then: continue` keeps the pipeline going with the
+                    # failure recorded, instead of ending the run here.
+                    #
+                    # Added because the alternative threw away finished work.
+                    # `verify` is the only step with an `on_failure` loop, and
+                    # on a large Java repo it exhausted all four attempts on
+                    # stg (2026-10-10, runs fc532091 and 1c2396a4) — at which
+                    # point `break` skipped `propose_pr` entirely, so a change
+                    # that had already been generated was never pushed, never
+                    # proposed, and never seen by anyone. The run reported
+                    # `failed` with the diff discarded.
+                    #
+                    # That is the wrong trade for this pipeline. A pull request
+                    # is not merged by the agent; it pauses for a person who
+                    # reads the diff. An unverified change, labelled as
+                    # unverified, is strictly more useful to that person than
+                    # no change at all — and they can always run the build
+                    # themselves, which is exactly what the agent could not
+                    # finish in time.
+                    #
+                    # `fail_needs_human` is still available and unchanged, for
+                    # a step whose failure really should stop everything.
                     failure_reason = step_result.get("failure")
+                    if on_failure["then"] == "continue":
+                        i += 1
+                        continue
+                    final_status = "failed" if on_failure["then"] == "fail_needs_human" else on_failure["then"]
                     break
                 i = next(idx for idx, s in enumerate(steps) if s["capability"] == on_failure["goto"])
                 continue
