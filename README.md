@@ -1,4 +1,4 @@
-# ARI On-Call Agent
+# ARI Action Agent
 
 A standalone agent that receives an incident/prompt + full configuration in
 a single request, autonomously clones a repo, analyzes the problem, generates
