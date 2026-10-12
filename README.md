@@ -20,7 +20,7 @@ request is fully self-contained (its own LLM key/model, its own repo
 credentials) and it is meant to be built, deployed, and scaled independently
 (EC2, a Kubernetes Job/Deployment, etc.).
 
-## Why it looks the way it does
+## Major features
 
 - **Temporal-only execution.** There is no "inline" fallback engine. Every
   request runs as one Temporal workflow, one A2A `Task`. Temporal (hosted
