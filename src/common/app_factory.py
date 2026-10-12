@@ -1,3 +1,6 @@
+import asyncio
+from contextlib import asynccontextmanager
+
 import httpx
 import structlog
 from fastapi import FastAPI
@@ -15,6 +18,7 @@ from a2a.server.tasks import (
 from common.a2a_server.agent_card import build_agent_card
 from common.a2a_server.auth import ApiKeyCallContextBuilder
 from common.a2a_server.executor import AriAgentExecutor
+from common.a2a_server.reconciler import reconcile_unfinished_tasks
 from common.a2a_server.task_store import build_task_store
 from common.settings import get_settings
 
@@ -56,10 +60,19 @@ def create_app() -> FastAPI:
 
     context_builder = ApiKeyCallContextBuilder()
 
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        reconcile = asyncio.create_task(reconcile_unfinished_tasks(task_store))
+        try:
+            yield
+        finally:
+            reconcile.cancel()
+
     app = FastAPI(
         title=settings.agent_name,
         description=agent_card.description,
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     # JSON-RPC and REST both mounted, per the scope decided in

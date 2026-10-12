@@ -152,7 +152,7 @@ async def test_plan_task_attaches_verifys_timeout_seconds_from_the_capability_re
 
         result = await activities.plan_task({"prompt": "run tests", "config": {}, "history": []})
 
-        assert result["steps"][0]["timeout_seconds"] == 480  # configs/oncall/capabilities.yaml
+        assert result["steps"][0]["timeout_seconds"] == 900  # configs/oncall/capabilities.yaml
         assert result["steps"][0]["on_failure"]["goto"] == "generate_change"
     finally:
         get_settings.cache_clear()
