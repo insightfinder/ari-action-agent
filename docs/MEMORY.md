@@ -3394,3 +3394,98 @@ crashing. `OwnerResolver`/`resolve_user_scope` live in
 `a2a.server.tasks.inmemory_task_store`, not `task_store`, and
 `resolve_user_scope` reads `context.user.user_name` — both found by running
 against the installed SDK rather than assuming.
+
+## 2026-10-12 — persisting a task was only half of it: a running one was orphaned
+
+Round four of the stg E2E found the other half of the lost-approval bug, and
+it is in this repo. The previous day's `FileTaskStore` fixes a task that was
+**already paused** when the API pod went away. It does nothing for a task that
+was **still running**, because the thing that writes the pause has itself died.
+
+`a2a_server/executor.py` drives the whole lifecycle from one in-process await:
+
+    handle = await client.start_workflow(..., id=context.task_id, ...)
+    result = await handle.result()
+    ...
+    await _publish_result(updater, result)
+
+Only `_publish_result` writes the artifacts and the terminal/`INPUT_REQUIRED`
+state. Everything before it — `enqueue_event(Task(...))`, `start_work()` — has
+already been saved, which is why an orphan is left sitting in WORKING.
+
+Measured on stg, task `86a04bdd-2fb0-4669-96bc-03c3e2b1e889`:
+
+    23:25        task saved as WORKING (93 bytes on the PVC)
+    23:31        API pod replaced; this coroutine dies with it
+    23:43-23:49  the Temporal workflow carries on and verify finally passes
+    23:49:51     propose_pr pushes ari/ari-fix-rejectedexecutionexception-with--86a04bdd
+    23:49:53     respond; workflow status COMPLETED
+    later        the .pb file is still 93 bytes, WORKING, zero artifacts
+
+So the branch is on GitHub with a real two-file fix, the workflow finished
+cleanly, and the approval is unreachable: `_find_pending_action` resolves a
+confirmation against the task's own artifacts, and there are none.
+
+`a2a_server/reconciler.py` re-attaches at startup. `FileTaskStore.unfinished()`
+returns every persisted task still in SUBMITTED/WORKING; for each, the
+reconciler takes the workflow handle (the workflow id *is* the task id) and
+awaits its result, then republishes it. It runs from a FastAPI lifespan task,
+never blocking readiness, since `handle.result()` on a still-running workflow
+blocks for as long as the run takes — which is exactly the point.
+
+Nothing about the publish is reimplemented: `_publish_result` is called
+unchanged against an `EventQueue` subclass that only collects, and the
+collected events go through the SDK's own `TaskManager.process`, which is what
+persists them for a real request too.
+
+Four things checked against the installed a2a-sdk (1.1.2) rather than assumed:
+
+- `TaskUpdater` touches nothing on the queue but `enqueue_event`, so a
+  collecting subclass is sufficient. `EventQueue`'s own docstring names a
+  custom subclass as the supported way to run an executor outside the
+  framework; `EventQueueLegacy` is deprecated and was not used.
+- `TaskManager.process` -> `save_task_event` -> `_save_task` is the same
+  persistence path a request takes.
+- A bare `ServerCallContext()` resolves to owner `''`, which is what
+  `ApiKeyCallContextBuilder` produces too — hence the flat `<task_id>.pb`
+  files at the root of the stg volume, and hence a reconciled task is written
+  back where the request would have written it. An owner subdirectory is
+  handled by rebuilding the context from the directory name.
+- Annotating `unfinished()` as `-> list[...]` raises `'function' object is not
+  subscriptable` at import: `FileTaskStore` already binds `list` as a method
+  (the `TaskStore` ABC requires it), and a class-body annotation is evaluated
+  in the class namespace. Quoted instead. This would have crashed the API on
+  startup; the new tests caught it before deploy.
+
+### `verify`'s timeout had no margin
+
+The same run showed `verify` is not hopeless on InfrastructureCore, only
+starved: attempts at 435s and 435s were killed, the third finished in 404.32s
+and returned PASS. The GitHub Actions job that does strictly more work
+(`mvn -B clean test` plus the powermock profile plus setup) ran 4.2-7.0 minutes
+across its last twelve runs. 435s was simply too close to the real cost.
+
+`timeout_seconds` 480 -> 900, and `on_failure.max_attempts` 3 -> 2 with it: the
+pipeline budget is 3000s, so three 900s attempts would leave nothing for
+propose_pr and turn a slow verify into no proposal at all, which is worse than
+the bug. Two attempts bound verify at ~31 minutes and leave ~19.
+
+The comment above `timeout_seconds` still warns about callers' "~8-10 minute
+patience timeout". That was written 2026-09-21 and no longer binds: mcp-service
+polls `GET /tasks/<id>` every five seconds rather than blocking on the send,
+and the deadline it reported for this run was 20115s.
+
+**Verified:** full suite **326 passed**, from 318 — run on Linux inside
+`ari-agent-api:2610100951-staging`, because four modules import `fcntl` and
+cannot run on Windows at all. Eight new cases in `tests/test_reconciler.py`:
+an orphaned task gets its `pending_action` persisted, that artifact is the one
+`_find_pending_action` resolves against, a finished task is never re-run, an
+unreadable workflow leaves its task alone, one bad workflow does not stop the
+others, an in-memory store is a no-op, an owner-scoped task is written back
+under its owner, and a missing Temporal frontend degrades instead of crashing.
+
+**Still not in this repo:** mcp-service abandons a task permanently when the
+connection drops. It stopped polling `86a04bdd` at 23:31 and never came back
+once the new pod was serving 56 seconds later, reporting "lost connection
+before opening a pull request" as a final answer. Until that retries, this
+reconciler restores the task but nothing asks for the approval.
