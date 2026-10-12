@@ -3,14 +3,35 @@ import tempfile
 import time
 
 import structlog
+from a2a.auth.user import User
 from a2a.server.context import ServerCallContext
 from a2a.server.tasks import InMemoryTaskStore, TaskStore
 from a2a.server.tasks.inmemory_task_store import OwnerResolver, resolve_user_scope
-from a2a.types import Task
+from a2a.types import Task, TaskState
 
 logger = structlog.get_logger()
 
 _MAX_AGE_SECONDS = float(os.getenv("TASK_STORE_MAX_AGE_SECONDS", str(7 * 24 * 3600)))
+
+_UNFINISHED_STATES = frozenset(
+    {
+        TaskState.TASK_STATE_SUBMITTED,
+        TaskState.TASK_STATE_WORKING,
+    }
+)
+
+
+class _ScopedUser(User):
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def is_authenticated(self) -> bool:
+        return bool(self._name)
+
+    @property
+    def user_name(self) -> str:
+        return self._name
 
 
 def _safe(name: str) -> str:
@@ -124,6 +145,20 @@ class FileTaskStore(TaskStore):
     async def delete(self, task_id: str, context: ServerCallContext) -> None:
         await self._memory.delete(task_id, context)
         self._remove(self._resolve(context), task_id)
+
+    def unfinished(self) -> "list[tuple[ServerCallContext, Task]]":
+        found = []
+        for dirpath, _, filenames in os.walk(self._root):
+            relative = os.path.relpath(dirpath, self._root)
+            owner = "" if relative == os.curdir else relative
+            for name in sorted(filenames):
+                if not name.endswith(".pb"):
+                    continue
+                task = self._read(owner, name[: -len(".pb")])
+                if task is None or task.status.state not in _UNFINISHED_STATES:
+                    continue
+                found.append((ServerCallContext(user=_ScopedUser(owner)), task))
+        return found
 
 
 def build_task_store(root: str) -> TaskStore:
