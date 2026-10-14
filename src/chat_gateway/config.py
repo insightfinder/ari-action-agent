@@ -2,6 +2,7 @@ import json
 from typing import Any
 from urllib.parse import urlsplit
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_MODELS = {"openai": "gpt-4o-mini", "anthropic": "claude-haiku-4-5"}
@@ -34,6 +35,11 @@ class GatewaySettings(BaseSettings):
     agent_outage_seconds: float = 600.0
     request_timeout_seconds: float = 60.0
 
+    @field_validator("ari_api_key", "llm_api_key", "github_pat", mode="before")
+    @classmethod
+    def strip_secret(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
     def llm_config(self) -> dict[str, Any]:
         if not self.llm_api_key:
             raise ConfigError("LLM_API_KEY is not set")
@@ -65,10 +71,10 @@ class GatewaySettings(BaseSettings):
 
     def check_repo_url(self, repo_url: str) -> str:
         parts = urlsplit(repo_url)
-        if parts.scheme != "https":
-            raise ConfigError(f"repository URL must use https: {repo_url}")
         if parts.username or parts.password:
             raise ConfigError("repository URL must not embed credentials")
+        if parts.scheme != "https":
+            raise ConfigError(f"repository URL must use https, not {parts.scheme or 'no scheme'}")
         host = (parts.hostname or "").lower()
         if host not in self.allowed_hosts():
             raise ConfigError(f"repository host {host!r} is not allowed; set ALLOWED_REPO_HOSTS to permit it")

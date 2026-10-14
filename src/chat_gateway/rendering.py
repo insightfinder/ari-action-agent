@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .tasks import (
@@ -42,6 +42,7 @@ class Rendered:
     state: str
     buttons: tuple[Button, ...] = ()
     links: tuple[str, ...] = ()
+    task: dict | None = field(default=None, compare=False, hash=False, repr=False)
 
 
 def state_label(task: dict[str, Any]) -> str:
@@ -58,7 +59,7 @@ def render_progress(task: dict[str, Any]) -> Rendered:
     text = f"{state_label(task)} (task {short_id(_text(task.get('id')))})"
     if produced:
         text += "; produced: " + ", ".join(produced)
-    return Rendered(text=text, state=task_state(task))
+    return Rendered(text=text, state=task_state(task), task=task)
 
 
 def render_proposal(action: dict[str, Any]) -> str:
@@ -104,7 +105,7 @@ def render_pending(task: dict[str, Any]) -> Rendered:
         )
     compare_url = _text(action.get("compare_url"))
     links = (compare_url,) if compare_url else ()
-    return Rendered(text="\n\n".join(text_parts), state=task_state(task), buttons=buttons, links=links)
+    return Rendered(text="\n\n".join(text_parts), state=task_state(task), buttons=buttons, links=links, task=task)
 
 
 def render_final(task: dict[str, Any]) -> Rendered:
@@ -116,7 +117,7 @@ def render_final(task: dict[str, Any]) -> Rendered:
     if url:
         text += f"\n\nPull request: {url}"
         links.append(url)
-    return Rendered(text=text, state=task_state(task), links=tuple(links))
+    return Rendered(text=text, state=task_state(task), links=tuple(links), task=task)
 
 
 def render(task: dict[str, Any]) -> Rendered:

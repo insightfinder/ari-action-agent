@@ -3665,3 +3665,172 @@ carries default ACLs that override `umask`, so a credentials file
 written there with `umask 077` still came out `other::r--`. Set the mode
 and strip the ACL explicitly (`setfacl -b`, `chmod 600`) on anything
 holding a key.
+
+## 2026-10-14 - `ari` gets an interactive chat for people (II-25116, step 1 follow-up)
+
+Feedback after the first hands-on test, verbatim in substance: the CLI
+"looks like a demo for developers, not something to hand to users". The
+concrete evidence was a misread: `ari send "In one sentence, what is a
+deadlock?"` printed the agent's answer bare under a progress line, and the
+answer (a definition of being blocked) was taken for an error. Nothing
+marked what was an answer and what was a failure, and using it at all
+meant knowing subcommands, internal setting names and task ids.
+
+Running `ari` on its own now opens a chat; the one-shot subcommands stay
+for scripts and are documented as such (`docs/CLI.md`).
+
+- **Chat first, menus only at decisions.** The main action is free text,
+  which a menu cannot express; menus appear where there is a fixed set of
+  choices. A proposal is a card (title, repository, branch to base,
+  files, test status, compare link, diff excerpt) followed by an
+  arrow-key menu: approve, decline, show the diff link, ask a follow-up,
+  decide later. Full-screen TUI was rejected because it works badly over
+  the SSH/bastion path this team actually uses and defeats copy-paste.
+- **Every output says what it is.** Answers under `ARI ›` with Markdown
+  rendered, errors as red `Error:`, failed tasks as `✖`, a spinner with
+  elapsed time and what the agent has produced so far while it works.
+  The agent does not report per-step progress (`executor.py` sends only
+  SUBMITTED/WORKING and artifacts), so "cloning / editing / pushing" step
+  names would need an agent change and are not shown.
+- **First-run setup** asks for the agent URL and key, provider, model, LLM
+  key, GitHub token and default repository, checks that the agent answers
+  and writes the settings file `0600`. It is skipped when the environment
+  already carries an agent URL and an LLM key, which is how the bastion
+  wrapper and any scripted install run.
+- **Slash commands** with Tab completion and history: `/repo`, `/branch`,
+  `/base`, `/status`, `/approve`, `/decline`, `/new`, `/config`,
+  `/setup`, `/quit`.
+- **Two terminal backends behind one interface** (`ari_cli/terminal.py`):
+  `prompt_toolkit` + `questionary` when attached to a terminal, plain
+  prompts with numbered menus otherwise. The libraries are imported only
+  for the terminal backend and live in the `cli` extra, so the agent
+  images and the unit tests on Windows do not need them.
+- `Rendered` now carries the raw task (`compare=False`), so the UI builds
+  the card from structured fields instead of re-parsing rendered text;
+  `bridge.start` keeps it when it appends the "earlier proposal" note.
+
+**Verified:** full suite **450 passed** in `ari-oncall-agent-worker:test`
+on the bastion, including `tests/test_ari_cli_tty.py`, which drives the
+real terminal UI through a pseudo-terminal against a fake agent: the chat,
+the arrow-key approval menu, Tab completion and the setup wizard (the
+saved file checked for content and `0600`). 17 plain-mode chat cases in
+`tests/test_ari_cli_chat.py`, 2 in `tests/test_ari_cli_session.py`
+(Ctrl-C while waiting and at the prompt). Then a pty session against the
+deployed test agent: banner, spinner, `ARI ›` answer, `/help`, Ctrl-D,
+exit 0. The approval menu has been exercised against the fake agent only.
+
+The pty tests warn that `forkpty()` runs in a process with a server
+thread. Harmless here (the child execs Python straight away), but it is
+why that fake agent is kept minimal.
+
+### Same day - an adversarial review before handing it over
+
+Three independent reviewers (conversation behaviour, terminal and platform,
+secrets/setup/tests), each finding then attacked by two verifiers trying to
+refute it: 15 confirmed, 0 refuted, 27 low-severity left unverified. Every
+confirmed one is fixed, and most of the low ones. The ones worth knowing
+about, because each would have reached a user:
+
+- **`/base` broke approvals.** It appended `base=<x>` to every line, so a
+  bare `yes` became `yes base=staging`, which `decision_word` does not
+  recognise; the "approval" went to the agent as a follow-up and burned
+  the proposal. `Bridge.start` now judges the text with directives
+  removed, and only treats yes/no as a decision when a proposal is
+  actually pending (a `yes` answering the agent's question is sent as
+  text). The appended sentence is now a condition ("if this request leads
+  to a pull request, open it against X") instead of an order, because the
+  order turned plain questions into change requests. `base_hint()` in
+  `chat_gateway/bridge.py` is the one place it is worded.
+- **Approving something never seen.** `/status` printed only "a proposal
+  is waiting", and `/approve` or `yes` would then confirm it. The chat
+  now records the id of the card it last showed and shows the card again
+  instead of confirming any other id; `/status` renders the card and menu.
+- **Losing a proposal silently.** `/new`, `/setup`, `/quit`, Ctrl-D and a
+  `/command` typed at the follow-up prompt all dropped a waiting
+  proposal, and no screen ever showed the full task id needed to recover
+  it. Leaving now prints the id with `ari approve <id>` or
+  `ari tasks follow <id>`; slash input at the follow-up prompt runs as a
+  command.
+- **Typeahead could approve.** Keys typed while the spinner ran stayed
+  queued and the arrow-key menu starts on Approve; a queued Enter picked
+  it. Input is flushed (`termios.tcflush` / `msvcrt`) before every menu
+  and confirm.
+- **Setup wrote unusable or wrong configs.** Pressing Enter through it
+  switched an OpenAI setup to Anthropic (the default came from a constant,
+  not from what was in effect); "other" with a blank name or model was
+  saved; a URL without a scheme was saved. Defaults now come from the
+  effective settings, the LLM block is validated with `llm_config()`
+  before saving, and `-` clears a value.
+- **Secrets on screen.** An API key with a trailing newline (a pasted key,
+  or a Secret made with `--from-file`) made h11 reject the header, and
+  `http_retry` copied the header value into the error text, which the
+  banner then printed. Secret fields are now stripped at the settings
+  model, and `AgentClient` replaces a `LocalProtocolError` message with
+  one that names no value. An `http://` repo URL carrying a token was
+  echoed by the scheme check; credentials are now checked first. Typer's
+  `pretty_exceptions_show_locals` is off, since setup frames hold keys.
+- **Windows.** Piped stdout uses a code page, and `→`/`✔`/`✖` raised
+  `UnicodeEncodeError` mid-proposal; stdout/stderr are reconfigured with
+  `errors="replace"` when they are not a terminal. Piped setup hung,
+  because `getpass` reads the console on Windows and `/dev/tty` on POSIX,
+  not the pipe; secrets are read from stdin when it is not a terminal.
+  `test_piped_setup_reads_every_answer_from_stdin_without_hanging` runs
+  this as a real subprocess.
+- **Agent text read as markup.** Rich parsed `app/[slug]/page.tsx` as a tag
+  (the file list on the card lost `[slug]`), and `[/tmp/x]` raised
+  `MarkupError`. Every agent string is now wrapped in `Text`.
+- **Smaller ones:** an invalid agent URL (`httpx.InvalidURL`, not a
+  `TransportError`) crashed instead of reporting; the connection check
+  took up to 3 x 60 s with no spinner and is now one attempt at 15 s with
+  one; a broken `config.toml` crashed both `ari` and `ari setup`, which
+  now reports it and lets setup replace it; the history file no longer
+  chmods the directory that holds `ARI_CONFIG_FILE`; the spinner hint no
+  longer stays on "restarting" after the agent recovers.
+
+Tests now share `tests/ari_cli_fakes.py` and fixtures in
+`tests/conftest.py` instead of one test module importing another's
+fixture. 17 new cases in `tests/test_ari_cli_chat_decisions.py`; the
+session test now proves the loop continues after Ctrl-C (it passed with
+`continue` mutated to `return` before); the pty test asserts that no
+secret reaches the screen.
+
+**Verified:** Windows 349 passed (13 modules not collectable there, as
+before); Linux **470 passed** in `ari-oncall-agent-worker:test`, including
+both pty tests; then a pty session against the deployed test agent through
+the rebuilt bastion image. The arrow-key approval menu is still exercised
+against the fake agent only.
+
+### Same day - first hands-on use on test: two gaps, one agent bug
+
+The user's first proposal went through end to end from the chat: card,
+arrow-key approval, PR #24 on `OnCall-ARI-InfraCore-testing`. The second
+request hung, and how the user tried to recover showed two gaps in the
+chat itself:
+
+- After Ctrl-C there was no way inside the chat to follow the task again
+  or to stop it; `/status` only gave a snapshot. The user then typed the
+  shell commands `ari tasks follow <id>` and `ari tasks cancel <id>` into
+  the chat, where they went to the bridge as messages (refused, since the
+  task was running). Added `/wait` (re-attach, via a new public
+  `Bridge.follow`) and `/cancel` (asks first; declines a waiting
+  proposal), every running-task notice now names them, a message typed
+  while the task runs is held back with that hint, and an `ari <command>`
+  line typed into the chat is explained instead of sent.
+- `/st` was rejected as unknown. Commands now resolve by unique prefix;
+  an ambiguous prefix lists the candidates.
+
+The hang itself was agent-side, not the CLI: task `f0d352b6` sat for 19
+minutes because the worker never noticed its `generate_change` follow-up
+opencode process exit. Evidence taken live on the worker pod: `opencode`
+pid 1185 was a zombie whose parent was `python -m api.worker` (so tini
+cannot reap it), asyncio was using `PidfdChildWatcher` (Python 3.12.15),
+and the worker held a pidfd for 1185 (fd 18) that no epoll instance in
+the process was watching, so `_do_wait`/`waitpid` never ran. The 10-10
+deadline then fired (`opencode (ari-change) timed out after 1155s (pid
+1185) and was killed`), `generate_change` retried, and the retry produced
+the proposal at 12:53 UTC. Third occurrence after 09-25 and 10-10; split
+out as its own task, since the fix belongs in `opencode_runtime`/`git_ops`
+rather than in the client.
+
+**Verified:** Windows 357 passed; Linux 478 passed in the worker image. 8 new cases in
+`tests/test_ari_cli_running.py`.
