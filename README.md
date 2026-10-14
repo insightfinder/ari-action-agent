@@ -3,7 +3,16 @@
 A standalone agent that receives an incident/prompt + full configuration in
 a single request, autonomously clones a repo, analyzes the problem, generates
 and verifies a fix (via [opencode](https://github.com/sst/opencode) running
-in a sandbox), and opens a pull request — then reports back.
+in a sandbox), pushes it to a branch, and asks a person to approve the pull
+request before opening it — then reports back.
+
+**A pull request is never opened without a human saying so.** The run pauses
+in A2A's `TASK_STATE_INPUT_REQUIRED` carrying everything needed to judge the
+change (title, target branch, files, an excerpt of the diff, and a compare
+link to the pushed branch), and the pull request is opened only once the
+caller confirms. See
+[`docs/INPUT_REQUIRED_INTEGRATION.md`](docs/INPUT_REQUIRED_INTEGRATION.md)
+for that contract.
 
 It's a **genuine A2A (Agent2Agent) protocol server**, built on the official
 [`a2a-sdk`](https://pypi.org/project/a2a-sdk/) (Linux Foundation project) —
@@ -123,6 +132,86 @@ same `message/send` operation) and a runnable sample client at
 `docs/examples/sample_client.py` (reads `OPENAI_API_KEY` / `GITHUB_PAT` from
 the environment, never hardcoded). `scripts/e2e_callback_receiver.py` is
 this project's own generic webhook-logging tool for local testing.
+
+## Testing
+
+Two layers, and they catch different things. Only the first one needs Docker.
+
+### Unit tests
+
+`pytest tests/` covers every capability against mocked tools. Docker is not a
+preference here — 11 modules need `a2a`/`fcntl` and cannot even be *collected*
+on Windows, so run them in the worker image:
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work insightfinderinc/ari-oncall-agent-worker:test   sh -lc 'pip install -q pytest pytest-asyncio; PYTHONPATH=/work/src python -m pytest tests/ -q'
+```
+
+**A green suite is not enough on its own.** Mocks always return something, so
+they cannot produce the three conditions that have actually broken this agent
+in production: a model that edits nothing while reporting that it did, a clock
+that accumulates across retries, and a brand-new file that `git diff HEAD`
+cannot see. All three shipped past a passing suite; see `docs/MEMORY.md`,
+2026-10-09.
+
+### Live scenarios against a deployed agent
+
+`scripts/oncall_live_test.py` closes that gap. It is a plain HTTP client — no
+Docker, no local agent, nothing to stand up. Its only dependency is `httpx`:
+
+```bash
+pip install httpx
+
+export ARI_BASE_URL=...  ARI_API_KEY=...
+export LLM_PROVIDER=anthropic LLM_API_KEY=... LLM_MODEL=claude-haiku-4-5
+export GITHUB_PAT=...    REPO_URL=https://github.com/<org>/<repo>  REPO_REF=<branch>
+
+python scripts/oncall_live_test.py --list           # the six scenarios
+python scripts/oncall_live_test.py                  # all of them, no writes
+python scripts/oncall_live_test.py budget           # just one
+python scripts/oncall_live_test.py --allow-writes   # include the one that opens a PR
+```
+
+`ARI_BASE_URL` is wherever the agent actually answers. An environment that
+publishes an ingress can be hit directly (`https://<host>`); one that does not
+is reached the same way its own callers reach it, through the in-cluster
+Service:
+
+```bash
+kubectl -n <ns> port-forward svc/ari-oncall-api 18001:80 &
+export ARI_BASE_URL=http://127.0.0.1:18001
+```
+
+That second form is worth preferring even when an ingress exists: it is the
+path MCP Service itself uses (`ARI_ONCALL_AGENT_URL=http://ari-oncall-api`), so
+it tests what production traffic traverses rather than an edge the product does
+not use. `ARI_API_KEY` is the agent's own `AGENT_API_KEYS` for that
+environment.
+
+| scenario | what it proves |
+|---|---|
+| `card` | the agent card is served where integrations look for it |
+| `budget` | a request given N seconds stops at ~N, instead of running to the plan's design maximum |
+| `empty` | a change that edits nothing fails fast, before `verify` is handed something that does not exist |
+| `propose` | the pause: `INPUT_REQUIRED` + a `pending_action` whose branch is already pushed |
+| `confirm` | approve the proposal and a pull request opens — design.md §5c's round trip |
+| `reject` | a confirm carrying an id the task never proposed is refused, not quietly planned around |
+
+It is deliberately **not** in `tests/`: each scenario costs real LLM tokens and
+real clone/build time, and two of them write a branch and a pull request to
+`REPO_URL`. Run it by hand against a test environment, never in CI, and point
+`REPO_URL` at a repository you do not mind collecting branches in.
+
+Two things it assumes, both learned the hard way (`docs/MEMORY.md`): assert on
+`status.state` and on which artifacts resolved, never on the final message —
+that text is an LLM writing for a human and is paraphrased differently every
+run. And each confirm scenario pauses its own task, because a confirm (valid
+or bogus) moves a task to a terminal state that A2A cannot return from.
+
+Neither layer sees everything. Both are per-request: they assert on what one
+call returns. Anything that only shows up by accumulating inside a
+long-running worker — leaked child processes, growing caches — is invisible to
+both, and is found by looking at the process, not at a response.
 
 See `docs/MEMORY.md` for what's been verified against real infrastructure
 (and real gaps found and fixed along the way: Temporal persists request
