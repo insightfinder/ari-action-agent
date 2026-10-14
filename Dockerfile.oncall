@@ -14,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         golang-go \
         openjdk-21-jdk-headless \
         maven \
-        tini \
     && rm -rf /var/lib/apt/lists/*
 
 # `repo.url` can be a local filesystem path (e.g. a bind-mounted volume),
@@ -108,24 +107,4 @@ ENV AGENT_KIND=oncall
 # OPENCODE_BIN default ("opencode") relies on exactly that, so nothing
 # else to configure here.
 
-# An init as PID 1, because this container's main process is not one.
-#
-# opencode spawns its own `git` children. When an activity is cancelled or
-# times out and opencode goes away, any of those children still running are
-# orphaned and reparented to PID 1 — which, without this, is the worker
-# itself. Python reaps only the processes *it* spawned (asyncio's child
-# watcher tracks those by pid), so an inherited orphan is never waited on and
-# stays a zombie for the life of the pod.
-#
-# Measured on the bastion, 2026-10-09: a worker up 3h35m had accumulated 15
-# `[git] <defunct>` entries, all parented to `python -m api.worker` running as
-# pid 1 in its container, and all 15 disappeared the moment that container
-# was removed. Harmless one at a time; the end state is pid exhaustion,
-# slowly enough that nobody would connect it to this.
-#
-# Reaping them from Python instead would mean a SIGCHLD handler calling
-# `os.waitpid(-1, ...)`, which races asyncio's own watcher threads for the
-# exit status of the processes we *do* own and makes `proc.wait()` fail with
-# ChildProcessError. An init is the mechanism built for this.
-ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "-m", "api.worker"]

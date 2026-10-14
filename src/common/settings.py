@@ -83,7 +83,6 @@ class Settings(BaseSettings):
     # storage) — see max_concurrent_activities above for why concurrency
     # here is bounded anyway.
     build_cache_root: str = "/var/lib/ari-agent/build-cache"
-    task_store_root: str = ""
 
     # Shared LRU-eviction thresholds for both repo_cache_root and
     # build_cache_root (see common/cache_gc.py) — both PVCs are small

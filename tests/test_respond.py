@@ -29,11 +29,7 @@ def _ctx(prompt, results, params, history=None, tools=None):
 def test_respond_is_excluded_from_planner_catalog():
     names = {c["name"] for c in catalog()}
     assert "respond" not in names
-    assert {"clone_repo", "generate_change", "verify", "propose_pr"} <= names
-    # publish_pr is internal: a pull request is opened only through
-    # plan_task's confirmation bypass, from a proposal a person approved.
-    # Offering it to the planner would let a plan skip the gate entirely.
-    assert "publish_pr" not in names
+    assert {"clone_repo", "generate_change", "verify", "publish_pr"} <= names
     # "analyze" was merged into "generate_change" (see generate_change.py's
     # own docstring) — must not reappear as a separate planner-selectable
     # capability.

@@ -64,24 +64,7 @@ from urllib.parse import urlsplit, urlunsplit
 # Still far above any real duration: this is a deadlock guard, and a guard
 # that fires on healthy work is worse than no guard, because it turns a
 # slow-but-fine run into a failed one.
-# Three tiers, not two. `push` is the one non-clone command here that
-# talks to the network, and it was sharing the 30s local-operation tier
-# with `diff`/`add`/`commit`. Confirmed live (prod, 2026-10-08): three
-# concurrent runs against ECommerce-Demo-APIServer all lost the
-# deterministic publish path and fell through to the opencode + GitHub MCP
-# fallback, which let the LLM invent branch names — two of them then
-# reported the same pull request, one having silently *updated* the
-# other's PR instead of opening its own. `git diff timed out after 30s`
-# appears in the same worker log window, so 30s was demonstrably not
-# enough headroom on that pod under concurrency, and a push to GitHub has
-# strictly less business being held to a local-filesystem budget.
-#
-# Same principle as the two tiers below it: a deadlock guard, not a
-# performance budget. A real push of a one-commit branch is well under a
-# second; 120s is far above any healthy duration while still being a
-# fraction of the step's own timeout.
 _CLONE_TIMEOUT_SECONDS = float(os.getenv("GIT_CLONE_TIMEOUT_SECONDS", "600"))
-_NETWORK_TIMEOUT_SECONDS = float(os.getenv("GIT_NETWORK_TIMEOUT_SECONDS", "120"))
 _DEFAULT_TIMEOUT_SECONDS = float(os.getenv("GIT_SUBPROCESS_TIMEOUT_SECONDS", "30"))
 
 
@@ -276,74 +259,9 @@ async def push(workdir: str, repo_config: dict, branch: str) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await _communicate(proc, "git push", timeout=_NETWORK_TIMEOUT_SECONDS)
+    _, stderr = await _communicate(proc, "git push")
     if proc.returncode != 0:
         raise RuntimeError(f"git push failed: {stderr.decode(errors='replace')}")
-
-
-async def untracked_files(workdir: str) -> list[str]:
-    """Paths git does not track yet, honouring .gitignore and
-    `.git/info/exclude` (so the per-request opencode.json this agent writes
-    is already excluded — see tools/opencode_cli.py).
-
-    Exists for `generate_change` to tell a file opencode just created apart
-    from one that was already lying around: it snapshots this before the
-    opencode call and again after, and only the difference is part of the
-    change. Confirmed live why that is needed (test, 2026-10-09) — see
-    `intent_to_add` below.
-    """
-    proc = await asyncio.create_subprocess_exec(
-        "git", "ls-files", "--others", "--exclude-standard",
-        cwd=workdir,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await _communicate(proc, "git untracked files")
-    if proc.returncode != 0:
-        raise RuntimeError(f"git ls-files --others failed: {stderr.decode(errors='replace')}")
-    return [line for line in stdout.decode(errors="replace").splitlines() if line.strip()]
-
-
-async def intent_to_add(workdir: str, files: list[str]) -> None:
-    """`git add -N` ("intent to add") for brand-new files, so the two
-    functions around this one can see them at all.
-
-    Both `diff` and `changed_files` below ask git for changes against HEAD,
-    which by definition never includes an untracked file. That made every
-    change whose whole content is a NEW file completely invisible:
-    `changed_files` came back empty and `diff` came back blank, however
-    much opencode had actually written.
-
-    Confirmed live (test, 2026-10-09, workflow 979a2b0e against
-    OnCall-ARI-InfraCore-testing@dev): asked for a CONTRIBUTING.md that
-    the repository did not have, opencode called `write` (tool trace:
-    read 2, glob 1, grep 1, write 1), the file was created — and the
-    pipeline reported that the working tree was unmodified. The retry
-    called `edit` on that same still-untracked file and reported the same
-    thing. Before generate_change's empty-tree guard existed this surfaced
-    one step later and just as wrongly, as `plan_pr`'s "generate_change
-    reported no changed files to publish", after paying for a full verify
-    run first. Either way: this agent could not ship "add a new file",
-    which is a large share of real fixes (a new test, a new module, a new
-    config).
-
-    `-N` stages the path with an empty blob and no content, so `git diff
-    HEAD` renders the whole file as additions. That matters beyond the
-    file list: `propose_pr`'s `key_hunks()` reads that diff, so without
-    this a human would be approving a new file whose contents the approval
-    email never showed them.
-    """
-    if not files:
-        return
-    proc = await asyncio.create_subprocess_exec(
-        "git", "add", "-N", "--", *files,
-        cwd=workdir,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await _communicate(proc, "git intent-to-add")
-    if proc.returncode != 0:
-        raise RuntimeError(f"git add -N failed: {stderr.decode(errors='replace')}")
 
 
 async def changed_files(workdir: str) -> list[str]:

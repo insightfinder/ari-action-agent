@@ -35,19 +35,6 @@ class StepContext:
     # trigger_build gate checks this, not anything in `params`, so it can't
     # be spoofed by a planner's own JSON output.
     confirmed: bool = False
-    # The effective `start_to_close_timeout` of the Temporal activity this
-    # step is running inside, in seconds — set by
-    # orchestration/activities.py from `activity.info()`, so nothing in
-    # common/ has to import temporalio. None when a capability is driven
-    # outside an activity (unit tests, the live-test script).
-    #
-    # Read by opencode_runtime._subprocess_deadline to bound its own
-    # `communicate()` *below* the activity's deadline, so a deadlocked pipe
-    # fails with a named error instead of Temporal killing the attempt with
-    # nothing to say. It is the effective value, not capabilities.yaml's
-    # `timeout_seconds`: Temporal clamps start_to_close down to whatever the
-    # pipeline budget has left, and the guard has to track the smaller one.
-    step_deadline_seconds: float | None = None
 
     def tool(self, name: str) -> Callable:
         return self.tools[name]
