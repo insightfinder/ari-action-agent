@@ -16,18 +16,6 @@ A2A-protocol agent kinds can sit on top of. Today there are two:
 | `oncall` | Clones a repo, diagnoses a bug/feature request, fixes it, opens a PR | `ari_oncall_agent/` |
 | `jenkins` | Reads/diagnoses a Jenkins job or build, proposes and (once confirmed) executes a change | `jenkins_agent/` |
 
-> **Where the Jenkins kind lives.** `jenkins_agent/` is *not* on `main`,
-> `test` or `staging` — it is developed and released from its own
-> `jenkins-agent` branch, which builds `ari-jenkins-agent-worker` from its
-> own copy of `.github/workflows/docker-build-push.yml`. The two kinds
-> ship on independent cadences and the on-call agent's pull requests stay
-> reviewable without an unrelated agent's diff in them. Everything §0
-> describes about the framework still holds: the split is in release
-> management, not in the design, and nothing in `common/` knows about it.
-> The rest of this document (§3's tables, §5b, §7) describes both kinds as
-> one codebase, which is what you see once the `jenkins-agent` branch is
-> checked out.
-
 **Package layout** (`src/`):
 
 - **`common/`** — everything agent-kind-agnostic: the A2A server
@@ -254,20 +242,6 @@ new capabilities/tools/catalog entries, not a rewrite. Adding a whole new
    `{"status": "failed"}` return) is caught the same way, so any hard
    capability failure still reaches `cleanup_workspace` and `respond`
    instead of aborting the workflow with no explanation.
-   **Every bound in `capabilities.yaml` is per-attempt**, so on their own
-   they bound nothing: `timeout_seconds` caps one attempt,
-   `retry.max_attempts` multiplies it, and the `on_failure` loop
-   multiplies that again. For the on-call agent's `verify` plan the
-   product is roughly 3.2 hours. `workflow.py` therefore also carries a
-   whole-pipeline ceiling (`_DEFAULT_PIPELINE_BUDGET_SECONDS`, 1 hour;
-   override per request with `options.pipeline_budget_seconds`), measured
-   from `workflow.info().start_time` so it covers planning and workspace
-   setup too. It is applied as each step's `schedule_to_close_timeout`
-   rather than as a check between steps, because the case that needs it
-   is the step that is *already* overrunning — confirmed live on stg
-   (workflow `9b32a817`, 2026-10-08: 45m56s, no single step ever past its
-   own timeout). When the remainder is too small to be worth scheduling
-   anything, the loop stops and says so; `respond` still runs.
 5. Every step happens against one ephemeral sandbox workspace
    (`tools/sandbox.py`, keyed by `request_id`), cleaned up when the
    workflow ends — one request's bad patch/hung test can't affect another.
@@ -525,44 +499,6 @@ behavior, `Step`'s pydantic schema dropping unknown fields) rather than
 assumed, and the full unit-test suite covers every new code path in
 isolation — but no real HTTP round-trip against a live instance has
 exercised it end to end yet.
-
-## 5c. The same gate, for the on-call agent's pull requests
-
-The on-call agent reuses §5b's three layers verbatim for the one thing it
-does that reaches outside the sandbox: opening a pull request. Nothing in
-`common/` changed to allow it — the mechanism was already generic, and
-turning it on for this agent kind is four lines of `ari_oncall_agent/meta.py`
-plus a capability.
-
-- **Pausing.** `propose_pr` returns `requires_approval`, which the step
-  loop turns into `status: "needs_approval"` → `TASK_STATE_INPUT_REQUIRED`.
-- **Resuming.** `AgentMeta.confirm_capability` is `"publish_pr"`, so
-  `plan_task`'s bypass runs that one step with the approved proposal as its
-  params and `confirmed: True`, skipping the planner entirely.
-- **The gate.** `publish_pr` refuses any step where `ctx.confirmed` is
-  false, and refuses a confirmed proposal that is not an
-  `open_pull_request` one with every field a pull request needs.
-
-Two things differ from the Jenkins case, both consequences of this agent
-owning a working tree:
-
-**The branch is pushed before the pause, not after the approval.** The
-approval is human-speed, and the resume is a *separate* Temporal workflow
-execution: `workflow.py` runs `cleanup_workspace` on the way out of the
-pausing run, and the sandbox root is on no persistent volume, so a worker
-restart during the approval window would take the change with it. Pushing
-first leaves the approval as one idempotent REST call that needs no
-working tree. The accepted cost is a branch visible on the target
-repository before anyone approved it — quieter than a pull request, but
-not nothing on a repository that builds every pushed branch.
-
-**`publish_pr` is `internal: true`.** The planner must not be able to
-schedule it at all; §5b's Jenkins gate relies on `execute_action` being
-plannable but refusing unconfirmed work, which leaves prompt guidance as
-the only thing discouraging a plan from trying. Here the capability is
-simply absent from `catalog()`, so there is nothing to discourage.
-`get_capability()` — which the confirmation bypass uses — does not filter
-internal capabilities, so the resume still resolves it.
 
 ## 6. Repo caching & dynamic branches (on-call agent)
 

@@ -57,77 +57,6 @@ from .settings import get_settings
 logger = structlog.get_logger()
 
 
-# opencode's own subprocess wait, bounded — the same guard git_ops has had
-# since 2026-10-05, in the one module that never got it.
-#
-# Confirmed live on stg, 2026-10-09 (workflow 5a0f4506, image
-# 2610091640-staging): `generate_change`'s opencode call returned normally
-# after 328s and logged `opencode_call`, and the activity then sat in
-# `proc.communicate()` for a further 14 minutes until Temporal's 1200s
-# `start_to_close` fired `CancelledError: Activity cancelled`. Inspected
-# while it was stuck: no opencode process anywhere in the container (only
-# pid 1 tini and pid 7 the worker), all eight threads in
-# `futex_wait`/`ep_poll`, CPU 1m, memory flat at 315Mi. The child was gone
-# and asyncio was never told. Attempt 2 ran the identical step on the
-# identical image in 93s.
-#
-# That is the same race git_ops.py's own comment describes against `git
-# diff`, symptom for symptom, which is the reason this is a deadlock guard
-# and not an attempt at a root cause: the cause is still unproven, and a
-# bound is what turns 20 minutes of silence into a fast, named failure the
-# existing retry can act on.
-#
-# Why the guard did not already cover this: the regression test for it,
-# `test_every_git_call_goes_through_the_deadline_helper`, scans
-# `inspect.getsource(git_ops)` — one module. It could never see this file.
-# That test now scans the whole package; see tests/test_git_ops.py.
-#
-# The deadline is derived per call, not fixed, because the two callers are
-# an order of magnitude apart: a legitimate `generate_change` turn has been
-# measured at 328s, while `verify`'s whole step budget is 480s. A single
-# constant generous enough for the first would never fire inside the
-# second. `ctx.step_deadline_seconds` carries the activity's own effective
-# `start_to_close` (set in orchestration/activities.py, where temporalio is
-# already imported), and the margin leaves room for this function's own
-# post-processing to still raise a named error *before* Temporal kills the
-# attempt blindly.
-_OPENCODE_TIMEOUT_SECONDS = float(os.getenv("OPENCODE_SUBPROCESS_TIMEOUT_SECONDS", "1200"))
-_OPENCODE_DEADLINE_MARGIN_SECONDS = float(os.getenv("OPENCODE_DEADLINE_MARGIN_SECONDS", "45"))
-# Never let the derived value collapse to something that would fire on
-# healthy work: a step whose remaining budget is already under this has
-# bigger problems than a stalled pipe, and Temporal will end it anyway.
-_OPENCODE_MIN_TIMEOUT_SECONDS = 60.0
-
-
-def _subprocess_deadline(ctx) -> float:
-    """How long this opencode call may sit in `communicate()` before it is
-    treated as deadlocked and killed."""
-    step_deadline = getattr(ctx, "step_deadline_seconds", None)
-    if not step_deadline:
-        return _OPENCODE_TIMEOUT_SECONDS
-    return max(_OPENCODE_MIN_TIMEOUT_SECONDS, step_deadline - _OPENCODE_DEADLINE_MARGIN_SECONDS)
-
-
-async def _communicate(proc, agent: str, timeout: float):
-    """`proc.communicate()` with a deadline; kills the child and raises on
-    expiry. Mirrors git_ops._communicate, deliberately — same failure, same
-    shape of guard, so neither one reads as the odd case."""
-    try:
-        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        # Don't leave the child holding the sandbox: every attempt of one
-        # request shares a workspace keyed by request_id alone, so a
-        # survivor could still be writing the tree the retry is about to
-        # read.
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        raise RuntimeError(
-            f"opencode ({agent}) timed out after {timeout:g}s (pid {proc.pid}) and was killed"
-        ) from None
-
-
 def _iter_json_lines(raw: bytes):
     for line in raw.decode(errors="replace").splitlines():
         line = line.strip()
@@ -354,7 +283,7 @@ async def run_opencode(
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
-    stdout, stderr = await _communicate(proc, agent, _subprocess_deadline(ctx))
+    stdout, stderr = await proc.communicate()
     wall_elapsed = time.monotonic() - start
     result = _parse_events(stdout)
     result["trace"] = _build_trace(result["raw_events"], wall_elapsed)

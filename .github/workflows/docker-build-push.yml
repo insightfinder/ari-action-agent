@@ -6,18 +6,17 @@ on:
       - main
       - staging
       - test
+      - code-analysis-agent
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     strategy:
       # One shared API image (Dockerfile.api — agent-kind-agnostic, see
-      # docs/design.md §7) plus one worker image per agent kind this
-      # branch carries. These names must match the Helm chart's own
-      # ariOncallAgent.api.image / .worker.image repository values
-      # exactly (charts/oncallari/values.yaml) — update both together if
-      # either changes. The Jenkins agent kind lives on its own
-      # `jenkins-agent` branch and builds its worker image from there.
+      # docs/design.md §7) plus one worker image per agent kind. These
+      # names must match the Helm chart's own ariOncallAgent.api.image /
+      # .worker.image repository values exactly (charts/oncallari/
+      # values.yaml) — update both together if either changes.
       matrix:
         include:
           - dockerfile: Dockerfile.api

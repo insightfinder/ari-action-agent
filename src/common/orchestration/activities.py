@@ -3,10 +3,6 @@
 pure so it can safely run in Temporal's workflow sandbox.
 """
 
-import asyncio
-import os
-from dataclasses import replace
-
 import structlog
 from temporalio import activity
 
@@ -113,99 +109,8 @@ async def plan_task(payload: dict) -> dict:
     return {"steps": enriched_steps, "rationale": plan.rationale}
 
 
-# How often this activity tells Temporal it is still alive. Must stay well
-# under the `heartbeat_timeout` workflow.py sets, since one missed beat is
-# all it takes to be declared dead.
-_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("ACTIVITY_HEARTBEAT_INTERVAL_SECONDS", "20"))
-
-
-async def _beat(interval: float) -> None:
-    """Heartbeat until cancelled.
-
-    Two things this buys, and the second is the one that is easy to miss:
-
-    1. A worker that dies mid-step is noticed in `heartbeat_timeout`
-       instead of in `start_to_close_timeout`. Measured on stg 2026-10-09:
-       the worker was OOMKilled at 17:29:05 and Temporal did not retry
-       `verify` until 17:33:20 — 4m15s of a 50-minute budget doing
-       nothing — and in workflow c0296796 the same gap was the full 20
-       minutes, because `generate_change`'s `start_to_close` is 1200s.
-    2. Temporal delivers cancellation *in the heartbeat response*. Without
-       a heartbeat there is no channel to deliver it on, so a timed-out
-       attempt's opencode subprocess keeps running in the pod after the
-       workflow has moved on. This was recorded as a known gap twice in
-       docs/MEMORY.md before it was finally paid for.
-
-    `activity.heartbeat()` is non-blocking; the cost is one RPC per
-    interval, batched by the SDK.
-    """
-    while True:
-        await asyncio.sleep(interval)
-        activity.heartbeat()
-
-
-# Steps that never read the checkout, so a missing one is not a problem to fix.
-#
-# `respond` is the reason this exists. workflow.py runs it *after*
-# `cleanup_workspace`, deliberately and on every ending, so by then the sandbox
-# is gone because something deleted it on purpose — and without this the heal
-# below treated that as a lost pod and cloned the whole repository again to
-# write a summary that only reads `results`. Observed on stg 2026-10-10
-# (dbc75291): `recloning_lost_sandbox capability=respond`, two seconds after
-# cleanup, on an otherwise healthy run.
-_NO_REPO_NEEDED = frozenset({"respond"})
-
-
-async def _reclone_if_the_sandbox_is_gone(ctx: StepContext) -> None:
-    """Re-run `clone_repo` when its checkout has vanished from disk.
-
-    The sandbox is an `emptyDir` (the chart persists only the repo and
-    build caches), so it belongs to one pod — while a Temporal activity
-    belongs to none. Any pod replacement between the clone and a step that
-    reads it loses the working tree.
-
-    Confirmed live, not theoretical (stg, workflow
-    c0296796-9df4-43b0-8691-d191e1343278, 2026-10-09). The activity
-    identities in that history show it exactly: `prepare_workspace`,
-    `plan_task` and `clone_repo` all ran on `ari-oncall-worker-766fc5765-tr59k`,
-    a deployment roll then replaced the pod (`strategy: Recreate`), and
-    `generate_change` started 20 minutes later as attempt 2 on
-    `ari-oncall-worker-7c4c9499dd-qq677`, where it failed instantly with
-    `FileNotFoundError: .../sandbox/c0296796-.../repo`. The incident was
-    reported to the caller as "the cloned repository directory became
-    inaccessible", which is true and useless.
-
-    Healing here rather than persisting the sandbox on a volume: making
-    the step not depend on pod affinity is the property we actually want,
-    and a PVC would only move the assumption somewhere harder to see. The
-    re-clone is cheap because the shared mirror *is* PVC-backed.
-
-    Note this is deliberately not `require_cloned_repo`'s job — that one
-    answers "did the planner include clone_repo at all", a planning
-    question, and it runs after the capability has already started.
-    """
-    if ctx.capability in _NO_REPO_NEEDED:
-        return
-    clone_result = ctx.results.get("clone_repo")
-    if not clone_result:
-        return
-    cloned_path = clone_result.get("cloned_path")
-    if not cloned_path or os.path.isdir(cloned_path):
-        return
-
-    logger.warning(
-        "recloning_lost_sandbox",
-        request_id=ctx.request_id,
-        capability=ctx.capability,
-        cloned_path=cloned_path,
-    )
-    clone_ctx = replace(ctx, capability="clone_repo", params={}, tools={})
-    ctx.results["clone_repo"] = await run_capability("clone_repo", clone_ctx)
-
-
 @activity.defn(name="execute_step")
 async def execute_step(payload: dict) -> dict:
-    info = activity.info()
     ctx = StepContext(
         request_id=payload["request_id"],
         workspace=payload["workspace"],
@@ -216,15 +121,6 @@ async def execute_step(payload: dict) -> dict:
         results=payload["results"],
         history=payload.get("history", []),
         confirmed=payload.get("confirmed", False),
-        step_deadline_seconds=(
-            info.start_to_close_timeout.total_seconds() if info.start_to_close_timeout else None
-        ),
     )
     logger.info("execute_step", request_id=ctx.request_id, capability=payload["capability"])
-
-    heartbeat = asyncio.create_task(_beat(_HEARTBEAT_INTERVAL_SECONDS))
-    try:
-        await _reclone_if_the_sandbox_is_gone(ctx)
-        return await run_capability(payload["capability"], ctx)
-    finally:
-        heartbeat.cancel()
+    return await run_capability(payload["capability"], ctx)

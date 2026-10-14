@@ -18,7 +18,6 @@ safety net rather than removed outright.
 
 import copy
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -222,41 +221,6 @@ def write_config(workdir: str, llm: dict, repo: dict) -> str:
     return str(path)
 
 
-def _build_cache_env(build_cache_root: str) -> dict[str, str]:
-    """The environment that puts each build tool's dependency cache on the
-    persistent volume instead of the container's own filesystem.
-
-    `HOME` alone is not enough, and that is the whole reason this exists.
-    npm and Go do resolve their caches from `$HOME`, but **the JVM does
-    not**: on Linux OpenJDK reads `user.home` from the passwd database, not
-    the environment, so Maven's local repository stays at
-    `/root/.m2/repository` however `HOME` is set. Measured in the worker,
-    2026-10-10:
-
-        $ HOME=/var/lib/ari-agent/build-cache java -XshowSettings:properties
-          user.home = /root
-
-    The cost of that was not subtle. On stg the same day `/root/.m2/
-    repository` held **1.5 GB**, downloaded inside a 25-minute-old pod, while
-    the build-cache volume held only `.npm` -- so every fresh worker paid a
-    full cold Maven download. That is what spent `verify`'s entire 480s
-    budget on a Java repo and failed it four attempts in a row (stg runs
-    fc532091 and 1c2396a4). `-Dmaven.repo.local` is Maven's own documented
-    override and does not go through `user.home`.
-
-    Gradle is the same class of problem and gets `GRADLE_USER_HOME` for the
-    same reason. `MAVEN_OPTS` is appended to rather than replaced:
-    Dockerfile.oncall sets `-Xmx2g` there and that heap limit still applies.
-    """
-    maven_repo = os.path.join(build_cache_root, ".m2", "repository")
-    existing_opts = os.environ.get("MAVEN_OPTS", "")
-    return {
-        "HOME": build_cache_root,
-        "MAVEN_OPTS": f"{existing_opts} -Dmaven.repo.local={maven_repo}".strip(),
-        "GRADLE_USER_HOME": os.path.join(build_cache_root, ".gradle"),
-    }
-
-
 async def run_opencode(ctx, instruction: str, *, continue_session: bool | None = None) -> dict:
     """Thin wrapper over common.opencode_runtime.run_opencode: resolves
     *this* agent kind's opencode agent name for the calling capability.
@@ -279,11 +243,7 @@ async def run_opencode(ctx, instruction: str, *, continue_session: bool | None =
         # in-flight build.
         async with reserve_build_cache_home() as build_cache_root:
             return await _run_opencode(
-                ctx,
-                instruction,
-                agent,
-                continue_session=continue_session,
-                extra_env=_build_cache_env(build_cache_root),
+                ctx, instruction, agent, continue_session=continue_session, extra_env={"HOME": build_cache_root}
             )
 
     return await _run_opencode(ctx, instruction, agent, continue_session=continue_session)
