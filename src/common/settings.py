@@ -98,6 +98,11 @@ class Settings(BaseSettings):
 
     opencode_bin: str = "opencode"
 
+    skills_enabled: bool = True
+    skills_dir: str = "/var/lib/ari-agent/skills"
+    bundled_skills_dir: str = ""
+    trust_repo_skills: bool = False
+
     # publish_pr's primary path is deterministic (git + a direct GitHub
     # REST API call, see capabilities/publish_pr.py) — this MCP server is
     # kept only as its fallback, still routed through a dedicated opencode

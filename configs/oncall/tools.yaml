@@ -75,6 +75,10 @@ tools:
     module: ari_oncall_agent.tools.opencode_cli
     function: run_opencode
 
+  opencode_skill:
+    module: ari_oncall_agent.tools.opencode_cli
+    function: run_skill_agent
+
   llm_complete:
     module: common.llm.client
     function: complete

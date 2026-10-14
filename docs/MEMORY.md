@@ -3834,3 +3834,130 @@ rather than in the client.
 
 **Verified:** Windows 357 passed; Linux 478 passed in the worker image. 8 new cases in
 `tests/test_ari_cli_running.py`.
+
+## 2026-10-14 - Agent Skills: how outsiders add capabilities (II-25116, step 3)
+
+The open-source goal needs one extension point that is not engine code. That
+is now [Agent Skills](https://agentskills.io/specification): a folder with a
+`SKILL.md` and optional scripts. `docs/SKILLS.md` is the user-facing guide;
+this entry records what was verified and why the isolation looks the way it
+does.
+
+**What exists.**
+
+- `skills/` ships three examples: `tls-certificate-check` (no repository),
+  `aws-security-group-allowlist` (the leader's example; refuses to change
+  anything without an operator `config.json`), `changelog-entry` (used during
+  a code change). Operators add more under `SKILLS_DIR/<name>/`.
+- `common/skills.py` validates (spec rules, plus YAML read the way opencode's
+  js-yaml reads it), discovers bundled then deployment skills (later wins),
+  and copies them per request into
+  `<workspace>/.opencode-state/config/opencode/skills`, which opencode reads
+  as global skills because `XDG_CONFIG_HOME` is already per request. Nothing
+  is written into the clone, so nothing can leak into a pull request.
+- New capability `run_skill` (agent `ari-skill`) runs one skill with no
+  repository. The planner sees `available_skills` (name and description) in
+  its request and chooses it; the change and verify agents can load the same
+  skills by name inside a code change.
+- `ari skills validate` checks a skill offline.
+
+**opencode 1.18.31 facts this rests on**, verified in the worker image with
+`opencode debug skill`, `opencode debug agent`, real `opencode run` calls, and
+the source at tag v1.18.31 (anomalyco/opencode):
+
+- Skills are discovered from `$XDG_CONFIG_HOME/opencode/skill(s)/**`, the
+  repository's `.opencode/skill(s)`, `.claude/skills`, `.agents/skills`,
+  `~/.claude/skills`, `~/.agents/skills`, `~/.opencode/skill(s)`, and, when
+  `--dir` is not inside a git repository, every ancestor directory's
+  `.opencode`, `.claude` and `opencode.json`. Two skills with one name: the
+  winner is whichever parse finishes last, so it is not deterministic.
+  opencode does not check names against the spec.
+- `OPENCODE_DISABLE_EXTERNAL_SKILLS=1` drops the `.claude`/`.agents` scans
+  (home and project). `OPENCODE_DISABLE_PROJECT_CONFIG=1` drops project
+  `.opencode` dirs and `opencode.json` files, including ancestors.
+- The `skill` tool returns the body plus "Base directory for this skill:
+  <abs path>", which is how a model finds the scripts.
+- Permission objects are evaluated **last match wins**, and a tool is removed
+  when its last rule is `"*": "deny"`. Every new map here is written
+  broad-first. The existing `_AGENT_DEFS` maps are written the other way round:
+  `ari-change` has had no bash at all, and `verify`'s `git push` deny does
+  nothing. A target repository's `.opencode/opencode.json` also overrides our
+  agent permissions. Both are pre-existing and split into their own task.
+- A bash permission pattern is the text of each tree-sitter `command` node, so
+  `>` redirects and `VAR=x cmd` prefixes are seen and `&&`/`;`/`|` parts are
+  checked one by one. `export`/`declare` statements are not `command` nodes and
+  are never checked. A script must never take a security decision from an
+  environment variable: that is why the AWS skill reads `config.json` from a
+  fixed path next to it.
+
+**Isolation of `run_skill`.** It runs in an empty `skill-run` directory with
+its config passed by `OPENCODE_CONFIG` from outside that directory and
+`OPENCODE_DISABLE_PROJECT_CONFIG=1`, so nothing in an ancestor directory
+applies. It may read only the chosen skill's folder, has no glob/grep/list,
+web fetch or edit, may load only that one skill, and may run only that skill's
+`scripts/` (directly or via python3/python/bash/sh) plus `Bash(...)` prefixes
+from `allowed-tools`. Commands containing `/../`, `$`, a backtick or `>` are
+refused: both bundled scripts echo their arguments, so `$SECRET` as an
+argument would have printed a worker secret. `AGENT_API_KEYS`,
+`TEMPORAL_API_KEY`, `TEMPORAL_PAYLOAD_ENCRYPTION_KEY` and GitHub tokens are
+removed from its environment.
+
+**Repository skills are untrusted by default.** External `.claude`/`.agents`
+scans are off, agents may load only our skills by name, and any of our names
+that also exists in the repository or in a worker home (the real home and the
+build cache, which is `verify`'s home) is blocked, using a lenient scan that
+follows symlinks and reads names the way opencode's forgiving parser would.
+`TRUST_REPO_SKILLS=true` allows repository skills except contested names and
+opencode's built-in `customize-opencode`.
+
+**`respond` said "NOTHING WAS EXECUTED" after a skill had acted.** oncall's
+FACT line keys on `publish_pr` only, so a run whose only step was `run_skill`
+was told nothing reached any external system, which would have contradicted
+an applied security group change. `AgentMeta.direct_capabilities` names the
+steps that act directly, and the fact line now says the step ran and to report
+exactly what its output shows.
+
+**Review.** A five-lens adversarial review (security, integration, spec,
+examples, docs), each lens with an independent verifier: 25 confirmed, 10
+refuted, all 25 fixed. The ones that mattered most: the FACT line above; YAML
+values such as an impossible date raised past the validator and would have
+taken discovery, and with it every opencode call, down; repository skill names
+were read with our strict parser, so a file opencode still accepts slipped
+past the same-name block; the AWS guard rails came from environment variables;
+`$VAR` arguments leaked secrets.
+
+**Ops note.** The bastion has 1 vCPU and 2 GB RAM. Two concurrent opencode
+containers got both SIGKILLed (`exit -9`), and SSH timed out in the banner
+exchange; live runs there must be one at a time.
+
+**Live**, opencode 1.18.31 with a real model (claude-haiku-4-5) in the worker
+image on the bastion, branch code mounted:
+
+- Planner: "Is the TLS certificate of github.com still valid" planned
+  `run_skill` with `tls-certificate-check`; "please whitelist 104.245.103.27
+  vpn" planned `run_skill` with `aws-security-group-allowlist`; a README typo
+  fix in a repository planned `clone_repo` + `generate_change`; "What is a
+  deadlock?" planned nothing.
+- `run_skill` end to end in 18 s: loaded the skill, ran `check_tls.py` once,
+  reported github.com ok with 46 days left and expired.badssl.com "certificate
+  has expired". Same result after the isolation changes.
+- `ari-skill` was refused `> /tmp/report.json`, a heredoc writing a file,
+  `env`, `curl`, and reads of `/etc/os-release` and `/proc/self/environ`; no
+  file was written. The `$(...)` attempt was refused by the model itself, so
+  the `$` rule rests on the rule text and unit tests, not on a live refusal.
+- `ari-change` fixed the typo, loaded `changelog-entry` and added
+  `## [Unreleased]` / `### Fixed` to CHANGELOG.md in 29 s. With a same-named
+  skill in the repository's `.opencode/skills`, `write_config` dropped
+  `changelog-entry` from the permission and logged `skills_shadowed`.
+- Intermittently a run hit its deadline although the session had finished:
+  debug logs show "exiting loop" on time, then opencode's own teardown
+  (dispose, config reload) taking 35-52 s per step on the 1-vCPU bastion. It
+  happened to `ari-change` with no skill config as well, so it is not caused by
+  this change, and it is not root-caused. 1 of the last 5 runs stalled. Worth
+  watching in the cluster, because a teardown stall turns a finished step into
+  a timeout.
+
+**Not done here:** a Helm chart mount for `SKILLS_DIR`, and a live run of the
+AWS skill (the test worker has no AWS credentials or `boto3`).
+
+**Verified:** Windows 466 passed; Linux 616 passed in the worker image.

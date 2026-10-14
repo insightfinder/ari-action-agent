@@ -189,7 +189,12 @@ ari tasks get <task id>                    # the task as JSON, secrets redacted
 ari tasks cancel <task id>
 ari config show
 ari config set <name> [value]              # omit the value to be prompted
+ari skills validate <dir> [<dir> ...]      # check Agent Skills before installing them
 ```
+
+`ari skills validate` works offline. It takes one skill directory or a
+directory of skills, prints `ok` or `invalid` with the reasons for each,
+and exits 1 when any skill is invalid. See [SKILLS.md](SKILLS.md).
 
 Inside a `send` message, `repo=<url>`, `ref=<branch>` and
 `base=<branch>` are read out of the text and applied to the request.
