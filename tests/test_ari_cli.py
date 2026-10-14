@@ -15,113 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import ari_cli.main as cli
 from chat_gateway.a2a_client import AgentClient
 from chat_gateway.config import GatewaySettings
+from tests.ari_cli_fakes import PENDING, PR, _task
 
 runner = CliRunner()
-
-RUNNING = ("TASK_STATE_SUBMITTED", "TASK_STATE_WORKING")
-
-
-def _task(task_id, state, artifacts=None, text="", **extra):
-    task = {"id": task_id, "contextId": "ctx-1", "status": {"state": state}, **extra}
-    if text:
-        task["status"]["message"] = {"parts": [{"text": text}]}
-    if artifacts:
-        task["artifacts"] = artifacts
-    return task
-
-
-PENDING = [
-    {
-        "name": "pending_action",
-        "parts": [
-            {
-                "data": {
-                    "id": "act-1",
-                    "action_name": "Open pull request",
-                    "title": "Fix it",
-                    "repo_url": "https://github.com/org/other",
-                    "compare_url": "https://github.com/org/other/compare/dev...b",
-                }
-            }
-        ],
-    }
-]
-PR = [{"name": "pull_request", "parts": [{"data": {"url": "https://github.com/org/repo/pull/9"}}]}]
-
-
-class FakeAgent:
-    def __init__(self):
-        self.sends = []
-        self.polls = {}
-        self.cancels = []
-        self.counter = 0
-        self.outage_after_confirm = 0
-        self.failing_gets = {}
-
-    def script(self, task_id, *tasks):
-        self.polls[task_id] = list(tasks)
-
-    def handler(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/.well-known/agent-card.json":
-            return httpx.Response(200, json={"name": "ARI On-Call Agent", "skills": [{"id": "code_analysis_fix"}]})
-        if path == "/message:send":
-            body = json.loads(request.read())
-            self.sends.append(body)
-            message = body["message"]
-            task_id = message.get("task_id")
-            if not task_id:
-                self.counter += 1
-                return httpx.Response(200, json={"task": _task(f"task-{self.counter}", "TASK_STATE_SUBMITTED")})
-            queue = self.polls.get(task_id) or []
-            data = message["parts"][1].get("data", {})
-            if queue and queue[0]["status"]["state"] == "TASK_STATE_INPUT_REQUIRED":
-                if "confirm_pending_action" in data:
-                    queue.pop(0)
-                    self.failing_gets[task_id] = self.outage_after_confirm
-            elif queue and queue[0]["status"]["state"] not in RUNNING:
-                return httpx.Response(400, text=f"Task {task_id} is in a terminal state")
-            return httpx.Response(200, json={"task": _task(task_id, "TASK_STATE_SUBMITTED")})
-        if path.startswith("/tasks/") and path.endswith(":cancel"):
-            task_id = path[len("/tasks/") : -len(":cancel")]
-            self.cancels.append(task_id)
-            self.polls[task_id] = [_task(task_id, "TASK_STATE_CANCELED")]
-            return httpx.Response(200, json=_task(task_id, "TASK_STATE_CANCELED"))
-        if path.startswith("/tasks/"):
-            task_id = path[len("/tasks/") :]
-            if self.failing_gets.get(task_id, 0) > 0:
-                self.failing_gets[task_id] -= 1
-                return httpx.Response(503, text="no available server")
-            queue = self.polls.get(task_id)
-            if not queue:
-                return httpx.Response(404, text=f"Task {task_id} not found")
-            head = queue[0]
-            if head["status"]["state"] == "TASK_STATE_INPUT_REQUIRED" or len(queue) == 1:
-                return httpx.Response(200, json=head)
-            return httpx.Response(200, json=queue.pop(0))
-        return httpx.Response(404, text=f"no route {path}")
-
-
-@pytest.fixture
-def agent(monkeypatch, tmp_path):
-    fake = FakeAgent()
-    for name in GatewaySettings.model_fields:
-        monkeypatch.delenv(name.upper(), raising=False)
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv(cli.CONFIG_FILE_ENV, str(tmp_path / "config.toml"))
-    monkeypatch.setenv("LLM_API_KEY", "sk-test")
-    monkeypatch.setenv("GITHUB_PAT", "ghp_test")
-    monkeypatch.setenv("DEFAULT_REPO_URL", "https://github.com/org/repo")
-    monkeypatch.setenv("POLL_SECONDS", "0")
-    monkeypatch.setattr("common.http_retry.backoff_seconds", lambda attempt: 0)
-
-    def make_client(settings):
-        http = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler), timeout=5)
-        return AgentClient(settings.ari_agent_url, settings.ari_api_key, http=http)
-
-    monkeypatch.setattr(cli, "make_client", make_client)
-    return fake
-
 
 def test_card_prints_the_agent_card(agent):
     result = runner.invoke(cli.app, ["card"])
@@ -137,7 +33,7 @@ def test_send_follows_the_task_and_prints_the_pull_request(agent):
     assert result.output.count("Opened it.") == 1
     assert "https://github.com/org/repo/pull/9" in result.output
     message = agent.sends[0]["message"]
-    assert message["parts"][0]["text"] == "fix the bug\nOpen the pull request against the staging branch."
+    assert message["parts"][0]["text"] == "fix the bug\nIf this request leads to a pull request, open it against the staging branch."
     assert message["parts"][1]["data"]["repo"] == {"url": "https://github.com/org/repo", "pat": "ghp_test"}
     assert message["parts"][1]["data"]["llm"]["api_key"] == "sk-test"
 
@@ -163,47 +59,6 @@ def test_send_tells_how_to_approve_a_paused_task(agent):
     assert result.exit_code == 0, result.output
     assert "Proposed: Open pull request" in result.output
     assert "approve with: ari approve task-1" in result.output
-
-
-def test_chat_approves_a_paused_task_when_the_user_says_yes(agent):
-    agent.script(
-        "task-1",
-        _task("task-1", "TASK_STATE_INPUT_REQUIRED", PENDING, "Ready."),
-        _task("task-1", "TASK_STATE_COMPLETED", PR, "Opened."),
-    )
-    result = runner.invoke(cli.app, ["chat"], input="fix the bug\ny\n/quit\n")
-    assert result.exit_code == 0, result.output
-    assert "Proposed: Open pull request" in result.output
-    assert "approve later with: ari approve task-1" in result.output
-    assert "https://github.com/org/repo/pull/9" in result.output
-    confirm = agent.sends[1]["message"]
-    assert confirm["task_id"] == "task-1"
-    assert confirm["context_id"] == "ctx-1"
-    assert confirm["parts"][1]["data"]["confirm_pending_action"] == {"id": "act-1"}
-
-
-def test_chat_declines_through_the_slash_command(agent):
-    agent.script("task-1", _task("task-1", "TASK_STATE_INPUT_REQUIRED", PENDING, "Ready."))
-    result = runner.invoke(cli.app, ["chat"], input="fix the bug\nn\n/decline\n/quit\n")
-    assert result.exit_code == 0, result.output
-    assert agent.cancels == ["task-1"]
-    assert "canceled" in result.output
-
-
-def test_chat_survives_eof_at_the_approval_prompt_and_leaves_the_task_addressable(agent):
-    agent.script("task-1", _task("task-1", "TASK_STATE_INPUT_REQUIRED", PENDING, "Ready."))
-    result = runner.invoke(cli.app, ["chat"], input="fix the bug\n")
-    assert result.exit_code == 0, result.output
-    assert "task task-1; approve later with: ari approve task-1" in result.output
-    assert "Aborted" not in result.output
-    assert agent.cancels == []
-
-
-def test_chat_keeps_running_after_a_recoverable_error(agent):
-    result = runner.invoke(cli.app, ["chat"], input="fix the bug\n/status\n/quit\n")
-    assert result.exit_code == 0, result.output
-    assert "error: tasks/get returned HTTP 404" in result.output
-    assert len(agent.sends) == 1
 
 
 def test_approve_command_confirms_with_the_proposals_own_repository(agent):

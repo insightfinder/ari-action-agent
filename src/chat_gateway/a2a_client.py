@@ -64,11 +64,20 @@ class AgentClient:
         kwargs: dict[str, Any] = {"headers": self.headers(), "timeout": timeout or self.timeout}
         if json is not None:
             kwargs["json"] = json
-        if self._http is not None:
-            response = await request_with_retry(self._http, method, url, what=what, max_attempts=max_attempts, **kwargs)
-        else:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await request_with_retry(client, method, url, what=what, max_attempts=max_attempts, **kwargs)
+        try:
+            if self._http is not None:
+                response = await request_with_retry(self._http, method, url, what=what, max_attempts=max_attempts, **kwargs)
+            else:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await request_with_retry(client, method, url, what=what, max_attempts=max_attempts, **kwargs)
+        except httpx.InvalidURL:
+            raise RuntimeError(f"{what}: {self.base_url!r} is not a valid agent URL") from None
+        except RuntimeError as exc:
+            if isinstance(exc.__cause__, httpx.LocalProtocolError):
+                raise RuntimeError(
+                    f"{what}: the request could not be sent; the agent URL or API key contains characters HTTP does not allow"
+                ) from None
+            raise
         if response.status_code >= 400:
             raise AgentError(what, response.status_code, response.text)
         if not response.content:
@@ -79,8 +88,10 @@ class AgentClient:
             raise AgentError(what, response.status_code, response.text) from None
         return body if isinstance(body, dict) else {"value": body}
 
-    async def agent_card(self) -> dict[str, Any]:
-        return await self._request("GET", "/.well-known/agent-card.json", "agent card")
+    async def agent_card(self, *, max_attempts: int | None = None, timeout: float | None = None) -> dict[str, Any]:
+        return await self._request(
+            "GET", "/.well-known/agent-card.json", "agent card", max_attempts=max_attempts, timeout=timeout
+        )
 
     async def send(
         self,
@@ -163,6 +174,8 @@ class AgentClient:
                     )
                 await sleep(poll_seconds)
                 continue
+            if outage_started is not None:
+                last_signature = None
             outage_started = None
             signature = (task_state(task), len(task.get("artifacts") or []))
             if on_update is not None and signature != last_signature:

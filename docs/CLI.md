@@ -1,21 +1,155 @@
-# `ari` — talking to a deployed agent from the command line
+# `ari` — chat with an ARI agent from your terminal
 
-`ari` is a thin client for the on-call agent's A2A surface. It runs on
-your machine, needs nothing but Python and network access to a deployed
-agent, and never runs the agent itself. It is also the first consumer of
-`src/chat_gateway/`, the platform-neutral bridge the Slack and Teams
-adapters are built on, so anything that works here works there.
+`ari` is a terminal client for the on-call agent. You ask in plain
+language; the agent answers, or investigates a repository, makes a
+change, pushes it to a branch and asks you before it opens a pull
+request. It runs on your machine and talks to a deployed agent over its
+A2A API; it never runs the agent itself.
+
+It is built on `src/chat_gateway/`, the platform-neutral bridge the
+Slack and Teams adapters use, so a conversation behaves the same way in
+every one of them.
 
 ## Install
 
 ```bash
 pip install -e ".[cli]"
-ari --help
 ```
 
-## Configure
+## Start
 
-Three layers, highest priority first:
+```bash
+ari
+```
+
+The first time, `ari` walks you through a short setup:
+
+| question | what it is |
+|---|---|
+| Agent URL | where the agent answers, e.g. `https://ari.example.com` |
+| Agent API key | one of the agent's `AGENT_API_KEYS` |
+| LLM provider and model | the model the agent uses for your requests (`anthropic`, `openai`, or another provider the agent supports) |
+| LLM API key | your key for that provider |
+| GitHub token | needed to push branches and open pull requests |
+| Default repository and branch | optional; you can also set them per conversation |
+
+Secrets are not echoed, and stray spaces around them are trimmed. `ari`
+then checks that the agent answers and saves everything to
+`~/.config/ari/config.toml`, readable by you only; nothing is saved if
+you cancel, if a value is unusable (no LLM key, an unknown provider
+without a model, an agent URL without `http://` or `https://`), or if
+the agent cannot be reached and you do not confirm.
+
+Run `ari setup` (or `/setup` inside the chat) to change it later.
+Pressing Enter keeps each current value; typing `-` clears an optional
+value or a secret. Defaults come from what is in effect, including
+`ARI_AGENT_URL` and `LLM_PROVIDER` in the environment, so pressing Enter
+never switches you to a different provider. Answers can also be piped
+in, one per line.
+
+## The chat
+
+```
+╭─ ARI On-Call Agent ─────────────────────────────────────────────╮
+│ Connected to ari.example.com                                    │
+│ Repository: acme/payments                                       │
+│ Works on branch dev; pull requests target dev                   │
+│ Type a request, or /help for commands.                          │
+╰─────────────────────────────────────────────────────────────────╯
+
+you › What is a deadlock?
+ARI ›
+  A deadlock is when two or more processes wait forever for
+  resources the others hold.
+
+you › Add a SECURITY.md with a short vulnerability reporting policy
+⠋ Working… 0:42 · root cause found
+
+ARI ›
+  I've prepared a pull request that adds SECURITY.md ...
+╭─ Proposed change ───────────────────────────────────────────────╮
+│ Add SECURITY.md with a vulnerability reporting policy           │
+│ Repository  acme/payments                                       │
+│ Branch      ari/add-security-md → dev                           │
+│ Files       SECURITY.md                                         │
+│ Tests       not run                                             │
+│ Full diff   https://github.com/acme/payments/compare/dev...     │
+│                                                                 │
+│ +# Security Policy                                              │
+╰─────────────────────────────────────────────────────────────────╯
+? What do you want to do?
+  ❯ Approve and open the pull request
+    Decline
+    Show the full diff link
+    Ask a follow-up
+    Decide later
+
+✔ Pull request opened: https://github.com/acme/payments/pull/24
+```
+
+- **Asking.** Anything that is not a `/command` is sent to the agent.
+  Answers appear under `ARI ›`; errors start with a red `Error:`, so an
+  answer is never mistaken for a failure.
+- **Proposals.** When the agent has a change ready it shows the card and
+  a menu (arrow keys and Enter). The branch is already pushed when you
+  see it; the pull request opens only if you approve. Declining leaves
+  the branch on the repository. Keys typed while the agent was working
+  are discarded before the menu appears, so they cannot pick an option.
+- **You only approve what you have seen.** `/approve`, or typing a bare
+  `yes`, `ok`, `approve`, opens the pull request only for the proposal
+  whose card was last shown. If the proposal changed, or was never shown
+  (for example after Ctrl-C), `ari` shows the card and menu first.
+  `/decline`, `no` or `decline` work the same way.
+- **Decide later** returns to the prompt with the proposal still
+  waiting and names the task. `/status` shows the card and menu again.
+- **When the agent asks a question** instead of proposing a change, no
+  card or menu appears; type your reply, and a `yes` there is sent as an
+  answer, not taken as an approval.
+- **Follow-ups** ("also run the tests first") continue the same task, so
+  the agent sees the conversation so far. If a follow-up finishes
+  without a new proposal, the earlier one can no longer be approved and
+  `ari` says so. A `/command` typed at the follow-up prompt runs as a
+  command; it is never sent to the agent.
+- **Leaving** with `/new`, `/setup`, `/quit` or Ctrl-D while a proposal
+  waits or a task runs prints the task id and the command to pick it up
+  again (`ari approve <id>` or `ari tasks follow <id>`).
+- **Ctrl-C** while the agent is working stops waiting; the task carries
+  on, `/wait` follows it again and `/cancel` stops it. A message typed
+  while it still runs is held back with that hint rather than sent.
+  Ctrl-C at the prompt clears the line. **Ctrl-D** or `/quit` leaves.
+- **Commands** can be shortened to any unique prefix (`/st` is
+  `/status`). An `ari ...` shell command typed into the chat is
+  explained, not sent to the agent.
+
+| command | what it does |
+|---|---|
+| `/help` | list the commands |
+| `/repo <url>` | repository for your next requests |
+| `/branch <name>` | branch to work from |
+| `/base <name>` | branch the pull request targets; each request then says "if this request leads to a pull request, open it against `<name>`", so a plain question stays a question |
+| `/status` | where the current task is; a waiting proposal is shown with its menu |
+| `/wait` | follow the current task again until it finishes, e.g. after Ctrl-C |
+| `/cancel` | stop the current task (asks first); on a waiting proposal it declines it |
+| `/approve` / `/decline` | act on the waiting proposal |
+| `/new` | start a new conversation |
+| `/config` | show the current settings, secrets masked |
+| `/setup` | change the connection and keys |
+| `/quit` | leave |
+
+Commands complete with Tab and earlier input is in the history (Up
+arrow), kept in `~/.config/ari/history` (or `ARI_HISTORY_FILE`); when
+that file cannot be written, history lasts for the session only.
+
+When `ari` is not attached to a terminal (piped input, CI), the same
+chat runs without colours or arrow-key menus: menus become numbered
+choices. Output that cannot be encoded on the current console, such as
+`→` or `✔` on a Windows code page, is replaced rather than crashing.
+Agent text is shown literally; brackets in file names such as
+`app/[slug]/page.tsx` are never read as formatting.
+
+## Settings
+
+Highest priority first:
 
 1. command-line flags (`--url`, `--key`, `--repo`, `--ref`)
 2. environment variables (`ARI_AGENT_URL`, `ARI_API_KEY`, `LLM_PROVIDER`,
@@ -24,169 +158,81 @@ Three layers, highest priority first:
    `OPTIONS_JSON`, `POLL_SECONDS`, `WAIT_SECONDS`,
    `AGENT_OUTAGE_SECONDS`, `REQUEST_TIMEOUT_SECONDS`)
 3. `~/.config/ari/config.toml` (or the file named by `ARI_CONFIG_FILE`),
-   written by `ari config set`
+   written by the setup or by `ari config set`
 
-No dotenv file is read. The gateway process reads the same variables
-from its environment.
-
-```bash
-ari config set ari_agent_url http://127.0.0.1:18001
-ari config set ari_api_key            # prompted, not echoed
-ari config set llm_provider anthropic
-ari config set llm_api_key            # prompted
-ari config set github_pat             # prompted
-ari config set default_repo_url https://github.com/<org>/<repo>
-ari config show
-```
-
-Give a secret on the command line only when the shell history is not a
-concern; omitting the value prompts for it without echo. The file is
-created readable by the owner only (`0600`), and `config show` masks
-every secret to its first four characters.
-
-The agent itself is reached the way `README.md` describes under "Live
-scenarios against a deployed agent": directly when an ingress exists, or
-through `kubectl port-forward svc/ari-oncall-api 18001:80`.
-
-The `llm` and `repo` blocks the agent expects (see
-`docs/DEVELOPER_GUIDE.md` §5) are built from these settings on every
-request. The agent stores nothing between requests; the CLI is the one
-holding the credentials.
+The setup is skipped when the environment already supplies an agent URL
+and an LLM key, which is how a shared or scripted installation is
+configured.
 
 ### Repository allow-list
 
-`GITHUB_PAT` is attached to every repository URL the CLI sends, and the
+`GITHUB_PAT` is attached to every repository URL `ari` sends, and the
 agent embeds it in the clone URL. A URL on an unexpected host would hand
 the token to that host, so a request is refused unless the host is
 `github.com`, a host named in `ALLOWED_REPO_HOSTS` (comma-separated), or
 the host of `DEFAULT_REPO_URL` / a `REPO_MAP` entry. Plain `http://` and
 URLs with embedded credentials are always refused.
 
-## Use
+## Scripting and automation
+
+The chat is for people. For scripts, the same operations are available
+as one-shot commands that print plain text and return an exit code:
 
 ```bash
 ari card                                   # the agent card, as integrations see it
-ari send "fix the NPE in CustomerLookup"   # one request, follows it to the end
+ari send "fix the NPE in CustomerLookup"   # one request, followed to the end
 ari send "add a CONTRIBUTING.md" --ref dev --base staging
 ari send "..." --no-wait                   # prints the task id and returns
-ari tasks get <task id>                    # the task as JSON, secrets redacted
-ari tasks follow <task id>                 # re-attach to a running task and wait for its end
-ari tasks cancel <task id>
 ari approve <task id>                      # confirm a paused proposal
-ari chat                                   # interactive, one conversation
+ari tasks follow <task id>                 # re-attach to a running task
+ari tasks get <task id>                    # the task as JSON, secrets redacted
+ari tasks cancel <task id>
+ari config show
+ari config set <name> [value]              # omit the value to be prompted
 ```
 
-Inside a message, `repo=<url>`, `ref=<branch>` and `base=<branch>` are
-read out of the text and applied to the request, so `ari chat` can switch
-repositories without restarting:
-
-```
-you> fix the flaky retry test repo=https://github.com/org/other ref=dev base=staging
-```
-
-`ref` becomes the branch the agent checks out; `base` is appended to the
-prompt as "Open the pull request against the staging branch", because the
-agent's planner reads the target branch from the prompt, not from config.
-
-## What a run looks like
-
-~~~
-$ ari send "add a minimal CONTRIBUTING.md"
-  … working (task 4bffcf4a)
-  … working (task 4bffcf4a); produced: root_cause
-Ready to open a pull request.
-
-Proposed: Open pull request
-Repo: org/repo (ari/add-contributing-4bffcf4a -> main)
-Title: Add a minimal CONTRIBUTING.md
-Files: CONTRIBUTING.md
-Verification: not run
-Full diff: https://github.com/org/repo/compare/main...ari/add-contributing-4bffcf4a
-```
-diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
-+# Contributing
-...
-```
-
-task 4bffcf4a-38c9-4493-b2ad-54e2a9b1b94f
-approve with: ari approve 4bffcf4a-38c9-4493-b2ad-54e2a9b1b94f
-~~~
-
-The pause is the agent's `TASK_STATE_INPUT_REQUIRED`, exactly as
-`docs/INPUT_REQUIRED_INTEGRATION.md` describes it. By the time you see
-it the branch is already pushed (that is what the `Full diff` link
-shows); the pull request is opened only after `ari approve`. Declining is
-`ari tasks cancel <id>`, which leaves the pushed branch in place.
+Inside a `send` message, `repo=<url>`, `ref=<branch>` and
+`base=<branch>` are read out of the text and applied to the request.
 
 `ari approve` needs `GITHUB_PAT` on the machine it runs from: the resume
 is a single `publish_pr` step on the agent, and without a token in the
 confirm it would fail after the proposal has already been consumed.
 
-In `ari chat` the same pause is offered as a `y/N` prompt. `/approve`,
-`/decline` and `/status` act on the conversation's current task; `/quit`
-leaves. Typing a bare `yes`, `ok`, `approve`, `no` or `decline` while a
-proposal is waiting is treated as the decision rather than sent to the
-agent, because the agent ignores free-text confirmations by design.
-
-Any other message typed while a proposal is waiting continues that same
-task, so the agent sees the conversation so far ("also run the tests
-first" is understood). The agent keeps history per task, and a task that
-finishes is final: if the follow-up ends without a new proposal, the
-earlier one can no longer be approved and the CLI says so. Approve or
-decline first when you want to keep it.
-
-## Exit codes and errors
-
 | situation | behaviour |
 |---|---|
 | task ends `TASK_STATE_FAILED` | message printed, exit 1 |
 | agent answers 4xx/5xx after retries, or is unreachable | `error: <operation> ...`, exit 1 |
-| missing LLM key, repository, or a disallowed host | `error: LLM_API_KEY is not set` / `no repository: ...` / `repository host ... is not allowed`, exit 1 |
+| missing LLM key, repository, or a disallowed host | `error: ...`, exit 1 |
 | the agent stops answering while a task is followed (a rollout, a pod restart) | `… agent unavailable (...); still waiting` once, then polling continues; after `AGENT_OUTAGE_SECONDS` (600) of unbroken failure: `error: agent unreachable for Ns ...`, exit 1 |
 | `WAIT_SECONDS` elapses while the task runs | `error: task ... still TASK_STATE_WORKING after Ns; the run continues on the agent`, exit 1 |
-
-Giving up on a task never cancels it. `ari tasks follow <id>` picks it up
-again; `ari tasks get <id>` shows where it is.
-
-The test environment redeploys the agent on every push to the `test`
-branch, so a run can easily overlap a rollout. The agent keeps paused and
-running tasks across a restart when `TASK_STORE_ROOT` is set (see
-`docs/MEMORY.md`, 2026-10-10 and 2026-10-12), which is what makes riding
-it out worthwhile. A confirm sent while the agent is down fails at once
-(`message:send` is never retried); the task is then still waiting, and
-running `ari approve` again is safe.
 | a bad value in the environment or the config file | `error: invalid setting: ...`, exit 1 (`config set` refuses it up front with exit 2) |
 
-Inside `ari chat` these are printed and the session continues.
+Giving up on a task never cancels it: `ari tasks follow <id>` picks it
+up again. Reads (`tasks get`, polling) are retried on transient failures
+with the agent's own policy (`src/common/http_retry.py`); `message:send`
+is never retried, because it creates a task and a retry after a lost
+response would start a second run. A confirm sent while the agent is
+down therefore fails at once and leaves the task paused, so running
+`ari approve` again is safe.
 
-Reads (`tasks get`, polling) are retried on transient failures with the
-same policy the agent uses for its own outbound calls
-(`src/common/http_retry.py`). `message:send` is never retried: it
-creates a task on the agent, and a retry after a lost response would
-start a second run.
-
-## Testing the CLI
+## Testing
 
 Unit tests run on Windows and Linux without a deployed agent. They need
-the `cli` extra; without `typer` installed `tests/test_ari_cli.py` skips
-itself so the rest of the suite is unaffected.
+the `cli` extra; without `typer` installed the CLI test modules skip
+themselves so the rest of the suite is unaffected.
 
 ```bash
 pip install -e ".[cli,dev]"
-python -m pytest tests/test_chat_gateway_a2a_client.py tests/test_chat_gateway_bridge.py \
-  tests/test_chat_gateway_config.py tests/test_chat_gateway_rendering.py \
-  tests/test_chat_gateway_session.py tests/test_ari_cli.py -q
+python -m pytest tests/test_chat_gateway_*.py tests/test_ari_cli*.py -q
 ```
 
-Against a deployed agent, the acceptance sequence is the same one
-`scripts/oncall_live_test.py` proves, driven by hand:
+`tests/test_ari_cli_tty.py` drives the real terminal interface (arrow-key
+menus, Tab completion, the setup wizard) through a pseudo-terminal
+against a small fake agent. It needs `pexpect` and a POSIX system, and
+skips itself otherwise.
 
-```bash
-ari card                                          # skills[0].id == code_analysis_fix
-ari send "what is a race condition, in one sentence?"   # completes with no repo work
-ari send "add a minimal CONTRIBUTING.md"          # pauses with a proposal
-ari approve <task id>                             # opens the pull request
-```
-
-Point `DEFAULT_REPO_URL` at a repository you do not mind collecting
-branches in: every proposal pushes one before it pauses.
+Against a deployed agent, the acceptance sequence mirrors
+`scripts/oncall_live_test.py`: start `ari`, ask a plain question, ask
+for a small change, approve it from the menu, and check the pull request
+on GitHub. Point the default repository at one you do not mind
+collecting branches in: every proposal pushes one before it pauses.

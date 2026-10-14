@@ -26,6 +26,9 @@ dev = [
 ]
 cli = [
     "typer>=0.12",
+    "rich>=13",
+    "prompt_toolkit>=3.0.40",
+    "questionary>=2.0",
 ]
 
 [project.scripts]
