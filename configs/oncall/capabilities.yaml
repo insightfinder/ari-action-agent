@@ -10,10 +10,12 @@
 #
 # generate_change/verify are backed by opencode, each through its own
 # scoped opencode "agent" (ari-change/ari-verify — see tools/opencode_cli.py)
-# with only the permissions that step actually needs. publish_pr's primary
-# path is plain deterministic git/REST (no opencode); it falls back to
-# opencode (agent: ari-publish, the only one with the GitHub MCP server's
-# tools enabled) only if that primary path fails.
+# with only the permissions that step actually needs. propose_pr and
+# publish_pr are plain deterministic git/REST with no opencode at all:
+# the opencode + GitHub MCP fallback the old single-step publish_pr kept
+# was removed when the human-in-the-loop gate split it in two, because it
+# drove commit/push/PR against the sandbox working tree and there is no
+# working tree left after the task pauses for approval.
 #
 # There used to be a separate `analyze` capability (read-only investigation,
 # its own opencode agent/session) that ran before generate_change — merged
@@ -58,7 +60,7 @@ capabilities:
       trusted from opencode's own report of what it changed — publish_pr
       uses the file list to scope staging and avoid sweeping in scratch
       files a later step (e.g. verify) may have left behind.
-    tools: [opencode, git_diff, git_changed_files]
+    tools: [opencode, git_diff, git_changed_files, git_untracked_files, git_intent_to_add]
     retry:
       max_attempts: 2
       backoff_seconds: 10
@@ -93,30 +95,59 @@ capabilities:
     # build-tool dependency cache (settings.build_cache_root) so repeat
     # attempts against the same repo aren't paying a cold-dependency-
     # download tax every time either.
-    timeout_seconds: 480
+    timeout_seconds: 900
     on_failure:
       goto: generate_change
-      max_attempts: 3
-      then: fail_needs_human
+      max_attempts: 2
+      # `continue`, not `fail_needs_human`: when every attempt is spent the
+      # pipeline carries on to propose_pr with the verification recorded as
+      # failed, so the change a person has to judge actually reaches them.
+      # `fail_needs_human` skipped propose_pr and discarded the diff -- see
+      # workflow.py's own comment on this branch for the runs that proved it.
+      then: continue
 
-  publish_pr:
-    module: ari_oncall_agent.capabilities.publish_pr
+  propose_pr:
+    module: ari_oncall_agent.capabilities.propose_pr
     description: >
       Deterministically (no LLM/opencode involved — title, body, branch
       name and file list are already fully known by this point) stage,
-      commit, and push the change to a new branch, then open a pull
-      request via the GitHub REST API; falls back to opencode + the
-      GitHub MCP server (agent: ari-publish) if that primary path fails.
-      Opt-out, part of the default pipeline whenever generate_change runs
-      — see meta.py's default_step_policy, which appends this step
-      automatically even if the planner's own step list omits it, unless
-      the request explicitly asked not to open a PR. Accepts an optional
-      `base_ref` param (the PR's target branch) when the prompt names one
-      explicitly and it differs from the branch clone_repo checked out,
-      e.g. "raise a PR against staging" while working from dev —
-      otherwise defaults to the same branch clone_repo used. Always the
-      last step.
-    tools: [git_add, git_commit, git_push, github_create_pr, opencode]
+      commit and push the change to a new branch, then put the pull
+      request it is ready to open in front of a person and pause: the
+      task ends in TASK_STATE_INPUT_REQUIRED carrying a `pending_action`
+      artifact, and the pull request is opened only after the caller
+      confirms it. Opt-out, part of the default pipeline whenever
+      generate_change runs — see meta.py's default_step_policy, which
+      appends this step automatically even if the planner's own step list
+      omits it, unless the request explicitly asked not to open a PR.
+      Accepts an optional `base_ref` param (the PR's target branch) when
+      the prompt names one explicitly and it differs from the branch
+      clone_repo checked out, e.g. "raise a PR against staging" while
+      working from dev — otherwise defaults to the same branch clone_repo
+      used. Always the last step of a plan.
+    tools: [git_add, git_commit, git_push]
+    retry:
+      max_attempts: 3
+      backoff_seconds: 5
+
+  # `internal: true` — deliberately invisible to the planner. A pull
+  # request is opened only through plan_task's confirmation bypass, from
+  # a propose_pr proposal a person approved, so this must never appear in
+  # the catalog the planner chooses from. meta.py's planner guidance says
+  # so too; this is the structural half of that guarantee, and the half
+  # that does not depend on a model reading its instructions. The bypass
+  # resolves it by name via get_capability(), which (unlike catalog())
+  # does not filter internal capabilities out.
+  publish_pr:
+    module: ari_oncall_agent.capabilities.publish_pr
+    description: >
+      Open the pull request for an already-approved, already-pushed
+      proposal, via one idempotent GitHub REST call. Every field comes
+      from the confirmed proposal rather than being recomputed, so what a
+      person approved is exactly what gets opened. Needs no repo working
+      tree, which is what lets it run in the separate workflow execution
+      that resumes a paused task.
+    tools: [github_create_pr]
+    internal: true
     retry:
       max_attempts: 3
       backoff_seconds: 5

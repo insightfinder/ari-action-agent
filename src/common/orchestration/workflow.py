@@ -19,6 +19,92 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError
 
+# A ceiling on the whole pipeline, not on any one step.
+#
+# Every per-step bound below is a *per-attempt* bound: the step loop's
+# `start_to_close_timeout` caps one attempt, and `retry.max_attempts`
+# multiplies it. Nothing capped their product, and nothing capped the
+# `on_failure` loop that re-runs whole steps on top of that. Confirmed
+# live (stg workflow 9b32a817, 2026-10-08) — a single request ran
+# 45m56s and every second of it was inside the configured budget:
+#
+#   verify              TIMEOUT @480s   (timeout_seconds: 480)
+#   generate_change     TIMEOUT @1200s  (default, attempt 1 of 2)
+#   generate_change     OK @20s         (attempt 2, after a 10s backoff)
+#   verify              TIMEOUT @481s
+#   generate_change     ...             (cancelled by hand at 506s)
+#
+# For that plan the design maximum is ~3.2 hours (4 passes of the
+# verify -> generate_change loop, each up to 1200s x 2 + 480s), which no
+# caller waits for and no on-call engineer should have to kill by hand.
+#
+# Enforced with `schedule_to_close_timeout` rather than a check between
+# steps, because a between-steps check cannot interrupt the step that is
+# already overrunning — which is exactly the case that produced the 45
+# minutes above. Temporal applies it across all of an activity's retries,
+# so the remaining budget binds the attempt *and* its retries.
+#
+# 3000s, not a round hour, and the difference is the point. The caller
+# that matters is MCP Service, whose own `ONCALL_TASK_AGENT_TIMEOUT_S`
+# (3600s on test, 2026-10-09) is the Temporal activity timeout on one
+# agent call — and its `agent_timeout_s()` docstring states plainly that
+# "the task path sets no deadline inside the agent itself", so this
+# budget is the only in-agent bound there is. A budget equal to that
+# backstop would be worthless: this bounds the *step loop*, after which
+# cleanup_workspace (30s x3), resolve_artifacts (10s x3) and respond
+# (120s x2) can still add ~6 minutes, so a 3600s budget answers at ~3960s
+# to a caller that gave up at 3600s and threw the answer away. 3000s
+# leaves that tail room and ~10 minutes of margin. Raise this only
+# together with the caller's own timeout.
+#
+# MCP's chat path is tighter still (`arioncall.yaml`'s `a2a.timeout_s`,
+# 1200s) but needs nothing here: that caller cancels the remote task
+# itself when it runs out of patience. This default is sized for the
+# task path, which is the one that opens pull requests and, per the
+# same docstring, imposes no deadline of its own. Note also that MCP
+# sends `"options": {}` (app/oncall/ari_oncall_agent.py), so the
+# per-request override below is never set in production — this constant
+# is the number that actually runs.
+_DEFAULT_PIPELINE_BUDGET_SECONDS = 3000
+
+# Below this, scheduling the next step is pointless — it would be killed
+# almost immediately and the run would report a timeout against a step
+# that never had a chance to do anything. Stopping first gives a clearer
+# failure, and `respond` still runs either way.
+# How long Temporal waits for a beat from `execute_step` before declaring
+# the attempt lost and retrying it. activities.py beats every 20s.
+#
+# This is the only thing that makes a dead worker cheap. Without it the
+# only signal is `start_to_close_timeout`, which is 1200s for
+# `generate_change` and 480s for `verify` — measured on stg 2026-10-09,
+# one OOMKill cost 4m15s of a 50-minute budget and one pod replacement
+# cost the full 20 minutes, both of them spent waiting on a worker that
+# was already gone.
+#
+# 90s, not 30s: a beat is one RPC from an activity that is otherwise busy
+# in a subprocess, and a worker briefly starved of CPU (stg runs on t3/t3a,
+# where hypervisor steal of 50-70% has been measured) must not be declared
+# dead for missing one. Four intervals of headroom.
+#
+# It also opens the channel Temporal delivers cancellation on, which is
+# why a timed-out attempt's opencode subprocess used to keep running in
+# the pod after the workflow had moved on.
+_STEP_HEARTBEAT_TIMEOUT_SECONDS = 90
+
+_MIN_USEFUL_STEP_SECONDS = 30
+
+
+def _pipeline_budget_seconds(config: dict) -> float:
+    """Per-request override, falling back to the module default. Lives in
+    `options` alongside `skip_pr` so a caller that knows a particular repo
+    is slow can raise it without a redeploy."""
+    raw = (config.get("options") or {}).get("pipeline_budget_seconds")
+    try:
+        budget = float(raw)
+    except (TypeError, ValueError):
+        return float(_DEFAULT_PIPELINE_BUDGET_SECONDS)
+    return budget if budget > 0 else float(_DEFAULT_PIPELINE_BUDGET_SECONDS)
+
 
 def _activity_failure_detail(exc: ActivityError) -> str:
     """The full message from whatever exception a capability raised (e.g.
@@ -125,12 +211,27 @@ class AriAgentWorkflow:
                 final_status = "failed"
                 failure_reason = f"planning failed: {_activity_failure_detail(exc)}"
 
+        # `workflow.info().start_time` is the deterministic workflow clock,
+        # so the budget covers planning and workspace setup too — the
+        # caller's wait started there, not here. A confirmation resume runs
+        # as its own workflow, so it gets its own full budget rather than
+        # inheriting whatever the proposing run spent.
+        deadline = workflow.info().start_time + timedelta(seconds=_pipeline_budget_seconds(config))
+
         i = 0
         while i < len(steps):
             step = steps[i]
             capability = step["capability"]
             retry = step.get("retry") or {}
             on_failure = step.get("on_failure")
+            remaining = (deadline - workflow.now()).total_seconds()
+            if remaining < _MIN_USEFUL_STEP_SECONDS:
+                final_status = "failed"
+                failure_reason = (
+                    f"pipeline budget of {_pipeline_budget_seconds(config):g}s exhausted before "
+                    f"{capability} could run"
+                )
+                break
 
             # A capability can fail two ways: a "soft" failure it reports
             # itself (e.g. verify's {"status": "failed", ...}, handled by
@@ -164,6 +265,23 @@ class AriAgentWorkflow:
                         "confirmed": step.get("confirmed", False),
                     },
                     start_to_close_timeout=timedelta(seconds=step.get("timeout_seconds") or 1200),
+                    # The budget left for the whole run, applied across this
+                    # step's retries — see _DEFAULT_PIPELINE_BUDGET_SECONDS.
+                    # A step that would outlive the budget is cut short here
+                    # rather than after the fact.
+                    #
+                    # Temporal also clamps `start_to_close_timeout` down to
+                    # this when it is the smaller of the two, so no `min()`
+                    # is needed above. Confirmed live (test, 2026-10-09,
+                    # workflow 613127ee with a 120s budget): `verify` was
+                    # scheduled with sttc=stc=44.86s, not the 480s its own
+                    # `timeout_seconds` asks for, because 44.86s was all the
+                    # budget had left — and it was cut at exactly 120.0s.
+                    # Worth knowing when reading a history: the per-step
+                    # timeout shown there is the effective one, not the one
+                    # in capabilities.yaml.
+                    schedule_to_close_timeout=timedelta(seconds=remaining),
+                    heartbeat_timeout=timedelta(seconds=_STEP_HEARTBEAT_TIMEOUT_SECONDS),
                     retry_policy=RetryPolicy(
                         maximum_attempts=retry.get("max_attempts", 1),
                         backoff_coefficient=2.0,
@@ -175,7 +293,7 @@ class AriAgentWorkflow:
                     final_status = "failed"
                     failure_reason = f"{capability} failed: {_activity_failure_detail(exc)}"
                     break
-                step_result = {"status": "failed", "failure": _activity_failure_detail(exc)}
+                step_result = {"status": "inconclusive", "failure": _activity_failure_detail(exc)}
 
             results[capability] = step_result
 
@@ -190,12 +308,40 @@ class AriAgentWorkflow:
                 final_status = "needs_approval"
                 break
 
-            if on_failure and step_result.get("status") == "failed":
+            if on_failure and step_result.get("status") in ("failed", "inconclusive"):
                 attempts = loop_attempts.get(capability, 0) + 1
                 loop_attempts[capability] = attempts
                 if attempts > on_failure["max_attempts"]:
-                    final_status = "failed" if on_failure["then"] == "fail_needs_human" else on_failure["then"]
+                    # `then: continue` keeps the pipeline going with the
+                    # failure recorded, instead of ending the run here.
+                    #
+                    # Added because the alternative threw away finished work.
+                    # `verify` is the only step with an `on_failure` loop, and
+                    # on a large Java repo it exhausted all four attempts on
+                    # stg (2026-10-10, runs fc532091 and 1c2396a4) — at which
+                    # point `break` skipped `propose_pr` entirely, so a change
+                    # that had already been generated was never pushed, never
+                    # proposed, and never seen by anyone. The run reported
+                    # `failed` with the diff discarded.
+                    #
+                    # That is the wrong trade for this pipeline. A pull request
+                    # is not merged by the agent; it pauses for a person who
+                    # reads the diff. An unverified change, labelled as
+                    # unverified, is strictly more useful to that person than
+                    # no change at all — and they can always run the build
+                    # themselves, which is exactly what the agent could not
+                    # finish in time.
+                    #
+                    # `fail_needs_human` is still available and unchanged, for
+                    # a step whose failure really should stop everything.
                     failure_reason = step_result.get("failure")
+                    if on_failure["then"] == "continue":
+                        if step_result.get("status") == "inconclusive":
+                            i += 1
+                            continue
+                        final_status = "failed"
+                        break
+                    final_status = "failed" if on_failure["then"] == "fail_needs_human" else on_failure["then"]
                     break
                 i = next(idx for idx, s in enumerate(steps) if s["capability"] == on_failure["goto"])
                 continue
@@ -262,6 +408,7 @@ class AriAgentWorkflow:
                     "history": history,
                 },
                 start_to_close_timeout=timedelta(minutes=2),
+                heartbeat_timeout=timedelta(seconds=_STEP_HEARTBEAT_TIMEOUT_SECONDS),
                 retry_policy=RetryPolicy(maximum_attempts=2, initial_interval=timedelta(seconds=5)),
             )
             message = respond_result["message"]
