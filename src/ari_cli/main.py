@@ -1,84 +1,55 @@
 import asyncio
 import json
-import os
-import tomllib
 import uuid
-from pathlib import Path
 from typing import Any
 
 import typer
 from pydantic import ValidationError
+from rich.console import Console
 
 from chat_gateway.a2a_client import AgentClient, AgentError
-from chat_gateway.bridge import Bridge, parse_directives
+from chat_gateway.bridge import Bridge, base_hint, parse_directives
 from chat_gateway.config import SECRET_FIELDS, ConfigError, GatewaySettings
 from chat_gateway.rendering import Rendered, render, render_outage, render_progress
 from chat_gateway.tasks import INPUT_REQUIRED, is_running, pending_action, task_state
 
-app = typer.Typer(no_args_is_help=True, add_completion=False)
-tasks_app = typer.Typer(no_args_is_help=True)
-config_app = typer.Typer(no_args_is_help=True)
+from . import views
+from .config_file import (
+    CONFIG_FILE_ENV,
+    config_path,
+    history_path,
+    load_settings,
+    needs_setup,
+    read_config_file,
+    validation_message,
+    write_config_file,
+)
+from .interactive import COMMANDS, CONNECT_TIMEOUT_SECONDS, ChatSession, run_setup
+from .terminal import make_io, safe_streams
+
+__all__ = [
+    "CONFIG_FILE_ENV",
+    "app",
+    "config_path",
+    "load_settings",
+    "make_bridge",
+    "make_client",
+    "read_config_file",
+    "write_config_file",
+]
+
+app = typer.Typer(
+    add_completion=False,
+    pretty_exceptions_show_locals=False,
+    help="Talk to an ARI agent. Run `ari` on its own for the interactive chat.",
+)
+tasks_app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False, help="Inspect or control a task by id.")
+config_app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False, help="Show or change saved settings.")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(config_app, name="config")
 
-CONFIG_FILE_ENV = "ARI_CONFIG_FILE"
 REQUESTER = "cli"
 REDACTED_KEYS = frozenset({"api_key", "pat", "ssh_key", "token", "password"})
-
-
-def config_path() -> Path:
-    override = os.environ.get(CONFIG_FILE_ENV)
-    if override:
-        return Path(override)
-    return Path.home() / ".config" / "ari" / "config.toml"
-
-
-def read_config_file(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    with path.open("rb") as handle:
-        data = tomllib.load(handle)
-    return {str(k).lower(): v for k, v in data.items()}
-
-
-def write_config_file(path: Path, values: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
-    lines = []
-    for key, value in sorted(values.items()):
-        if isinstance(value, bool):
-            lines.append(f"{key} = {'true' if value else 'false'}")
-        elif isinstance(value, (int, float)):
-            lines.append(f"{key} = {value}")
-        else:
-            lines.append(f"{key} = {json.dumps(str(value), ensure_ascii=False)}")
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-
-
-def validation_message(exc: ValidationError) -> str:
-    return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
-
-
-def load_settings(**overrides: Any) -> GatewaySettings:
-    merged = read_config_file(config_path())
-    for name in GatewaySettings.model_fields:
-        env_value = os.environ.get(name.upper())
-        if env_value is not None:
-            merged[name] = env_value
-    merged.update({k: v for k, v in overrides.items() if v not in (None, "")})
-    try:
-        return GatewaySettings(**merged)
-    except ValidationError as exc:
-        raise ConfigError(f"invalid setting: {validation_message(exc)}") from None
 
 
 def make_client(settings: GatewaySettings) -> AgentClient:
@@ -110,14 +81,6 @@ def run(coro):
         return asyncio.run(coro)
     except RECOVERABLE as exc:
         fail(exc)
-
-
-def attempt(coro):
-    try:
-        return asyncio.run(coro)
-    except RECOVERABLE as exc:
-        typer.echo(f"error: {exc}", err=True)
-        return None
 
 
 def redact(value: Any) -> Any:
@@ -166,10 +129,77 @@ def settings_from_options(url: str, key: str, repo: str, ref: str) -> GatewaySet
     return settings_or_fail(ari_agent_url=url, ari_api_key=key, default_repo_url=repo, default_repo_ref=ref)
 
 
+def check_connection(settings: GatewaySettings) -> str:
+    card = asyncio.run(make_client(settings).agent_card(max_attempts=1, timeout=CONNECT_TIMEOUT_SECONDS))
+    return str(card.get("name") or "")
+
+
+def setup_and_save(io: Any, console: Console, overrides: dict[str, Any] | None = None) -> bool:
+    path = config_path()
+    try:
+        current = read_config_file(path)
+    except ConfigError as exc:
+        console.print(views.error_line(exc))
+        console.print(views.notice_line("Starting from scratch; saving will replace that file."))
+        current = {}
+    try:
+        effective = load_settings(**(overrides or {})).model_dump()
+    except ConfigError:
+        effective = {}
+    values = run_setup(io, console, current, check_connection, effective)
+    if values is None:
+        return False
+    write_config_file(path, values)
+    console.print(views.success_line(f"Saved to {path}"))
+    return True
+
+
+def start_interactive(url: str = "", key: str = "", repo: str = "", ref: str = "") -> None:
+    console = Console()
+    io = make_io(console, history_path(), list(COMMANDS) + ["/exit"])
+    overrides = {"ari_agent_url": url, "ari_api_key": key, "default_repo_url": repo, "default_repo_ref": ref}
+    settings = settings_or_fail(**overrides)
+    if needs_setup(settings, url_given=bool(url)):
+        if not setup_and_save(io, console, overrides):
+            raise typer.Exit(code=1)
+        settings = settings_or_fail(**overrides)
+
+    def setup() -> GatewaySettings | None:
+        if not setup_and_save(io, console, overrides):
+            return None
+        try:
+            return load_settings(**overrides)
+        except ConfigError as exc:
+            console.print(views.error_line(exc))
+            return None
+
+    ChatSession(settings, io, console, make_bridge=make_bridge, setup=setup).run()
+
+
 UrlOption = typer.Option("", "--url", help="agent base URL (ARI_AGENT_URL)")
 KeyOption = typer.Option("", "--key", help="agent API key (ARI_API_KEY)")
 RepoOption = typer.Option("", "--repo", help="repository URL (DEFAULT_REPO_URL)")
 RefOption = typer.Option("", "--ref", help="branch to work from (DEFAULT_REPO_REF)")
+
+
+@app.callback(invoke_without_command=True)
+def root(ctx: typer.Context) -> None:
+    safe_streams()
+    if ctx.invoked_subcommand is None:
+        start_interactive()
+
+
+@app.command()
+def chat(url: str = UrlOption, key: str = KeyOption, repo: str = RepoOption, ref: str = RefOption) -> None:
+    start_interactive(url, key, repo, ref)
+
+
+@app.command()
+def setup() -> None:
+    console = Console()
+    io = make_io(console, history_path(), [])
+    if not setup_and_save(io, console):
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -198,7 +228,7 @@ def send(
     async def submit_only() -> str:
         prompt, directives = parse_directives(text)
         if directives.get("base"):
-            prompt += f"\nOpen the pull request against the {directives['base']} branch."
+            prompt += "\n" + base_hint(directives["base"])
         config = bridge.build_config(thread_key, directives)
         task = await bridge.client.send(prompt, config)
         return str(task.get("id", ""))
@@ -213,49 +243,6 @@ def send(
         typer.echo(f"\ntask {conversation.task_id}\napprove with: ari approve {conversation.task_id}")
     if rendered.state == "TASK_STATE_FAILED":
         raise typer.Exit(code=1)
-
-
-@app.command()
-def chat(url: str = UrlOption, key: str = KeyOption, repo: str = RepoOption, ref: str = RefOption) -> None:
-    settings = settings_from_options(url, key, repo, ref)
-    bridge = make_bridge(settings)
-    thread_key = f"cli:{uuid.uuid4()}"
-    typer.echo("ARI chat. Commands: /approve  /decline  /status  /quit")
-    while True:
-        try:
-            line = typer.prompt("you", prompt_suffix="> ")
-        except (EOFError, typer.Abort):
-            typer.echo("")
-            break
-        line = line.strip()
-        if not line:
-            continue
-        if line in ("/quit", "/exit", "/q"):
-            break
-        if line == "/approve":
-            echo_rendered(attempt(bridge.approve(thread_key, REQUESTER, on_update=print_progress)))
-            continue
-        if line == "/decline":
-            echo_rendered(attempt(bridge.decline(thread_key, REQUESTER)))
-            continue
-        if line == "/status":
-            echo_rendered(attempt(bridge.status(thread_key)))
-            continue
-        rendered = attempt(bridge.start(thread_key, line, REQUESTER, on_update=print_progress))
-        if rendered is None:
-            continue
-        echo_rendered(rendered)
-        conversation = bridge.store.get(thread_key)
-        if rendered.state != INPUT_REQUIRED or conversation is None:
-            continue
-        typer.echo(f"task {conversation.task_id}; approve later with: ari approve {conversation.task_id}")
-        try:
-            approved = typer.confirm("Approve?", default=False)
-        except (EOFError, typer.Abort):
-            typer.echo("")
-            break
-        if approved:
-            echo_rendered(attempt(bridge.approve(thread_key, REQUESTER, on_update=print_progress)))
 
 
 @app.command()

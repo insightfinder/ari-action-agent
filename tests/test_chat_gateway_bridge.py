@@ -160,7 +160,7 @@ async def test_directives_override_the_repo_and_shape_the_prompt(bridge):
     await bridge.start("th", "fix it repo=https://github.com/org/x ref=dev base=staging", "alice")
     sent = bridge.client.sent[0]
     assert sent["config"]["repo"] == {"url": "https://github.com/org/x", "ref": "dev", "pat": "ghp_test"}
-    assert sent["prompt"] == "fix it\nOpen the pull request against the staging branch."
+    assert sent["prompt"] == "fix it\nIf this request leads to a pull request, open it against the staging branch."
 
 
 @pytest.mark.asyncio

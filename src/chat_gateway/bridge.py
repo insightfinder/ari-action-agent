@@ -1,4 +1,5 @@
 import re
+from dataclasses import replace
 from typing import Any, Awaitable, Callable
 
 from .a2a_client import AgentClient
@@ -16,7 +17,13 @@ DECLINE_WORDS = frozenset(
     {"no", "n", "nope", "decline", "declined", "reject", "rejected", "cancel", "cancel it", "stop", "abort", "dont", "do not"}
 )
 
+STALE_PROPOSAL_NOTE = "The earlier proposal on this task can no longer be approved; ask for the change again to get a new one."
+
 OnUpdate = Callable[[Rendered], Awaitable[None]]
+
+
+def base_hint(base: str) -> str:
+    return f"If this request leads to a pull request, open it against the {base} branch."
 
 
 def parse_directives(text: str) -> tuple[str, dict[str, str]]:
@@ -98,7 +105,7 @@ class Bridge:
                 )
         continuing = conversation.task_state == INPUT_REQUIRED
         if continuing:
-            decision = decision_word(text)
+            decision = decision_word(parse_directives(text)[0]) if conversation.pending_action_id else ""
             if decision == "approve":
                 return await self.approve(thread_key, requester, on_update=on_update)
             if decision == "decline":
@@ -112,7 +119,7 @@ class Bridge:
         if not prompt:
             return render_refusal("nothing to do: the message is empty")
         if directives.get("base"):
-            prompt += f"\nOpen the pull request against the {directives['base']} branch."
+            prompt += "\n" + base_hint(directives["base"])
         config = self.build_config(thread_key, directives)
         if not continuing:
             conversation.requester = requester
@@ -121,11 +128,9 @@ class Bridge:
         self.store.record_task(thread_key, submitted, config=config)
         rendered = await self._follow(thread_key, submitted["id"], on_update)
         if continuing and rendered.state != INPUT_REQUIRED:
-            rendered = Rendered(
-                text=rendered.text + "\n\nThe earlier proposal on this task can no longer be approved; ask for the change again to get a new one.",
-                state=rendered.state,
-                buttons=rendered.buttons,
-                links=rendered.links,
+            rendered = replace(
+                rendered,
+                text=f"{rendered.text}\n\n{STALE_PROPOSAL_NOTE}",
             )
         return rendered
 
@@ -186,6 +191,12 @@ class Bridge:
         task = result if result.get("id") else await self.client.get_task(conversation.task_id)
         self.store.record_task(thread_key, task)
         return render(task)
+
+    async def follow(self, thread_key: str, on_update: OnUpdate | None = None) -> Rendered:
+        conversation = self.store.get(thread_key)
+        if conversation is None or not conversation.task_id:
+            return render_refusal("no task in this conversation yet")
+        return await self._follow(thread_key, conversation.task_id, on_update)
 
     async def status(self, thread_key: str) -> Rendered:
         conversation = self.store.get(thread_key)
