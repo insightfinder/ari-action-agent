@@ -6,7 +6,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ari_oncall_agent.capabilities import clone_repo, generate_change as opencode_change, publish_pr, verify  # noqa: E402
+from ari_oncall_agent.capabilities import (  # noqa: E402
+    clone_repo,
+    generate_change as opencode_change,
+    propose_pr,
+    publish_pr,
+    verify,
+)
 from common.capabilities_base import StepContext  # noqa: E402
 
 # Stub `run_opencode()`'s trace field (tools/opencode_cli.py) — every
@@ -16,6 +22,20 @@ from common.capabilities_base import StepContext  # noqa: E402
 _STUB_TRACE = {"elapsed_s": 0.0, "tool_call_counts": {}, "tool_call_total": 0, "slowest_gaps": []}
 
 
+def _change_tools(opencode, diff: str, changed: list[str], untracked: list[list[str]] | None = None):
+    """The tool set generate_change asks for. `untracked` is the sequence of
+    `git_untracked_files` results — it is called once before opencode and
+    once after, so a two-element list expresses "this appeared during the
+    call" (see git_ops.intent_to_add for why that difference matters)."""
+    return {
+        "opencode": opencode,
+        "git_diff": AsyncMock(return_value=diff),
+        "git_changed_files": AsyncMock(return_value=changed),
+        "git_untracked_files": AsyncMock(side_effect=list(untracked or [[], []])),
+        "git_intent_to_add": AsyncMock(return_value=None),
+    }
+
+
 _CLONE_REPO_RESULT = {"cloned_path": "/tmp/ws/repo", "ref": "main"}
 
 
@@ -23,8 +43,9 @@ def _ctx(
     results: dict,
     tools: dict,
     params: dict | None = None,
-    capability: str = "publish_pr",
+    capability: str = "propose_pr",
     include_clone_repo: bool = True,
+    confirmed: bool = False,
 ) -> StepContext:
     # generate_change/verify/publish_pr all now hard-require clone_repo to
     # have run first (StepContext.require_cloned_repo) -- included by
@@ -47,6 +68,7 @@ def _ctx(
         params=params or {},
         results=results,
         tools=tools,
+        confirmed=confirmed,
     )
 
 
@@ -78,185 +100,109 @@ def test_branch_name_is_deterministic_and_collision_resistant():
     assert " " not in name
 
 
-def test_extract_pr_from_opencode_result_uses_structured_tool_output():
-    result = {
-        "text": "done",
-        "tool_calls": [
-            {
-                "tool": "github_create_pull_request",
-                "input": {"head": "ari/fix-1"},
-                "output": {"html_url": "https://github.com/x/y/pull/42"},
-            }
-        ],
+def _approved_proposal(**overrides) -> dict:
+    """What plan_task puts in the step's params when a caller confirms a
+    propose_pr proposal: the artifact itself, verbatim."""
+    proposal = {
+        "id": "11111111-2222-3333-4444-555555555555",
+        "action": "open_pull_request",
+        "repo": "x/y",
+        "repo_url": "https://github.com/x/y",
+        "branch": "ari/fix-the-cart-bug-req-1234",
+        "base_ref": "main",
+        "title": "ARI: fix the cart bug",
+        "body": "the cart was empty",
+        "changed_files": ["a.py"],
     }
-    pr = publish_pr._extract_pr_from_opencode_result(result)
-    assert pr == {"url": "https://github.com/x/y/pull/42", "branch": "ari/fix-1"}
-
-
-def test_extract_pr_from_opencode_result_falls_back_to_text_regex():
-    result = {"text": "Opened it here: https://github.com/x/y/pull/7 — done.", "tool_calls": []}
-    pr = publish_pr._extract_pr_from_opencode_result(result)
-    assert pr["url"] == "https://github.com/x/y/pull/7"
-
-
-def test_extract_pr_from_opencode_result_returns_none_when_nothing_found():
-    assert publish_pr._extract_pr_from_opencode_result({"text": "no pr here", "tool_calls": []}) is None
+    proposal.update(overrides)
+    return proposal
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_primary_path_stages_commits_pushes_and_opens_pr():
+async def test_publish_pr_refuses_a_step_that_was_not_confirmed():
+    # The gate itself. `confirmed` is set only by plan_task's confirmation
+    # bypass and lives outside `params`, so a planner that scheduled this
+    # step anyway -- or a future default_step_policy appending it by
+    # mistake -- must not reach GitHub.
     tools = _publish_pr_tools()
-    ctx = _ctx(
-        results={"generate_change": {"summary": "fixed it", "changed_files": ["cart_service.py"]}},
-        tools=tools,
-    )
+    ctx = _ctx(results={}, tools=tools, params=_approved_proposal(), capability="publish_pr")
 
-    result = await publish_pr.run(ctx)
-
-    tools["git_add"].assert_awaited_once_with("/tmp/ws/repo", ["cart_service.py"])
-    tools["git_commit"].assert_awaited_once()
-    tools["git_push"].assert_awaited_once()
-    tools["github_create_pr"].assert_awaited_once()
-    tools["opencode"].assert_not_awaited()  # primary path succeeded -- no fallback
-    assert result == {"pr": {"url": "https://github.com/x/y/pull/1", "branch": "ari/x"}}
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_create_pr_call_uses_repo_slug_title_body_branch_and_base():
-    tools = _publish_pr_tools()
-    ctx = _ctx(
-        results={"generate_change": {"summary": "fixed the bug", "changed_files": ["a.go"]}},
-        tools=tools,
-    )
-    ctx.config["repo"]["url"] = "https://github.com/neyaadeez/go-script"
-
-    await publish_pr.run(ctx)
-
-    args = tools["github_create_pr"].await_args.args
-    repo_config, owner_repo, title, body, head, base = args
-    assert owner_repo == "neyaadeez/go-script"
-    assert "fixed the bug" in title or "fixed the bug" in body
-    assert head.startswith("ari/")
-    assert base == "main"
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_base_ref_param_overrides_repo_default():
-    tools = _publish_pr_tools()
-    ctx = _ctx(
-        results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}},
-        tools=tools,
-        params={"base_ref": "staging"},
-    )
-
-    await publish_pr.run(ctx)
-
-    assert tools["github_create_pr"].await_args.args[5] == "staging"
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_base_ref_defaults_to_clone_repo_ref_when_unset():
-    tools = _publish_pr_tools()
-    ctx = _ctx(
-        results={
-            "clone_repo": {"cloned_path": "/tmp/ws/repo", "ref": "dev"},
-            "generate_change": {"summary": "fixed it", "changed_files": ["a.py"]},
-        },
-        tools=tools,
-    )
-
-    await publish_pr.run(ctx)
-
-    assert tools["github_create_pr"].await_args.args[5] == "dev"
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_raises_when_generate_change_reports_no_changed_files():
-    tools = _publish_pr_tools()
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": []}}, tools=tools)
-
-    with pytest.raises(RuntimeError, match="no changed files"):
+    with pytest.raises(RuntimeError, match="was not confirmed"):
         await publish_pr.run(ctx)
 
-    tools["git_add"].assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_skips_when_options_skip_pr_is_set():
-    # Belt-and-suspenders alongside meta.py's default_step_policy (which
-    # normally wouldn't schedule this step at all in that case) -- in case
-    # the planner includes it anyway despite an explicit opt-out.
-    tools = _publish_pr_tools()
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
-    ctx.config["options"] = {"skip_pr": True}
-
-    result = await publish_pr.run(ctx)
-
-    assert result == {"status": "skipped"}
-    tools["git_add"].assert_not_awaited()
     tools["github_create_pr"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_falls_back_to_opencode_when_primary_path_fails():
-    # The safety net this whole design keeps: an unusual repo/auth state a
-    # fixed git/REST sequence can't handle should still get a real
-    # attempt via the more flexible opencode+MCP path, not just fail.
-    tools = _publish_pr_tools(
-        git_push=AsyncMock(side_effect=RuntimeError("git push failed: permission denied")),
-        opencode=AsyncMock(
-            return_value={
-                "text": "ok",
-                "tool_calls": [
-                    {
-                        "tool": "github_create_pull_request",
-                        "input": {"head": "b"},
-                        "output": {"html_url": "https://github.com/x/y/pull/9"},
-                    }
-                ],
-            }
-        ),
-    )
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"action": "trigger_build", "job": "deploy"},
+        _approved_proposal(branch=""),
+        _approved_proposal(title=""),
+    ],
+    ids=["empty", "another-agents-proposal", "no-branch", "no-title"],
+)
+async def test_publish_pr_refuses_a_confirmation_that_is_not_one_of_its_own_proposals(params):
+    # Being confirmed is not enough: the resolved artifact has to be an
+    # open_pull_request proposal with everything a pull request needs.
+    # A stale one, or one matched against some other artifact, fails here
+    # rather than opening half a pull request.
+    tools = _publish_pr_tools()
+    ctx = _ctx(results={}, tools=tools, params=params, capability="publish_pr", confirmed=True)
+
+    with pytest.raises(RuntimeError, match="not an open_pull_request proposal"):
+        await publish_pr.run(ctx)
+
+    tools["github_create_pr"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_pr_opens_the_pr_from_the_confirmed_proposal_verbatim():
+    # What a person approved is what gets opened. Nothing is recomputed --
+    # `_branch_name` is derived from the request id and the resume runs as
+    # a different workflow execution, so recomputing would open a pull
+    # request for a branch nobody approved and nothing pushed.
+    tools = _publish_pr_tools()
+    proposal = _approved_proposal()
+    ctx = _ctx(results={}, tools=tools, params=proposal, capability="publish_pr", confirmed=True)
 
     result = await publish_pr.run(ctx)
 
-    tools["opencode"].assert_awaited_once()
-    instruction = tools["opencode"].await_args.args[1]
-    assert "permission denied" in instruction
-    assert "a.py" in instruction
-    assert result == {"pr": {"url": "https://github.com/x/y/pull/9", "branch": "b"}}
-
-
-@pytest.mark.asyncio
-async def test_publish_pr_raises_clearly_when_both_primary_and_fallback_fail():
-    tools = _publish_pr_tools(
-        git_push=AsyncMock(side_effect=RuntimeError("git push failed: permission denied")),
-        opencode=AsyncMock(return_value={"text": "I could not open a PR either", "tool_calls": []}),
+    assert result == {"pr": {"url": "https://github.com/x/y/pull/1", "branch": "ari/x"}}
+    args = tools["github_create_pr"].await_args.args
+    assert args[1:] == (
+        "x/y",
+        "ARI: fix the cart bug",
+        "the cart was empty",
+        "ari/fix-the-cart-bug-req-1234",
+        "main",
     )
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
-
-    with pytest.raises(RuntimeError, match="primary path failed"):
-        await publish_pr.run(ctx)
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_refuses_to_push_a_protected_branch_without_even_trying(monkeypatch):
-    # Hard veto: unreachable in practice today (_branch_name always
-    # generates a fresh ari/... name), but if a protected branch were ever
-    # about to be pushed to, this must refuse outright -- not touch git at
-    # all, and not fall back to opencode either (a different mechanism
-    # must never be allowed to "work around" the veto).
-    monkeypatch.setattr(publish_pr, "is_protected", lambda repo_url, branch: True)
+async def test_publish_pr_needs_no_repo_working_tree():
+    # The point of splitting publish_pr out of propose_pr. The resume runs
+    # after `cleanup_workspace` removed the sandbox, in a workflow whose
+    # plan is this one step -- there is no clone_repo result and no
+    # checked-out repo. If this step ever regained a require_cloned_repo()
+    # or a git call, every approval would fail here instead.
     tools = _publish_pr_tools()
-    ctx = _ctx(results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}}, tools=tools)
+    ctx = _ctx(
+        results={},
+        tools=tools,
+        params=_approved_proposal(),
+        capability="publish_pr",
+        include_clone_repo=False,
+        confirmed=True,
+    )
 
-    with pytest.raises(RuntimeError, match="refusing to push protected branch"):
-        await publish_pr.run(ctx)
+    await publish_pr.run(ctx)
 
+    tools["github_create_pr"].assert_awaited_once()
     tools["git_add"].assert_not_awaited()
     tools["git_push"].assert_not_awaited()
-    tools["opencode"].assert_not_awaited()
 
 
 def _clone_repo_tools(**overrides):
@@ -348,11 +294,7 @@ async def test_generate_change_returns_only_the_marked_summary_not_raw_narration
     )
     ctx = _ctx(
         results={},
-        tools={
-            "opencode": opencode,
-            "git_diff": AsyncMock(return_value="diff --git a/models.go b/models.go"),
-            "git_changed_files": AsyncMock(return_value=["models.go"]),
-        },
+        tools=_change_tools(opencode, "diff --git a/models.go b/models.go", ["models.go"]),
         capability="generate_change",
     )
 
@@ -372,11 +314,7 @@ async def test_generate_change_also_returns_root_cause_from_the_same_summary():
     )
     ctx = _ctx(
         results={},
-        tools={
-            "opencode": opencode,
-            "git_diff": AsyncMock(return_value="diff"),
-            "git_changed_files": AsyncMock(return_value=["models.go"]),
-        },
+        tools=_change_tools(opencode, "diff", ["models.go"]),
         capability="generate_change",
     )
 
@@ -413,7 +351,10 @@ async def test_verify_raises_clearly_when_clone_repo_never_ran():
 
 
 @pytest.mark.asyncio
-async def test_publish_pr_raises_clearly_when_clone_repo_never_ran():
+async def test_propose_pr_raises_clearly_when_clone_repo_never_ran():
+    # The repo guard moved here with the push itself. publish_pr has the
+    # opposite requirement now -- see
+    # test_publish_pr_needs_no_repo_working_tree.
     tools = _publish_pr_tools()
     ctx = _ctx(
         results={"generate_change": {"summary": "fixed it", "changed_files": ["a.py"]}},
@@ -422,7 +363,7 @@ async def test_publish_pr_raises_clearly_when_clone_repo_never_ran():
     )
 
     with pytest.raises(RuntimeError, match="clone_repo must run before this step"):
-        await publish_pr.run(ctx)
+        await propose_pr.run(ctx)
 
     tools["git_add"].assert_not_awaited()
 
@@ -444,11 +385,7 @@ async def test_generate_change_issues_enforcement_followup_when_marker_missing()
     )
     ctx = _ctx(
         results={},
-        tools={
-            "opencode": opencode,
-            "git_diff": AsyncMock(return_value="diff --git a/models.go b/models.go"),
-            "git_changed_files": AsyncMock(return_value=["models.go"]),
-        },
+        tools=_change_tools(opencode, "diff --git a/models.go b/models.go", ["models.go"]),
         capability="generate_change",
     )
 
@@ -462,3 +399,186 @@ async def test_generate_change_issues_enforcement_followup_when_marker_missing()
     # would otherwise start a fresh, context-less session.
     _, followup_kwargs = opencode.await_args_list[1]
     assert followup_kwargs == {"continue_session": True}
+
+
+@pytest.mark.asyncio
+async def test_generate_change_refuses_to_report_success_on_an_unmodified_tree():
+    # The live failure this guards (stg workflow 9b32a817, 2026-10-08):
+    # opencode made one tool call, which was invalid, returned in 20s
+    # having edited nothing, and handed back a confident, fabricated
+    # summary. Without this guard that empty change flowed on to `verify`,
+    # which spent its full 480s building a change that did not exist,
+    # looped back here on `on_failure`, and did it all again — 45 minutes
+    # to discover nothing happened in the first 20 seconds.
+    opencode = AsyncMock(
+        return_value={
+            "text": "TITLE: Add retry logic\nSUMMARY:\nThe service now includes exponential backoff.",
+            "trace": {**_STUB_TRACE, "tool_call_counts": {"invalid": 1}, "tool_call_total": 1},
+        }
+    )
+    ctx = _ctx(
+        results={},
+        tools=_change_tools(opencode, "", []),
+        capability="generate_change",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await opencode_change.run(ctx)
+
+    message = str(exc_info.value)
+    assert "the working tree is unmodified" in message
+    # The two things a human needs to tell "the model did nothing" apart
+    # from "the sandbox is broken": what it actually called, and what it
+    # said about it.
+    assert "invalid" in message, "must report the tool calls that were made"
+    assert "exponential backoff" in message, "must quote the account it could not back up"
+
+
+@pytest.mark.asyncio
+async def test_generate_change_accepts_a_tree_with_changes():
+    # Contrast case for the guard above — the normal path must be
+    # untouched by it.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Fix it\nSUMMARY:\nFixed the thing.", "trace": _STUB_TRACE}
+    )
+    ctx = _ctx(
+        results={},
+        tools=_change_tools(opencode, "diff --git a/models.go b/models.go", ["models.go"]),
+        capability="generate_change",
+    )
+
+    result = await opencode_change.run(ctx)
+
+    assert result["changed_files"] == ["models.go"]
+
+
+@pytest.mark.asyncio
+async def test_generate_change_still_fails_on_an_empty_tree_after_a_verify_loopback():
+    # The on_failure loop re-runs this capability in the *same* working
+    # tree, so an earlier attempt's edits are still uncommitted there. A
+    # clean tree on the second pass therefore means nothing was ever done,
+    # not "nothing new was done" — the guard must not be relaxed for it.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Fix it\nSUMMARY:\nFixed the thing.", "trace": _STUB_TRACE}
+    )
+    ctx = _ctx(
+        results={"verify": {"status": "failed", "failure": "tests failed"}},
+        tools=_change_tools(opencode, "", []),
+        capability="generate_change",
+    )
+
+    with pytest.raises(RuntimeError, match="the working tree is unmodified"):
+        await opencode_change.run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_generate_change_stages_a_brand_new_file_so_the_diff_can_see_it():
+    # The live bug this closes (test, 2026-10-09, workflow 979a2b0e):
+    # asked for a CONTRIBUTING.md the repository did not have, opencode
+    # called `write`, the file was created — and because `git diff HEAD`
+    # cannot see an untracked path, the pipeline reported the working tree
+    # unmodified and failed. Every change whose whole content is a new
+    # file was unshippable.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Add guide\nSUMMARY:\nAdded CONTRIBUTING.md.", "trace": _STUB_TRACE}
+    )
+    tools = _change_tools(
+        opencode,
+        "diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md",
+        ["CONTRIBUTING.md"],
+        untracked=[[], ["CONTRIBUTING.md"]],
+    )
+    ctx = _ctx(results={}, tools=tools, capability="generate_change")
+
+    result = await opencode_change.run(ctx)
+
+    tools["git_intent_to_add"].assert_awaited_once_with(ctx.repo_dir, ["CONTRIBUTING.md"])
+    assert result["changed_files"] == ["CONTRIBUTING.md"]
+    # Staging has to happen before the diff is taken, or the diff that
+    # propose_pr turns into the approval email's key hunks is still blank
+    # and a human approves a file they were never shown.
+    assert tools["git_intent_to_add"].await_count == 1
+    assert tools["git_diff"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_change_does_not_stage_files_it_did_not_create():
+    # A file already untracked before opencode ran is not part of this
+    # change. On an on_failure loop back from `verify` that is exactly what
+    # verify's own scratch files are, and sweeping them in would put a
+    # throwaway test script into the pull request.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Fix it\nSUMMARY:\nFixed it.", "trace": _STUB_TRACE}
+    )
+    tools = _change_tools(
+        opencode,
+        "diff --git a/app.py b/app.py",
+        ["app.py"],
+        untracked=[["verify_scratch.py"], ["verify_scratch.py"]],
+    )
+    ctx = _ctx(
+        results={"verify": {"status": "failed", "failure": "tests failed"}},
+        tools=tools,
+        capability="generate_change",
+    )
+
+    result = await opencode_change.run(ctx)
+
+    tools["git_intent_to_add"].assert_awaited_once_with(ctx.repo_dir, [])
+    assert result["changed_files"] == ["app.py"]
+
+
+@pytest.mark.asyncio
+async def test_generate_change_stages_only_the_newly_created_file_among_untracked_ones():
+    # The discriminating case for the before/after snapshot: one scratch
+    # file was already there, one real file appeared during this call.
+    opencode = AsyncMock(
+        return_value={"text": "TITLE: Add test\nSUMMARY:\nAdded a test.", "trace": _STUB_TRACE}
+    )
+    tools = _change_tools(
+        opencode,
+        "diff --git a/tests/test_new.py b/tests/test_new.py",
+        ["tests/test_new.py"],
+        untracked=[["verify_scratch.py"], ["verify_scratch.py", "tests/test_new.py"]],
+    )
+    ctx = _ctx(results={}, tools=tools, capability="generate_change")
+
+    await opencode_change.run(ctx)
+
+    tools["git_intent_to_add"].assert_awaited_once_with(ctx.repo_dir, ["tests/test_new.py"])
+
+
+@pytest.mark.asyncio
+async def test_the_empty_tree_message_does_not_accuse_an_honest_model_of_lying():
+    # Two different things reach this guard and the message has to be true
+    # of both. Seen live on stg (2026-10-09) one hour after the fabricated
+    # case shipped: opencode read the repo, correctly concluded nothing
+    # needed changing, and said so plainly. The first wording opened with
+    # "opencode reported a change but left the working tree unmodified",
+    # which is simply false here and sends whoever reads the failure
+    # hunting for a lying model that is not there.
+    #
+    # Failing is still right -- telling the two apart would mean trusting
+    # the model's account of itself, which is what this guard exists
+    # because we cannot do -- but the message must only state what was
+    # observed.
+    honest = "Verified that a README.md file exists in the repository root. No changes were required."
+    opencode = AsyncMock(
+        return_value={
+            "text": "TITLE: No change needed\nSUMMARY:\n" + honest,
+            "trace": {**_STUB_TRACE, "tool_call_counts": {"read": 1}, "tool_call_total": 1},
+        }
+    )
+    ctx = _ctx(results={}, tools=_change_tools(opencode, "", []), capability="generate_change")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await opencode_change.run(ctx)
+
+    message = str(exc_info.value)
+    assert "the working tree is unmodified" in message
+    assert honest in message, "must quote the account verbatim, whatever it says"
+    for accusation in ("reported a change", "claimed"):
+        assert accusation not in message, (
+            f"message asserts {accusation!r}, which is false when the model correctly "
+            f"declined to edit anything"
+        )
