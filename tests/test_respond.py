@@ -135,8 +135,11 @@ def test_system_prompt_forbids_dangling_follow_up_questions():
 # it, because the absence of a step is the hard thing for a model to notice.
 # --------------------------------------------------------------------------
 
-def _meta(confirm_capability):
-    return SimpleNamespace(confirm_capability=confirm_capability)
+def _meta(confirm_capability, artifacts=None):
+    return SimpleNamespace(
+        confirm_capability=confirm_capability,
+        artifacts=artifacts if artifacts is not None else {"pending_action": "propose_action.pending_action"},
+    )
 
 
 class TestExecutionFact:
@@ -165,6 +168,30 @@ class TestExecutionFact:
     def test_a_failed_step_is_not_an_execution(self):
         results = {"execute_action": {"status": "failed", "failure": "refused"}}
         assert "NOTHING WAS EXECUTED" in respond.execution_fact(_meta("execute_action"), results)
+
+    def test_a_run_that_proposed_nothing_says_so(self):
+        # The 2026-10-13 prod failure: the planner returned a valid plan
+        # holding only `resolve_target`, so propose_action never ran, yet
+        # respond still told the operator an approval was pending. There
+        # was no pending_action to approve and the task had completed.
+        fact = respond.execution_fact(_meta("execute_action"), {"resolve_target": {"x": 1}})
+        assert "NOTHING WAS PROPOSED EITHER" in fact
+        for word in ("proposed", "pending", "awaiting approval", "awaiting confirmation"):
+            assert word in fact
+
+    def test_a_real_proposal_is_still_reported_as_awaiting_approval(self):
+        results = {"propose_action": {"pending_action": {"id": "pa-1"}, "requires_approval": True}}
+        fact = respond.execution_fact(_meta("execute_action"), results)
+        assert "There IS a proposal awaiting confirmation" in fact
+        assert "NOTHING WAS PROPOSED EITHER" not in fact
+
+    def test_an_empty_pending_action_is_not_a_proposal(self):
+        results = {"propose_action": {"pending_action": {}, "requires_approval": True}}
+        assert "NOTHING WAS PROPOSED EITHER" in respond.execution_fact(_meta("execute_action"), results)
+
+    def test_a_meta_without_artifacts_degrades_instead_of_raising(self):
+        fact = respond.execution_fact(_meta("execute_action", artifacts={}), {"propose_action": {"pending_action": {"id": "x"}}})
+        assert "NOTHING WAS PROPOSED EITHER" in fact
 
     def test_an_agent_kind_with_no_confirm_capability_says_nothing(self):
         # oncall has no single step meaning "something outside changed",
