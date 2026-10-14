@@ -52,6 +52,7 @@ import time
 
 import structlog
 
+from . import skills
 from .settings import get_settings
 
 logger = structlog.get_logger()
@@ -269,8 +270,19 @@ def merge_traces(*traces: dict) -> dict:
     }
 
 
+def opencode_config_home(workspace: str) -> str:
+    return os.path.join(workspace, ".opencode-state", "config")
+
+
 async def run_opencode(
-    ctx, instruction: str, agent: str, *, continue_session: bool | None = None, extra_env: dict[str, str] | None = None
+    ctx,
+    instruction: str,
+    agent: str,
+    *,
+    continue_session: bool | None = None,
+    extra_env: dict[str, str] | None = None,
+    workdir: str | None = None,
+    drop_env: tuple[str, ...] = (),
 ) -> dict:
     """Runs one opencode turn for the calling capability. `ctx` is the
     capability's `StepContext`; `agent` is the specific opencode agent name
@@ -304,7 +316,7 @@ async def run_opencode(
     cmd = [
         settings.opencode_bin,
         "run",
-        "--dir", ctx.repo_dir,
+        "--dir", workdir or ctx.repo_dir,
         "--agent", agent,
         "--model", f"{llm['provider']}/{llm['model']}",
         "--format", "json",
@@ -338,14 +350,17 @@ async def run_opencode(
     # anything under HOME/XDG_DATA_HOME.
     opencode_state_dir = os.path.join(ctx.workspace, ".opencode-state")
     os.makedirs(opencode_state_dir, exist_ok=True)
+    skills.prepare(opencode_config_home(ctx.workspace))
     base_env = {
         **os.environ,
         "XDG_DATA_HOME": os.path.join(opencode_state_dir, "data"),
-        "XDG_CONFIG_HOME": os.path.join(opencode_state_dir, "config"),
+        "XDG_CONFIG_HOME": opencode_config_home(ctx.workspace),
         "XDG_CACHE_HOME": os.path.join(opencode_state_dir, "cache"),
         "XDG_STATE_HOME": os.path.join(opencode_state_dir, "state"),
     }
-    env = {**base_env, **extra_env} if extra_env else base_env
+    env = {**base_env, **skills.opencode_env(), **(extra_env or {})}
+    for name in drop_env:
+        env.pop(name, None)
 
     start = time.monotonic()
     proc = await asyncio.create_subprocess_exec(

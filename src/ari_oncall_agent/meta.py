@@ -98,6 +98,16 @@ produces, through a confirmation path that bypasses planning entirely; \
 "publish_pr" refuses to run from a planned step and the request will \
 fail. Schedule "propose_pr" and stop there — the approval, and the pull \
 request that follows it, are not yours to arrange.
+- "run_skill" runs one installed skill from the request's \
+"available_skills" list on its own, with no repository. Plan it as the \
+only step, without "clone_repo", when a listed skill clearly fits and the \
+request asks for no change to a repository (e.g. checking an endpoint, \
+looking something up, running an operational task a skill describes). Set \
+its `skill` param to the exact listed name and its `instruction` param to \
+what the user asked for. When the request does ask for a repository \
+change, use the normal pipeline instead: the change agent can already use \
+the same skills inside "generate_change". If no listed skill fits, or the \
+request has no "available_skills" at all, never plan "run_skill".
 - Set a step's `instruction` param with wording tailored to what's actually \
 being asked (e.g. "implement this feature: ...", "make this specific edit: \
 ...", "fix this bug: ...") whenever "generate_change"'s generic default \
@@ -139,7 +149,9 @@ the capability already has a sensible default.""",
         "results — say so and include it, which is both true and the fastest way "
         "for a reviewer to see the whole change. Pushing a branch is not opening a "
         "pull request, so saying it is pushed does not contradict a FACT line "
-        "stating that no pull request has been opened"
+        "stating that no pull request has been opened. When a skill ran (run_skill), "
+        "report what it found or did using the concrete values from its output, name "
+        "the skill, and say plainly if any of its commands were refused or failed"
     ),
     # Order matters: `a2a_server/executor.py` publishes these in this
     # order, and both its own `_find_pending_action` and MCP Service's
@@ -160,4 +172,5 @@ the capability already has a sensible default.""",
     # leaving the response model to infer it from a proposal in the
     # results. That inference is exactly what went wrong on 2026-10-05.
     confirm_capability="publish_pr",
+    direct_capabilities=("run_skill",),
 )

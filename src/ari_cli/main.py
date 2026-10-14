@@ -45,8 +45,10 @@ app = typer.Typer(
 )
 tasks_app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False, help="Inspect or control a task by id.")
 config_app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False, help="Show or change saved settings.")
+skills_app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False, help="Check Agent Skills before installing them.")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(config_app, name="config")
+app.add_typer(skills_app, name="skills")
 
 REQUESTER = "cli"
 REDACTED_KEYS = frozenset({"api_key", "pat", "ssh_key", "token", "password"})
@@ -325,6 +327,42 @@ def config_set(
         fail(f"invalid value for {name}: {validation_message(exc)}", code=2)
     write_config_file(path, values)
     typer.echo(f"saved {name} to {path}")
+
+
+@skills_app.command("validate")
+def skills_validate(
+    paths: list[str] = typer.Argument(..., help="a skill directory, or a directory of skill directories"),
+) -> None:
+    from pathlib import Path
+
+    from common import skills
+
+    reports = []
+    for text in paths:
+        path = Path(text)
+        if not path.is_dir() or skills.has_skill_file(path):
+            reports.append(skills.inspect_skill(path))
+            continue
+        found = skills.scan(path, "local")
+        if not found:
+            reports.append(
+                skills.Report(
+                    path=path,
+                    errors=[f"{path} has no {skills.SKILL_FILE}, and none of the folders directly inside it has one"],
+                )
+            )
+        reports.extend(found)
+    for report in reports:
+        label = report.skill.name if report.skill else str(report.path)
+        typer.echo(f"{'ok' if report.ok else 'invalid'}  {label}")
+        for error in report.errors:
+            typer.echo(f"  error: {error}")
+        for warning in report.warnings:
+            typer.echo(f"  warning: {warning}")
+    invalid = sum(1 for report in reports if not report.ok)
+    typer.echo(f"{len(reports) - invalid} valid, {invalid} invalid")
+    if invalid:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
