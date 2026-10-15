@@ -40,17 +40,18 @@ ARI_BASE_URL=http://127.0.0.1:18002 python scripts/k8s_agent_live_test.py
 
 ```bash
 # From the charts repo (charts/oncallari); keys are generated in place and never written down.
+# fullnameOverride "ari": the chart adds "-k8s-*" itself (ari-k8s-api, ari-k8s-worker).
 kubectl --context $CTX create namespace ari-k8s-agent
 helm --kube-context $CTX install ari-k8s charts/oncallari -n ari-k8s-agent \
-  --set fullnameOverride=ari-k8s --set ariK8sAgent.enabled=true \
+  --set fullnameOverride=ari --set ariK8sAgent.enabled=true \
   --set ariK8sAgent.api.image.tag=$TAG --set ariK8sAgent.worker.image.tag=$TAG \
   --set ariK8sAgent.temporalHost=$TEMPORAL_HOST \
-  --set ariK8sAgent.agentPublicUrl=http://ari-k8s-k8s-api.ari-k8s-agent \
+  --set ariK8sAgent.agentPublicUrl=http://ari-k8s-api.ari-k8s-agent \
   --set ariK8sAgent.agentApiKeys="$(openssl rand -hex 24)" \
   --set ariK8sAgent.temporalPayloadEncryptionKey="$(openssl rand -base64 32)"
-kubectl --context $CTX -n ari-k8s-agent port-forward svc/ari-k8s-k8s-api 18002:80 &
-ARI_API_KEY="$(kubectl --context $CTX -n ari-k8s-agent get secret ari-k8s-k8s-secret -o jsonpath='{.data.AGENT_API_KEYS}' | base64 -d)" \
-ARI_API_DEPLOYMENT=ari-k8s-agent/ari-k8s-k8s-api ARI_API_SERVICE=ari-k8s-agent/ari-k8s-k8s-api \
+kubectl --context $CTX -n ari-k8s-agent port-forward svc/ari-k8s-api 18002:80 &
+ARI_API_KEY="$(kubectl --context $CTX -n ari-k8s-agent get secret ari-k8s-secret -o jsonpath='{.data.AGENT_API_KEYS}' | base64 -d)" \
+ARI_API_DEPLOYMENT=ari-k8s-agent/ari-k8s-api ARI_API_SERVICE=ari-k8s-agent/ari-k8s-api ARI_WORKER_DEPLOYMENT=ari-k8s-agent/ari-k8s-worker \
   python scripts/k8s_agent_live_test.py --allow-writes
 ```
 
