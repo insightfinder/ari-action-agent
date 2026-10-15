@@ -5,15 +5,16 @@ what's been verified against real infrastructure, and the history of bugs
 found and fixed along the way, see [`docs/MEMORY.md`](MEMORY.md) — that's
 the decision/verification log; this doc is just what's true today.
 
-## 0. One framework, two agent kinds
+## 0. One framework, several agent kinds
 
 This started as a single agent (the on-call agent, §1–§6 below) and has
 since been restructured into a small shared framework that any number of
-A2A-protocol agent kinds can sit on top of. Today there are two:
+A2A-protocol agent kinds can sit on top of:
 
 | Agent kind | What it does | Package |
 |---|---|---|
 | `oncall` | Clones a repo, diagnoses a bug/feature request, fixes it, opens a PR | `ari_oncall_agent/` |
+| `k8s` | Checks Pod health of the cluster it runs in; proposes and, once approved, applies Deployment scaling (replicas, or KEDA/HPA min/max on explicit request) and CPU/memory changes (explicit request only) | `k8s_agent/` |
 | `jenkins` | Reads/diagnoses a Jenkins job or build, proposes and (once confirmed) executes a change | `jenkins_agent/` |
 
 > **Where the Jenkins kind lives.** `jenkins_agent/` is on `main` like
@@ -22,6 +23,14 @@ A2A-protocol agent kinds can sit on top of. Today there are two:
 > separate `jenkins-agent` branch while it was incomplete and merged in
 > once it was finished and verified against a real Jenkins; see
 > `docs/MEMORY.md`, 2026-10-23.
+>
+> **The `k8s` kind** is documented in `docs/DEVELOPER_GUIDE.md` §10. It
+> uses no opencode and no shell: every cluster operation is a typed API
+> call (the official `kubernetes` Python client) with the worker's in-cluster ServiceAccount, and its
+> worker image (`Dockerfile.k8s`) carries no build or shell tooling. That
+> isolation is the reason it is a separate kind rather than more
+> capabilities on `oncall`: the oncall worker runs opencode's `ari-verify`
+> with open bash, which must never share a pod with a cluster-write token.
 
 **Package layout** (`src/`):
 

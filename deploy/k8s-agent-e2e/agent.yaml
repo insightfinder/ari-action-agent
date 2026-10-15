@@ -1,0 +1,101 @@
+# Temporary deployment of the `k8s` agent kind for end-to-end testing on a
+# test cluster, until the Helm chart supports this kind. Render the two
+# placeholders first (see README.md):
+#   __IMAGE_TAG__     image tag of ari-agent-api and ari-k8s-agent-worker
+#   __TEMPORAL_HOST__ Temporal frontend host:port reachable from the cluster
+# Apply docs/examples/k8s-rbac.yaml too — it defines the worker's
+# ServiceAccount and its (enumerated) permissions.
+# The Secret `ari-k8s-agent-env` (AGENT_API_KEYS,
+# TEMPORAL_PAYLOAD_ENCRYPTION_KEY) is created from environment variables,
+# never from a file in this repository.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ari-k8s-agent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ari-k8s-api
+  namespace: ari-k8s-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ari-k8s-api}
+  template:
+    metadata:
+      labels: {app: ari-k8s-api}
+    spec:
+      automountServiceAccountToken: false   # the API never talks to the cluster
+      containers:
+        - name: api
+          image: docker.io/insightfinderinc/ari-agent-api:__IMAGE_TAG__
+          command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports: [{containerPort: 8000}]
+          env:
+            - {name: AGENT_KIND, value: k8s}
+            - {name: AGENT_NAME, value: ARI Kubernetes Agent}
+            - {name: AGENT_PUBLIC_URL, value: "http://ari-k8s-api.ari-k8s-agent"}
+            - {name: TEMPORAL_HOST, value: "__TEMPORAL_HOST__"}
+            - {name: TEMPORAL_NAMESPACE, value: k8s-ari-agent}
+            - {name: TEMPORAL_TASK_QUEUE, value: k8s-ari-queue}
+          envFrom:
+            - secretRef: {name: ari-k8s-agent-env}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8000}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ari-k8s-worker
+  namespace: ari-k8s-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ari-k8s-worker}
+  template:
+    metadata:
+      labels: {app: ari-k8s-worker}
+    spec:
+      serviceAccountName: ari-k8s-agent
+      automountServiceAccountToken: true    # the worker acts with this ServiceAccount
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: docker.io/insightfinderinc/ari-k8s-agent-worker:__IMAGE_TAG__
+          env:
+            - {name: AGENT_KIND, value: k8s}
+            - {name: TEMPORAL_HOST, value: "__TEMPORAL_HOST__"}
+            - {name: TEMPORAL_NAMESPACE, value: k8s-ari-agent}
+            - {name: TEMPORAL_TASK_QUEUE, value: k8s-ari-queue}
+            - {name: SANDBOX_ROOT, value: /tmp/ari-agent-sandbox}
+          envFrom:
+            - secretRef: {name: ari-k8s-agent-env}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ari-k8s-api
+  namespace: ari-k8s-agent
+spec:
+  selector: {app: ari-k8s-api}
+  ports:
+    - {port: 80, targetPort: 8000}
