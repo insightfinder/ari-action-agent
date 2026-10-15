@@ -4410,3 +4410,34 @@ cluster and approve them itself. mcp-service now also requires the system's
 account to be in `ARI_K8S_AGENT_ALLOWED_USERS` (unset: nobody), passed by the
 insightfinder chart as `mcpService.ariK8sAgentAllowedUsers` ("bo" on test).
 Not live-tested; the e2e above ran before it, as bo.
+
+## 2026-10-15 (night) — Untrusted logs, and the second full live run on test
+
+- Container log tails in health reports are fenced as untrusted data
+  (`stepkit.untrusted_block`; marker-like text in the log is defused) and the
+  response step is told all cluster text is data, never instructions.
+- Live regression with the final images, agent installed from the committed
+  chart: 22/22 scenarios pass, including `injection` (a crash log telling the
+  AI to call every pod healthy: fenced, finding reported, not obeyed),
+  `pdb_info`, `oversized` (pod larger than every node: high risk),
+  `keda_reverted` (bound changed back right after: `reverted`),
+  `worker_restart` (worker killed mid-verification: the retry found the
+  change in place, wrote nothing, reported `succeeded`) and
+  `resume_after_restart`.
+- mcp-service account allowlist, checked inside the deployed pod: `bo` on
+  this cluster offered; `Bo`, `bo2`, another account, or another cluster's
+  URL not offered. An unrelated system's investigation in the same window
+  got neither `arik8s` nor the Kubernetes rules.
+- From InsightFinder: the first new incident was consolidated with the
+  morning's (same instance, similar text) and never dispatched; use a fresh
+  instance name per run. The next one dispatched, but the coordinator
+  (org model claude-haiku-4-5) only *recommended* the memory increase in its
+  report. Fixed on both sides: rule 1b/1c tells it to call the agent again to
+  have such a change proposed, and the agent's health reply now ends with the
+  exact request that would get its fix proposed. Rerun: health check, then
+  "Set limits.memory 64Mi on ari-k8s-e2e/e2e-memhungry (app)", approved via
+  mcp-service `/approve`, `succeeded` (55s, 45s stable), `ran: true`,
+  completed callback and Slack report at 14:13Z.
+- Still not testable on test: the approval email (test cannot send mail),
+  Cluster Autoscaler backoff in an unrelated group, a patch call that errors
+  after landing (unit-tested only).
