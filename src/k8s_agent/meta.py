@@ -106,7 +106,10 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "the reason, the current values it reports, and what an acceptable request would look like; a refusal means "
         "no change was proposed and nothing is waiting for approval, so never describe one as proposed or ready "
         "to confirm. For a health check, include each flagged workload's configured requests and limits "
-        "(container_resources), since a follow-up change has to name a value against them. Never print anything "
+        "(container_resources), since a follow-up change has to name a value against them, and when a finding "
+        "is one this agent can change (an OOM kill at a memory limit, CPU throttling, too few replicas), end "
+        "with the exact request that would get it proposed, e.g. 'To have it proposed, ask: set the memory "
+        "limit of container app in deployment X (namespace Y) to <value>'. Never print anything "
         "that looks like a "
         "credential"
     ),
