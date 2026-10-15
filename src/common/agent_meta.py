@@ -27,6 +27,7 @@ from .settings import get_settings
 _AGENT_PACKAGES = {
     "oncall": "ari_oncall_agent",
     "jenkins": "jenkins_agent",
+    "k8s": "k8s_agent",
 }
 
 
