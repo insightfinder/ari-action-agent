@@ -4402,3 +4402,11 @@ mcp-service's `/approve` (test still cannot email approvals); applied,
 completed callback and the Slack report at 11:24Z. Everything was removed
 afterwards (helm release, namespaces, Temporal namespace, mcp-service
 restored by Flux, Detected incidents off again).
+
+**After the commit security review:** mcp-service offered `arik8s` to any
+system whose card named this cluster's URL, and that URL is whatever a
+tenant types, so another tenant could have changes proposed against our own
+cluster and approve them itself. mcp-service now also requires the system's
+account to be in `ARI_K8S_AGENT_ALLOWED_USERS` (unset: nobody), passed by the
+insightfinder chart as `mcpService.ariK8sAgentAllowedUsers` ("bo" on test).
+Not live-tested; the e2e above ran before it, as bo.
