@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from common.capabilities_base import StepContext
 
-from ..stepkit import finish, options, resolved_target
+from ..stepkit import finish, options, resolved_target, untrusted_block
 from ..tools import health_rules
 
 _FINDINGS_LIMIT = {"deployment": 40, "namespace": 40, "cluster": 30}
@@ -140,7 +140,7 @@ async def run(ctx: StepContext) -> dict:
             if finding["kind"] == "Pod" and str(finding["reason"]).startswith("CrashLoopBackOff"):
                 tail = await get_log(finding["namespace"], finding["name"], finding.get("container"), True)
                 if tail:
-                    finding["previous_log_tail"] = tail
+                    finding["previous_log_tail"] = untrusted_block(tail)
                     tails += 1
 
     bounded, omitted = health_rules.sort_and_bound(findings, _FINDINGS_LIMIT[scope])
