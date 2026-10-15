@@ -1,10 +1,11 @@
 # Developer Guide — calling the ARI agents over A2A
 
-There are two agent kinds on this codebase today, each its own A2A server
-deployment with its own base URL and Agent Card: the **on-call agent**
-(§1–§8 below — clones a repo, fixes it, opens a PR) and the **Jenkins
-agent** (§9 — reads/diagnoses a Jenkins job or build, proposes and, once
-confirmed, executes a change). Both are genuine
+Each agent kind on this codebase is its own A2A server deployment with
+its own base URL and Agent Card: the **on-call agent** (§1–§8 below —
+clones a repo, fixes it, opens a PR), the **Kubernetes agent** (§10 —
+checks Pod health, and proposes and, once approved, applies scaling and
+CPU/memory changes), and the **Jenkins agent** (§9 — deprecated: no longer
+maintained or deployed, kept for reference). All are genuine
 [A2A (Agent2Agent) protocol](https://a2a-protocol.org) servers, built on
 the official [`a2a-sdk`](https://pypi.org/project/a2a-sdk/) (a Linux
 Foundation project), serving both the **JSON-RPC** and **REST/HTTP+JSON**
@@ -422,3 +423,132 @@ pip install httpx
 JENKINS_BASE_URL=https://jenkins.example.com JENKINS_USER=... JENKINS_TOKEN=... \
   ANTHROPIC_API_KEY=sk-ant-... python docs/examples/jenkins_sample_client.py propose
 ```
+
+## 10. The Kubernetes agent (`k8s` kind)
+
+A separate deployment with its own base URL and Agent Card
+(`skills[0].id == "kubernetes_ops"`, name "Kubernetes Health & Scaling"),
+using the same `message/send` operation and response patterns as §3. It
+acts on **the cluster it runs in**, with its worker's own ServiceAccount —
+a request never carries cluster credentials.
+
+### What it does
+
+- **Health checks** (read-only, never paused): Pod-level findings for a
+  Deployment, a namespace or the whole cluster — crash loops with the
+  previous container's termination reason (OOMKilled vs a failing probe),
+  image pull failures, unschedulable pods, restarts, warning events, usage
+  near limits — plus the gaps it could not check. Artifact: `health_report`.
+- **Changes**, always proposed first and applied only after approval:
+  - replica count of a Deployment that no autoscaler manages;
+  - min and/or max of the KEDA ScaledObject or HPA that manages a
+    Deployment — **only when the request names the autoscaler and the
+    values** (a plain "scale X to 5" on a managed Deployment is refused,
+    with its current min/max);
+  - CPU and/or memory requests/limits of one container — **only the fields
+    the request states values for**.
+
+  Never below 1 replica. Targets above `options.high_replica_threshold`
+  (default 50) are proposed with `risk_tier: critical`. CPU/memory values
+  above what one eligible node can give the container (allocatable minus
+  DaemonSet requests, minus `options.node_headroom_ratio`, default 20%,
+  minus the requests of the pod's other containers; CPU and memory taken
+  from the same node, since the pod has to fit on one) are **clamped**,
+  and the proposal lists `requested -> applied`. A new pod larger than
+  every eligible node is a `high` risk: adding nodes of the current
+  instance types cannot run it.
+
+### Config `DataPart` shape
+
+```json
+{
+  "llm": {"provider": "anthropic", "api_key": "...", "model": "..."},
+  "options": {
+    "namespace": "shop",
+    "high_replica_threshold": 50,
+    "node_headroom_ratio": 0.2,
+    "include_logs": true
+  }
+}
+```
+
+`src/k8s_agent/schemas.py` documents the same shape.
+
+### The approval round trip
+
+1. `message/send` "scale checkout to 5 replicas" → the task ends in
+   `TASK_STATE_INPUT_REQUIRED` with a `pending_action` artifact: `id`,
+   `action` (`scale_replicas` | `set_autoscaler_bounds` | `set_resources`),
+   `action_name` (the line an approval email shows), `before`/`after`,
+   `clamped`, `risk_tier`, `risks`, `capacity_outlook`, the server-side
+   `dry_run` result, `drift_notice`, `persistence`, and a `snapshot` of
+   the target at proposal time.
+2. Approve: a second `message/send` with the same `task_id`/`context_id`
+   whose config `DataPart` repeats `llm` and adds
+   `"confirm_pending_action": {"id": "<pending_action.id>"}`. Decline:
+   `POST /tasks/{id}:cancel`.
+3. The agent re-reads the target; if anything changed since the proposal
+   it refuses and nothing is applied, unless the target already holds the
+   approved values (a retried step whose first attempt wrote them), in
+   which case it skips the write and verifies. It writes at most once and
+   verifies from cluster state; new pods must also stay up without a
+   restart for 45 s after the rollout looks done. A
+   `ProgressDeadlineExceeded` left over from a rollout that was already
+   stuck before the change is not this change's verdict. An autoscaler
+   change is verified by the Deployment moving inside the new bounds and
+   the autoscaler still holding them afterwards. Artifact
+   `action_result` carries `ran: true` (every result means the change is
+   in place) and `status`, one of `succeeded`, `in_progress` (the rollout
+   outlived the wait window — not a failure), `new_pods_failing`,
+   `rollout_failed`, `unschedulable` (with
+   `verification.scheduling.cause`: `node_provisioning_failed` when
+   Cluster Autoscaler could not add a node for these pods, e.g. an EC2
+   quota; `autoscaler_cannot_help`; or `failed_scheduling`), `reverted`
+   (the autoscaler's bounds were changed back, e.g. by a GitOps
+   reconcile), or `verification_unavailable` (applied, but the rollout
+   could not be checked). Every value in a proposal must be stated in the
+   quote the model extracted it from ("3 replicas" cannot back 2024).
+
+A request the agent will not act on completes normally with a `refusal`
+artifact (`reason`, plus e.g. the autoscaler's current bounds or the
+candidate Deployments) — nothing is proposed or changed.
+
+### Lasting changes
+
+Everything is deployed through Flux, so a direct change is temporary.
+`drift_notice` says how long it will last (a Kustomization reverts it at
+the next reconcile; a Helm release at its next upgrade, with how often it
+has been upgraded lately). `persistence` says where it would have to be
+changed in Git — read live from the cluster's own Flux objects
+(HelmRelease → Kustomization → source), never assumed, and stamped with
+the commit it was read at. The agent never writes to Git.
+
+`persistence` is shaped to be handed to whoever writes the Git change,
+including a code agent the on-call coordinator calls next:
+
+- `git` — `host`, `repo_slug` (`owner/repo`), `https_url`, `branch`,
+  `commit`, derived from the GitRepository so a caller never parses
+  `ssh://git@…` URLs or `main@sha1:…` revisions (None for OCI/Bucket).
+- `helmrelease.values_sources` — in Flux's merge order, each with
+  `target_path`; `values_precedence` states the rule (later `valuesFrom`
+  overrides earlier, inline `spec.values` overrides all).
+- `helmrelease.chart_source.url` — where the chart comes from, for looking
+  up the values key when no values file sets it yet. Optional: an
+  unreadable source sets `read_error` and the chain carries on.
+- `ready_to_persist` / `readiness_reason` — false in a proposal; in an
+  `action_result`, true only when `status` is `succeeded`.
+- `instruction` — the same in one sentence; `changes` — the rendered
+  fields, `{object, field, from, to}`, with the applied (clamped) value.
+  Values are manifest strings (`"2"`, `"6Gi"`): protobuf would otherwise
+  turn a replica count into `2.0` on the way through A2A.
+
+### Deployment
+
+Worker image `ari-k8s-agent-worker` (`Dockerfile.k8s`, no shell tooling),
+API image `ari-agent-api` with `AGENT_KIND=k8s`. RBAC:
+`docs/examples/k8s-rbac.yaml` (enumerated, no Secrets, no exec, no
+create/delete). Set `TEMPORAL_PAYLOAD_ENCRYPTION_KEY` so request LLM keys
+are encrypted in Temporal history. A temporary test-cluster deployment
+and fixtures: `deploy/k8s-agent-e2e/`; live scenarios:
+`scripts/k8s_agent_live_test.py`; sample client:
+`docs/examples/k8s_sample_client.py`.

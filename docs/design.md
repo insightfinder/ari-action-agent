@@ -5,28 +5,29 @@ what's been verified against real infrastructure, and the history of bugs
 found and fixed along the way, see [`docs/MEMORY.md`](MEMORY.md) — that's
 the decision/verification log; this doc is just what's true today.
 
-## 0. One framework, two agent kinds
+## 0. One framework, several agent kinds
 
 This started as a single agent (the on-call agent, §1–§6 below) and has
 since been restructured into a small shared framework that any number of
-A2A-protocol agent kinds can sit on top of. Today there are two:
+A2A-protocol agent kinds can sit on top of:
 
 | Agent kind | What it does | Package |
 |---|---|---|
 | `oncall` | Clones a repo, diagnoses a bug/feature request, fixes it, opens a PR | `ari_oncall_agent/` |
-| `jenkins` | Reads/diagnoses a Jenkins job or build, proposes and (once confirmed) executes a change | `jenkins_agent/` |
+| `k8s` | Checks Pod health of the cluster it runs in; proposes and, once approved, applies Deployment scaling (replicas, or KEDA/HPA min/max on explicit request) and CPU/memory changes (explicit request only) | `k8s_agent/` |
+| `jenkins` | **Deprecated** — no longer maintained or deployed. Reads/diagnoses a Jenkins job or build | `jenkins_agent/` (on the `jenkins-agent` branch only) |
 
-> **Where the Jenkins kind lives.** `jenkins_agent/` is *not* on `main`,
-> `test` or `staging` — it is developed and released from its own
-> `jenkins-agent` branch, which builds `ari-jenkins-agent-worker` from its
-> own copy of `.github/workflows/docker-build-push.yml`. The two kinds
-> ship on independent cadences and the on-call agent's pull requests stay
-> reviewable without an unrelated agent's diff in them. Everything §0
-> describes about the framework still holds: the split is in release
-> management, not in the design, and nothing in `common/` knows about it.
-> The rest of this document (§3's tables, §5b, §7) describes both kinds as
-> one codebase, which is what you see once the `jenkins-agent` branch is
-> checked out.
+> **The `k8s` kind** is documented in `docs/DEVELOPER_GUIDE.md` §10. It
+> uses no opencode and no shell: every cluster operation is a typed API
+> call (the official `kubernetes` Python client) with the worker's in-cluster ServiceAccount, and its
+> worker image (`Dockerfile.k8s`) carries no build or shell tooling. That
+> isolation is the reason it is a separate kind rather than more
+> capabilities on `oncall`: the oncall worker runs opencode's `ari-verify`
+> with open bash, which must never share a pod with a cluster-write token.
+>
+> **The Jenkins kind** was released from its own `jenkins-agent` branch and
+> is now deprecated. Parts of this document (§3's tables, §5b, §7) still
+> describe it alongside `oncall`; read those as history.
 
 **Package layout** (`src/`):
 

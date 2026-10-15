@@ -3961,3 +3961,444 @@ image on the bastion, branch code mounted:
 AWS skill (the test worker has no AWS credentials or `boto3`).
 
 **Verified:** Windows 466 passed; Linux 616 passed in the worker image.
+
+## 2026-10-13 — A Kubernetes agent kind (II-25173): health checks and approved scaling, in the cluster it runs in
+
+New agent kind `k8s` (`src/k8s_agent/`, `configs/k8s/`, `Dockerfile.k8s`).
+It checks Pod-level health and proposes — and, after a person approves,
+applies — Deployment replica changes, KEDA/HPA min/max changes and
+CPU/memory changes. What follows is what someone extending it needs and
+cannot read off the code.
+
+### Decisions (with the user, 2026-10-13)
+
+- **A separate kind, not more capabilities on `oncall`.** The oncall worker
+  runs opencode's `ari-verify` with open bash; a ServiceAccount token with
+  cluster write access in that pod could be read by any shell command and
+  used to bypass the approval gate. `confirm_capability` is also a single
+  name per kind (`publish_pr` for oncall). The only `common/` change is the
+  one `_AGENT_PACKAGES` line ARCHITECTURE.md §3.2 prescribes.
+- **In-cluster ServiceAccount only**, one agent per cluster, no kubeconfig
+  fallback, no credential in any request. All agents deploy only on
+  Kubernetes. The Jenkins kind is deprecated.
+- **No opencode, no shell**: typed calls through the official `kubernetes`
+  Python client (v37, kubernetes-client/python). lightkube 1.0.1 was used
+  first and replaced the same day at the user's request: this runs in
+  production, and lightkube 1.0 was two months old and pulls in the
+  brand-new `httpx2`. The official client is synchronous, so
+  `tools/client.py:Kube` runs every call in `asyncio.to_thread` and exposes
+  dict-in/dict-out `get/list/patch/pod_log` by kind name — the only surface
+  the rest of the package (and the tests' fake) depends on. v37's generated
+  methods pick the *first* JSON content type for a patch, which is
+  json-patch, so every patch passes `_content_type` explicitly
+  (merge-patch for scale/autoscalers, strategic-merge for container
+  resources).
+- **"Managed" means KEDA- or HPA-managed.** A plain "scale X to N" on a
+  managed Deployment is refused with the autoscaler's current bounds; its
+  min/max change only when the request names the autoscaler and the values
+  (`policy.mentions_autoscaler` + a verbatim quote check). Never below 1.
+  KEDA-generated `keda-hpa-*` HPAs are never patched.
+- **CPU/memory**: four independent fields, only the ones with a stated value.
+  Values above the node cap — best eligible node's allocatable minus its
+  DaemonSet requests, times (1 − headroom 0.2) — are **clamped**, and the
+  proposal and result carry `requested` and `applied`.
+- **Every change needs approval; > 50 replicas gets one approval, flagged
+  `critical`.** A second approval for > 50 was designed, then dropped (see
+  below).
+- **Git is never written.** `persistence` is derived live from the cluster's
+  own Flux objects (labels → HelmRelease → Kustomization → source), with no
+  repository, path or chart convention hard-coded
+  (`test_no_gitops_repository_or_org_is_hardcoded` enforces it), and never
+  reads values ConfigMaps or inline values (test's values ConfigMap holds
+  plaintext secrets).
+- **Nothing secret leaves**: reads are reduced to whitelisted views
+  (`tools/views.py` drops `env`/`args`/`command`/volumes and every annotation
+  but ownership/KEDA-paused), and every capability result passes through
+  `tools/redact.py` before it becomes a step result, so `respond`, the A2A
+  artifacts and Temporal history only see scrubbed data.
+  `test_no_canary_reaches_any_result_or_prompt` plants one value in env,
+  last-applied, inline Helm values, a Git URL, a log line and an event, and
+  checks results and every LLM prompt.
+
+### Why there is no second approval for > 50 replicas
+
+mcp-service's `pending_action_id()` (`app/a2a/client.py`) confirms **the
+first** artifact carrying an `id`, and `common/a2a_server/executor.py`
+publishes artifacts with SDK-generated ids, so a second proposal is
+appended after the first rather than replacing it. A two-pause flow would
+have mcp-service re-confirm the first proposal forever (fail-safe — nothing
+executes — but never completes). Options were a one-line mcp-service fix,
+reading prior workflow runs from Temporal, or a single approval; the user
+chose a single approval with `risk_tier: critical` and an
+`[HIGH REPLICA COUNT > 50]` prefix on `action_name`. If a second pause is
+ever wanted, fix `pending_action_id()` first.
+
+### Verified read-only on the test cluster (2026-10-13)
+
+- Helm-rendered Deployments carry `app.kubernetes.io/managed-by: Helm`,
+  `meta.helm.sh/release-*` and `helm.toolkit.fluxcd.io/name|namespace`; the
+  HelmRelease carries `kustomize.toolkit.fluxcd.io/name|namespace`; the
+  Kustomization's `spec.sourceRef` resolves to a GitRepository. The whole
+  persistence chain resolves.
+- helm-controller v1.6.3 owns `spec.replicas` and `resources` of the app
+  Deployments via server-side apply; the `insightfinder` release was
+  upgraded five times in about two hours by image automation — a direct
+  change there usually lasts minutes to hours. stg's helm-controller v1.3.0
+  owns the same fields via Update (Helm 3 three-way merge). No
+  `driftDetection` on either.
+- KEDA operator and `scaledobjects.keda.sh` CRD, metrics-server and Cluster
+  Autoscaler are installed; `kube-system/cluster-autoscaler-status` is the
+  YAML format (per-group `maxSize`, `cloudProviderTarget`, `backoffInfo`).
+  A ScaledObject on stg had no `scaleTargetRef.kind` (KEDA defaults it to
+  Deployment — handled).
+- InsightFinder Java services: startupProbe `60s + 10×10s`, readiness 60s
+  delay, `progressDeadlineSeconds: 600` — hence verification waits on the
+  Deployment's own rollout semantics, bounded by `progressDeadlineSeconds +
+  60`, instead of a fixed timeout.
+- Nodes are t3/t3a.2xlarge (allocatable 7910m / ~30Gi); one carries a
+  `role` taint, which the node-cap calculation must respect.
+
+### Things that are easy to get wrong
+
+- Crash-loop logs are read with `previous=True` — the crashed container's
+  log is the one that explains a crash loop, not the restarting one.
+- Integers come back as floats after the A2A artifact round trip
+  (`ParseDict` into a protobuf `Value`); `apply_approved_change._int`
+  normalises them. Tests feed confirmations through the same round trip
+  (`k8s_fixtures.a2a_round_trip`), not `json.dumps`.
+- The pre-apply staleness check compares only what the approved change
+  depends on, never the Deployment's `generation`: image automation bumps
+  it several times an hour on test, which would have refused nearly every
+  approval inside the 3-hour window.
+- In tests, a fake that never completes a rollout makes `wait_rollout` run
+  its full window (660s real time). Use the fake's `auto_rollout` or patch
+  `time.monotonic`; never leave an apply test on the real clock.
+
+**Verified:** full suite on a local Python 3.12 venv (Docker daemon was not
+running): **426 passed**, of which 100 are new (`test_k8s_rules.py`,
+`test_k8s_capabilities.py`, `test_k8s_workflow.py` — the latter runs the
+real workflow and activities on Temporal's test server: propose → pause →
+confirm → apply). Manifests validated with kubeconform.
+### Live run on the test EKS, same day
+
+Deployed from `deploy/k8s-agent-e2e/` (temporary images `*-ii25173`, a
+temporary Temporal namespace `k8s-ari-agent`), then everything removed
+again. No LLM key was available, so the LLM's extraction step was replaced
+by a scripted stand-in run inside the worker pod; everything else was real
+— in-cluster ServiceAccount, RBAC, dry-runs, patches, rollout waiting, the
+A2A protobuf round trip of the approval data.
+
+**Verified live:** reads, KEDA/HPA detection, CA status and the full Flux
+chain (resolved to the real test-fluxcd commit); dry-runs of all three
+actions leave the object unchanged; RBAC denies reading Secrets and
+deleting pods; health check finds the crash loop (with redacted log), the
+OOM kill and the image-pull failure; refusals (KEDA/HPA-managed, scale to 0,
+limit below request, autoscaler not explicitly named); proposals for 51
+replicas (`critical`), a clamped 64-CPU request (cap 6008m on t3.2xlarge
+after DaemonSets and 20% headroom), a Helm-labelled Deployment whose chain
+breaks; applied and verified: replicas 2→3→2, KEDA max 3→4→3, HPA min
+1→2→1, and a memory change on a 150-second-startup fixture (waited 331s
+for both pods, no false timeout); a stale approval (replicas changed by
+hand after the proposal) is refused with nothing applied; agent card, API →
+Temporal → worker path, and wrong-key rejection.
+
+**Three defects only the live run could show, all fixed:**
+1. When the previous container's log is gone, the kubelet answers **HTTP
+   200** with "unable to retrieve container logs for containerd://…". That
+   text was being reported as the crash log; `read.get_pod_log` now treats
+   it as missing and falls back to the current (just-terminated) container,
+   which still holds the crash output.
+2. Redaction ran twice (on read, and on the step result) and the second
+   pass turned `password=[REDACTED]` into `[REDACTED]]`. Redaction is now
+   idempotent.
+3. A Deployment named `e2e-hpa` made "let e2e-hpa go up to 10" count as an
+   explicit autoscaler request. The target's own names are now removed
+   before the keyword check.
+
+**Shared behaviour noticed, not changed (it is in `common/`, same for
+oncall):** a wrong `x-api-key` is rejected, but the A2A SDK surfaces the
+401 as HTTP 500; and a planning failure's message carries the provider's
+error text, which for OpenAI includes a masked form of the rejected key
+(first/last characters).
+
+**Not verified live:** the LLM's own extraction and planning (no key), and
+a real Cluster Autoscaler scale-up or quota failure (would add a paid node;
+covered by unit tests with real CA status samples).
+
+**Still to do outside this repo:** a Helm chart for this kind (API +
+worker Deployments, the RBAC in `docs/examples/k8s-rbac.yaml`, worker
+`automountServiceAccountToken: true`, `TEMPORAL_PAYLOAD_ENCRYPTION_KEY`
+from a Secret) before any non-test deployment.
+
+## 2026-10-14 — The k8s persistence hint is a hand-off contract for a GitOps PR
+
+**What.** `persistence` (in `pending_action` and `action_result`) gained
+`git` (`repo_slug`, `https_url`, `branch`, `commit`), per-source
+`target_path` and `values_precedence`, `chart_source.url`, and
+`ready_to_persist` / `readiness_reason`. RBAC adds read on
+`source.toolkit.fluxcd.io/helmrepositories` (the chart source).
+
+**Why.** The intended next step after a direct change is a pull request to
+the Flux repo, written by a code agent that the on-call coordinator
+(mcp-service `OnCallInvestigationWorkflow`) calls. The coordinator only
+sees artifacts as rendered JSON (`render_task`), and the code agent only
+gets a repo from the system's `github_repositories` allow-list, matched by
+`owner/repo`. On test the main `insightfinder` HelmRelease merges 15
+`valuesFrom` keys, so without the merge order a correct-looking edit can
+land in a file a later source overrides; and when no values file sets the
+key yet, only the chart says what the key is.
+
+**Verified on the test cluster (2026-10-14),** in the worker pod with its
+own ServiceAccount and the enumerated RBAC (LLM extraction stubbed): the
+chain for the real `insightfinder-appserver` and `ari-oncall-worker`
+(read-only) resolves to `git.repo_slug` `insightfinder/test-fluxcd`,
+branch `main`, the applied commit, and the chart source URL read through the
+new `helmrepositories` grant; a fixture labelled as part of the real
+`insightfinder` HelmRelease was scaled 1→2→1 through propose/apply, with
+`ready_to_persist` false on the proposal and true on the `succeeded`
+result; no URL userinfo in any output. All test resources were deleted.
+
+**Found live, fixed:** after the A2A protobuf round trip `changes[].from/to`
+read `1.0 → 2.0` (protobuf `Value` has only doubles), which a code agent
+would copy into YAML as `replicas: 2.0`. `changes` values are now manifest
+strings (`"1" → "2"`, `"6Gi"`).
+
+**Not done here (mcp-service side, separate work):** the k8s agent is not
+registered as an on-call agent; coordinator rule 3a tells a code agent to
+make no change when the cause is configuration or infrastructure, which
+forbids exactly this PR; the Flux repo would have to be in the
+allow-list with a PAT that can push; and the oncall `verify` step looks for
+a build, which a YAML-only repo does not have.
+
+## 2026-10-14 — Live run with a real LLM: 13/13 scenarios after one fix
+
+**What.** `scripts/k8s_agent_live_test.py --allow-writes` against the agent
+deployed on the test EKS (API → Temporal → worker, in-cluster
+ServiceAccount, the enumerated RBAC), with a real Anthropic model doing
+planning, target resolution and change extraction. Passed: agent card;
+health (crash loop, OOM kill, image pull); refusals (KEDA/HPA-managed
+replicas, scale to 0, limit below request); clamp (64 CPU → 6008m);
+51 replicas proposed as `critical`; drift notice; and approved, applied,
+verified changes: replicas 2→3, KEDA max 3→4, HPA min 1→2, a memory change
+on the slow-start fixture (waited 336s, no false timeout), and the new
+`persist` scenario (a fixture labelled into the real `insightfinder`
+HelmRelease: `git.repo_slug` `insightfinder/test-fluxcd`, chart source URL,
+`changes` `"1" → "2"`, `ready_to_persist` false on the proposal and true on
+the result). No canary leak anywhere. Everything was deleted afterwards
+(both namespaces, RBAC, the temporary Temporal namespace).
+
+**Found live, fixed:** the first `health` run missed the crash loop. Between
+two restarts the kubelet shows the container that just exited as
+`terminated` (reason `Error`) for a few seconds before it reports
+`CrashLoopBackOff`; the rule reported that as a `warning` "Error". A
+terminated container with a non-zero exit and at least one restart is now
+the same critical `CrashLoopBackOff (<reason>)` finding (and gets the
+previous-log tail). Unit-tested for both windows; the three live reruns
+after the fix happened to land in the `CrashLoopBackOff` window, so the
+`terminated` window itself is covered by the unit test only.
+
+**Not exposed:** test's `test-temporal.insightfinder.com` is the Temporal
+Web UI (HTTPRoute → `temporal-web:8080`, Traefik basic auth), not the gRPC
+frontend; a client connect there gets 401. Local access to Temporal still
+needs a port-forward.
+
+## 2026-10-14 — End to end from InsightFinder: incident → on-call → k8s agent → approval → change
+
+**What ran (test).** The k8s agent was wired into the ARI on-call path in
+mcp-service (branch `II-25173-k8s-agent-oncall`, uncommitted): agent
+`arik8s` (`config/agents/arik8s.yaml`), offered on `general_support` only
+for a system whose Kubernetes agent card sets `kubernetes_url`, and called
+only when that URL is the cluster the agent serves
+(`ARI_K8S_AGENT_CLUSTER_URL`). On test.insightfinder.com (account bo): a log
+project with an `incidentlist` keyword (`OOMKilled`) in a new system, the
+Kubernetes card (test EKS API URL; token unused), "Detected incidents" on,
+then one synthetic log line naming deployment `e2e-oom`. IC created the
+incident, held it for its 1800 s root-cause wait, dispatched it; the
+coordinator called the k8s agent (health check, then "set the memory limit
+... to 256Mi"); the proposal paused, IC recorded the approval request
+("Set limits.memory 256Mi on ari-k8s-e2e/e2e-oom (app)"); after approval the
+change was applied (32Mi → 256Mi), the investigation completed and IC sent
+the report as a Slack DM. Dev images were run by excluding the
+`insightfinder` HelmRelease from its Kustomization
+(`kustomize.toolkit.fluxcd.io/reconcile: disabled`) and suspending it — a
+plain suspend was undone within minutes when the `apps` Kustomization
+re-applied the object. Everything was restored and deleted afterwards.
+
+**Found live, fixed in this repo:**
+1. A coordinator asking to "propose an increase" without a value was refused
+   (by design), but the reply said a 512Mi change was "ready for
+   confirmation". The respond note now says a refusal proposes nothing, and
+   the refusal carries the current replicas/resources and an example request.
+2. The health report did not show configured requests/limits, so nobody
+   could name a concrete value. It now has `container_resources` for the
+   workloads with findings.
+3. A memory change was reported `succeeded` after 10 s while the new pod
+   kept OOM-crashing (a container that is killed at its limit is ready for a
+   few seconds after each start). New pods must now stay up without a
+   restart for 45 s (`rollout.STABILITY_SECONDS`); re-run live: the same
+   change is now `new_pods_failing` with "OOMKilled (exit code 137)".
+4. A pod that restarts often but is running at the moment was reported only
+   as `FrequentRestarts`; it is now `FrequentRestarts (<last reason>)`.
+
+**Environment facts (test, 2026-10-14):** approval email is not delivered
+(`EmailNative: Configuration is not correct for sending the email,
+Platform: AWS, Version: TEST`), so the single-use approve link never
+reaches anyone; the test approval was sent to mcp-service's
+`/api/v1/tasks/{id}/approve` (the call IC's approval page makes). The
+Temporal gRPC frontend has no ingress (`test-temporal.insightfinder.com` is
+the Web UI). The test cluster's own telemetry goes to stg, not test.
+
+**Not done / follow-ups:** cross-cluster routing (a stg system watching
+test pods) is refused, not routed; IC's Kubernetes card still requires an
+unused token; a k8s change has no URL so it is absent from IC's digest
+action list (it is in the report text).
+
+
+## 2026-10-15 — k8s agent review fixes, and the k8s kind after the Agent Skills merge
+
+Merged `origin/test` (chat gateway, `ari` CLI, Agent Skills) into the
+II-25173 branch; conflicts were only in `README.md`, `docs/MEMORY.md` and
+`pyproject.toml` (wheel packages now list `k8s_agent` with `chat_gateway`
+and `ari_cli`).
+
+**Agent Skills and the k8s kind.** `common/planner.py` now offers every
+kind's planner the discovered skills (`available_skills`), but only the
+oncall kind registers `run_skill`. A k8s plan naming `run_skill` would have
+failed `plan_task` on an unknown capability, and skill scripts have no
+business on a worker holding cluster-wide patch rights. Two guards, both
+outside `common/`: `Dockerfile.k8s` sets `SKILLS_ENABLED=false`, and
+`k8s_agent/meta.py`'s plan policy keeps only `find_workload`,
+`check_health` and `propose_change` (a test pins that list to
+`configs/k8s/capabilities.yaml`).
+
+**Review fixes** (each with a test that fails on the old code):
+- `rollout.assess` reported `rollout_failed` from a `ProgressDeadlineExceeded`
+  left over from before the change, which is exactly the stuck Deployment a
+  resource fix gets approved for. It now trusts the condition only once the
+  controller has observed the patched generation and the condition was
+  updated after the change (views now keep conditions' `last_update`).
+- `check_health` matched events and flagged workloads by name prefix, so
+  `api` picked up `api-gateway`'s events. Pods are now mapped to their
+  Deployment through the ReplicaSet owner and `pod-template-hash`; events
+  match the Deployment, its listed Pods, or generated names in Kubernetes'
+  vowel-free safe-encoding alphabet.
+- `find_workload`'s verbatim-name shortcut no longer fires when the prompt
+  uses that name for a namespace ("the cert-manager namespace",
+  "namespace cert-manager", "-n cert-manager", "命名空间"); the model decides.
+- The plan policy now puts `find_workload` before `check_health` too, as
+  its docstring always claimed.
+- `capacity.resource_cap` subtracts the pod's other containers' requests
+  (sidecars) and takes CPU and memory from one node. A per-pod request
+  larger than every eligible node is now a `high` risk instead of "stays
+  Pending until Cluster Autoscaler adds nodes".
+
+Known gap, not fixed: a Deployment whose selector has only
+`matchExpressions` gives `list_pods` no label selector, so a deployment-scope
+health check reads every pod in the namespace (and their events). Rare on
+EKS workloads, which use `matchLabels`.
+
+`poetry.lock` is stale against `pyproject.toml` (`poetry check --lock`
+fails); that is already true on `origin/test` itself, so it is not from
+this merge. Images build with `pip install .` and are unaffected.
+
+Not re-run on a live cluster; all of the above is covered against the fake
+API server (678 passed, 7 skipped: the `ari` CLI tests, which need `typer`
+and `pexpect` from the `cli` extra).
+
+**Chart (`charts` repo, `II-25173-k8s-agent-chart`).** The k8s API now gets
+the same task store volume as the on-call API (`ariK8sAgent.persistence.taskStore`,
+1Gi RWO PVC `<fullname>-k8s-task-store` at `/var/lib/ari-agent/tasks`,
+`TASK_STORE_ROOT` in the Secret, `strategy: Recreate`). Without it a proposal
+waiting for approval (up to mcp-service's 25-minute approval timeout) is lost
+whenever the API restarts, and the shared `ari-agent-api` image is redeployed
+on every build; the approval then fails closed ("Could not find a pending
+action") and nothing is applied. The worker no longer sets `command:`, which
+had replaced the image's tini entrypoint so SIGTERM was ignored and every
+rollout ended in SIGKILL. Checked with `helm lint` and a server-side dry run
+against test EKS. Still open: the test-fluxcd release carries placeholders,
+and mcp-service offers `arik8s` for systems whose cluster URL does not match.
+
+**Keeping the existing agents untouched** (checked 2026-10-15):
+- `kubernetes` is now the `k8s` extra, installed only by `Dockerfile.k8s`
+  (`pip install ".[k8s]"`). With it out of the base dependencies,
+  `uv pip compile pyproject.toml` resolves exactly what `origin/test`
+  resolves, so the shared `ari-agent-api` image and the oncall worker get
+  the same packages as before. The API process never imports `kubernetes`,
+  even as the k8s kind (imported `api.main` with `AGENT_KIND=k8s` in a venv
+  without it). The k8s test modules `importorskip("kubernetes")`, so a
+  `.[dev]` checkout without the extra runs 544 passed / 10 skipped.
+- The only line in `src/common/` is the `_AGENT_PACKAGES` registration.
+- `charts/oncallari`: `helm template` of the ari-oncall and ari-action
+  releases with their test-fluxcd values (and with defaults, and with the
+  shared Ingress on) renders byte-for-byte as before apart from the chart
+  version label.
+- mcp-service: the coordinator's Kubernetes rules are added only when
+  `arik8s` is offered; without it every addendum variant equals the one on
+  `origin/test`.
+- test-fluxcd: adding the `k8s-ari-agent` Temporal namespace only adds a
+  step to the namespace-creation Job (describe-or-create); the Temporal
+  server Deployments and ConfigMaps render unchanged.
+
+## 2026-10-15 (evening) — Second full review, fixes, and a chart-based live run on test
+
+Three parallel reviews (this repo; mcp-service + helm-charts; charts +
+test-fluxcd), then fixes, then a live run with the agent installed from the
+branch chart (`helm install ari-k8s charts/oncallari`, namespace
+`ari-k8s-agent`) and mcp-service swapped to the branch image.
+
+**Fixed here** (each with a test that fails on the old code):
+- *An applied change could be reported as "nothing was executed".*
+  `apply_approved_change` patched, then `wait_rollout` (or the Flux read)
+  could raise, or the worker could die; the step had one attempt and no
+  `action_result`, so `respond` stated NOTHING WAS EXECUTED while the change
+  was live. Now: everything after the patch is caught
+  (`verification_unavailable`, applied); a patch call that errors is judged
+  by re-reading the target; and a retried attempt that finds the approved
+  values already in place skips the write and verifies. With that, the step
+  retries once (`max_attempts: 2`) without ever writing twice.
+- *The quote did not have to state the value.* "3 replicas" could back 2024,
+  "2Gi" could back 20Gi. `policy.quote_in_prompt` now also requires the
+  quote to state the extracted value (same integer, or the same quantity in
+  any spelling: "2 GiB" = 2Gi, "0.5 cores" = 500m).
+- *A capacity clamp could produce 0* (other containers' requests eat the
+  node); now refused.
+- *Unrelated Cluster Autoscaler trouble stopped verification.* A GPU group in
+  backoff, or a FailedScaleUp for another pod, made a CPU Deployment's
+  rollout `unschedulable`. `classify_pending` now counts only CA events on
+  the workload's own pending pods (and a backoff only when CA acted for
+  them); a backoff at proposal time is a medium risk, not high.
+- *Autoscaler changes were never verified.* A lowered max reported success
+  at once; now the Deployment must move inside both bounds, and the
+  autoscaler is re-read afterwards (`reverted` if a reconcile restored it).
+- `action_result.ran: true`, which UIE's on-call Slack summary reads (it
+  printed "did not run" for an applied k8s change).
+- Smaller: generated-name hashes are 6-10 characters (`api-grpc` is not
+  `api`'s); a namespace is preferred only where the prompt uses it as one
+  (a namespace called `it`); PDBs match template labels and are reported as
+  not blocking a scale-down (ReplicaSet deletions are not evictions).
+
+**Not fixed, recorded:** several proposals on one A2A task stay approvable
+(only reachable through the new chat gateway continuing a task; the on-call
+path opens a task per call); an autoscaler word in a negation still counts
+as asking for an autoscaler change; the patch carries no resourceVersion
+precondition (a millisecond window).
+
+**Live run on test (2026-10-15 18:25-18:47, real LLM):** 17/17 scenarios
+pass, including the new ones: `health_prefix` (e2e-web vs e2e-web-gateway),
+`clamp_sidecar` (cap minus the proxy's 256Mi), `fix_stuck` (e2e-memhungry
+stuck in ProgressDeadlineExceeded, raised to 128Mi: succeeded) and
+`resume_after_restart` (API restarted between proposal and approval; the
+task-store PVC carried the proposal and the change applied). The chart
+install showed tini as PID 1 in the worker, `SKILLS_ENABLED=false`, and the
+PVC mounted at `/var/lib/ari-agent/tasks`.
+
+**End to end from InsightFinder, same evening:** a synthetic OOMKilled log for
+`e2e-memhungry` (stuck in ProgressDeadlineExceeded) at 10:39Z; IC dispatched
+at 11:20Z with `arik8s` offered (its new availability check passed for the
+matching cluster); health check, then the proposal "Set requests.memory 64Mi,
+limits.memory 128Mi on ari-k8s-e2e/e2e-memhungry (app)"; approved through
+mcp-service's `/approve` (test still cannot email approvals); applied,
+`status: succeeded` after 55s with the 45s stability window, `ran: true`;
+completed callback and the Slack report at 11:24Z. Everything was removed
+afterwards (helm release, namespaces, Temporal namespace, mcp-service
+restored by Flux, Detected incidents off again).
