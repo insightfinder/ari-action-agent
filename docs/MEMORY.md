@@ -3489,3 +3489,475 @@ connection drops. It stopped polling `86a04bdd` at 23:31 and never came back
 once the new pod was serving 56 seconds later, reporting "lost connection
 before opening a pull request" as a final answer. Until that retries, this
 reconciler restores the task but nothing asks for the approval.
+
+## 2026-10-13 — A platform-neutral chat gateway and an `ari` CLI (II-25116, PR 1 of 5)
+
+II-25116 asks for three things on top of a cleanup: users talking to the
+agent from Slack and Teams, users talking to it from a terminal, and
+Agent Skills as the way outsiders extend it once it is open source. This
+entry covers the first slice, which the other two chat surfaces build on:
+`src/chat_gateway/` (the bridge) and `src/ari_cli/` (its first consumer).
+The plan for the whole ticket, with the cleanup list and the reasons for
+the order, lives outside the repo for now.
+
+**Nothing in the agent changed.** The gateway is a *caller* of the A2A
+surface this repo already serves, holding its own credentials and its
+own in-memory thread-to-task map, exactly as MCP Service does. The only
+pre-existing file touched is `pyproject.toml` (two packages in the wheel,
+a `cli` extra, a console script). That was deliberate: another branch was
+mid-flight in the same files this week, and a caller cannot conflict with
+the server.
+
+**Why a bridge and not three bots.** The parts that differ between Slack,
+Teams and a terminal are how a message arrives, how a reply is posted in
+a thread, and how a button is drawn. Everything else — building the
+`DataPart`, polling, the `INPUT_REQUIRED` pause, who may approve, what a
+follow-up means — is identical and has to be right once. So `bridge.py`
+owns that, `rendering.py` turns a Task into platform-neutral text plus
+abstract buttons, and the CLI is the cheapest adapter: it proves the
+bridge end to end without a Slack workspace.
+
+**What the bridge decides, and why:**
+
+- `message:send` is **never retried** (`a2a_client.py` passes
+  `max_attempts=1` to `http_retry`). It creates a task; a retry after a
+  lost response would clone, run the LLM and push a second branch. Reads
+  and `:cancel` keep the shared retry policy.
+- A repository URL is accepted only on an **allowed host** (`github.com`,
+  `ALLOWED_REPO_HOSTS`, and the hosts of `DEFAULT_REPO_URL`/`REPO_MAP`),
+  `https` only, no embedded credentials. The gateway attaches its
+  `GITHUB_PAT` to every repo it sends and `git_ops.authed_url` embeds it in
+  the clone URL for *any* host, so a `repo=https://evil.example/x` typed
+  into a channel would hand the organisation's token to that host on the
+  first 401. Checked at the one choke point (`GatewaySettings.repo_config`)
+  that both the chat path and `ari approve` go through.
+- The **requester is per task**, not per thread; whoever starts a task
+  may approve or decline it, plus a configured `APPROVERS` list. While a
+  proposal is waiting, only those people can continue the task at all,
+  because a continuation that ends without a new proposal makes the old
+  one unconfirmable (a terminal task refuses further `message/send`).
+- A bare typed `yes`/`ok`/`approve`/`no`/`decline` while a proposal waits
+  is treated as the decision, never sent as text. The agent ignores
+  free-text confirmations by design (`docs/INPUT_REQUIRED_INTEGRATION.md`
+  §5), so sending them would silently burn the task.
+- Any other message while a proposal waits **continues the same task**
+  (same `task_id`), because `executor._extract_history` reads history off
+  the current task only; a new task in the same `context_id` would give
+  the planner no conversation at all. The cost is stated to the user when
+  the follow-up ends without a new proposal.
+- `approve` re-reads the live task before confirming and refuses when it
+  is no longer `INPUT_REQUIRED`; the latest `pending_action` artifact
+  wins when a task carries two (a follow-up that proposed again).
+- A button still works after the gateway lost the thread (TTL or restart)
+  for a configured approver, by rebuilding the config from settings — the
+  agent side already persists paused tasks (`TASK_STORE_ROOT`), so the
+  gateway should not be the weaker half.
+- A cached "still working" state is re-checked against the agent before
+  refusing a new message, so a client-side wait timeout cannot block a
+  thread forever.
+
+**CLI specifics worth knowing:** config precedence is flags, then
+environment, then `~/.config/ari/config.toml`; no dotenv file is read.
+`config set` without a value prompts (no echo for secrets), validates
+through the settings model, and writes the file `0600`. `tasks get`
+redacts `api_key`/`pat`/`ssh_key`/`token`/`password` values at any depth,
+since a Task can carry the request `DataPart` in its history. `ari
+approve` requires `GITHUB_PAT`: the resume is a lone `publish_pr` step
+and a confirm without a token fails after the proposal is consumed.
+Inside `ari chat`, recoverable errors are printed and the session goes
+on; EOF at the approval prompt leaves the task addressable (the full id
+is printed before the prompt).
+
+**Review before this landed.** A five-lens adversarial review (wire
+contract, secrets/authorisation, repo rules, runtime edge cases, test
+quality) over the first draft produced 46 findings; 8 were confirmed by
+two independent refuters and the rest were triaged by hand after the
+review budget ran out. Fixed from it: the PAT-to-any-host hole, the
+`message:send` retry, world-readable config, the first-artifact-wins
+bug, a falsy `SessionStore` (`store or SessionStore()` dropped a
+caller's empty store because `__len__` is defined), `.env.chat-gateway`
+being read from the cwd and not gitignored (dotenv support removed
+instead), the frozen per-thread requester, unauthenticated continuation
+of a paused task, EOF/`Ctrl-C` at the approval prompt exiting 1, raw
+tracebacks on an unreachable agent, a REPL that quit on any error, a
+`--no-wait` path outside the error handler, `config set` accepting
+values it cannot load, a TOML writer that emitted surrogate escapes,
+Slack `<url|label>` and trailing punctuation in `repo=` values, a test
+fake whose `wait` never reported the terminal task (the real one does),
+and a CLI fake that served the post-confirm state before the confirm.
+`tests/test_ari_cli.py` does `pytest.importorskip("typer")` because the
+documented full-suite harness installs only `pytest`/`pytest-asyncio`;
+a hard import would have failed collection for the whole suite.
+
+**Verified:** 307 passed, 1 skipped (POSIX file-mode check on Windows) on
+Windows, where 13 pre-existing modules cannot be collected (`a2a`,
+`fcntl`). 99 new cases across six modules, plus the two source-level
+`http_retry` guards still green over the new packages. The new code
+imports neither `a2a` nor `fcntl`, so it runs on Windows.
+
+**Verified on Linux and against the deployed test agent, 2026-10-14.**
+Full suite **426 passed** inside `ari-oncall-agent-worker:test` on the
+bastion, with `src/`, `tests/`, `configs/`, `docs/`, `scripts/` and the
+Dockerfiles mounted over it. Then the package was installed into that
+image (`pip install --no-deps .` plus `typer`), which proves the wheel
+carries both new packages and the `ari` console script, and the CLI was
+driven against `https://test-ari-oncall-agent.insightfinder.com` (the
+public ingress; the kubectl session had expired, so not the
+`svc/ari-oncall-api` port-forward MCP uses — same pods either way):
+
+| step | result |
+|---|---|
+| `ari config show` | secrets masked to 4 characters; none of the three full values present in the output |
+| `ari card` | `ARI On-Call Agent ['code_analysis_fix']` |
+| plain question | `TASK_STATE_COMPLETED` in 6s, one-sentence answer, no repo work |
+| `repo=https://evil.example/x` | refused client-side, exit 1, no request sent |
+| `ari chat`, piped | answer in 7s, `/status` re-rendered the finished task, `/quit` exit 0 |
+| propose (`.editorconfig` on `OnCall-ARI-InfraCore-testing@dev`) | `TASK_STATE_INPUT_REQUIRED` in 32s; proposal rendered with branch, base, files, `Verification: not run`, compare link and the new-file hunk; task `4e978738-ce56-4e81-a1bb-5bfb123ddf40` |
+| `ari tasks get` on that task | `pending_action` + `root_cause` artifacts, `branch_pushed: true`; no secret value present (this server's `tasks/get` returned no request DataPart, so the redaction had nothing to do) |
+
+`ari approve` was then run by a person, and it ran straight into a
+rollout. Someone pushed `b7e3ce2` to `test` at 09:42:33Z (a `respond.py`
+change); CI published `2610140942-test` at 09:43:28 (api) and 09:44:20
+(worker), and Flux image automation rolled the agent while the approval
+was being followed. The CLI printed the resume's first poll (`working`,
+`produced: root_cause`) and then died on `tasks/get returned HTTP 503:
+no available server` — Traefik's literal reply when a Service has no
+ready endpoint — after `http_retry`'s three attempts, roughly three
+seconds.
+
+The agent side did its job regardless: **PR #23** on
+`OnCall-ARI-InfraCore-testing` was created at 09:46:43Z and the task read
+back as `TASK_STATE_COMPLETED` at 09:46:45 with `pending_action`,
+`root_cause` and `pull_request` artifacts, from the new pod. That is the
+full propose → approve → pull request round trip through the CLI.
+Whether the old pod published the result during its termination grace
+period or the new pod's startup reconciler did is **not established**;
+the kubectl session had expired and the pod logs were not read.
+
+The defect was in the client: a follow that gives up after three seconds
+of 503 cannot survive the routine event of this environment, which
+redeploys on every push to `test`. `AgentClient.wait` now treats a
+retryable status or a connection failure as an outage rather than an
+answer: it reports it once through `on_outage`, keeps polling, and gives
+up only after `AGENT_OUTAGE_SECONDS` (600) of unbroken failure — never on
+a 404, which means the agent really no longer knows the task. `ari tasks
+follow <id>` was added to re-attach after any give-up. `message:send`
+stays unretried: a confirm that hits the outage fails fast and leaves the
+task paused, so re-running `ari approve` is safe.
+
+**Verified after the fix:** full suite **433 passed** in
+`ari-oncall-agent-worker:test` (7 new cases: an outage ridden out and
+reported once, connection failures ridden out, a give-up after
+`AGENT_OUTAGE_SECONDS`, a 404 still raised, the bridge forwarding the
+outage, `ari approve` through a scripted outage, `ari tasks follow`), and
+`ari tasks follow 4e978738-ce56-4e81-a1bb-5bfb123ddf40` against test
+rendered PR #23 with exit 0. The outage path itself has not been seen
+live yet; that needs a rollout to overlap a run again.
+
+When repeating this on the bastion: the containers run as root, so a
+test run leaves root-owned `__pycache__` in the mounted scratch directory
+that the `test` account cannot delete. Pass
+`-e PYTHONDONTWRITEBYTECODE=1`, and clean up with a container
+(`find /work -user 0 -exec chown ...`).
+
+One operational note for anyone repeating this on the bastion: `/work`
+carries default ACLs that override `umask`, so a credentials file
+written there with `umask 077` still came out `other::r--`. Set the mode
+and strip the ACL explicitly (`setfacl -b`, `chmod 600`) on anything
+holding a key.
+
+## 2026-10-14 - `ari` gets an interactive chat for people (II-25116, step 1 follow-up)
+
+Feedback after the first hands-on test, verbatim in substance: the CLI
+"looks like a demo for developers, not something to hand to users". The
+concrete evidence was a misread: `ari send "In one sentence, what is a
+deadlock?"` printed the agent's answer bare under a progress line, and the
+answer (a definition of being blocked) was taken for an error. Nothing
+marked what was an answer and what was a failure, and using it at all
+meant knowing subcommands, internal setting names and task ids.
+
+Running `ari` on its own now opens a chat; the one-shot subcommands stay
+for scripts and are documented as such (`docs/CLI.md`).
+
+- **Chat first, menus only at decisions.** The main action is free text,
+  which a menu cannot express; menus appear where there is a fixed set of
+  choices. A proposal is a card (title, repository, branch to base,
+  files, test status, compare link, diff excerpt) followed by an
+  arrow-key menu: approve, decline, show the diff link, ask a follow-up,
+  decide later. Full-screen TUI was rejected because it works badly over
+  the SSH/bastion path this team actually uses and defeats copy-paste.
+- **Every output says what it is.** Answers under `ARI ›` with Markdown
+  rendered, errors as red `Error:`, failed tasks as `✖`, a spinner with
+  elapsed time and what the agent has produced so far while it works.
+  The agent does not report per-step progress (`executor.py` sends only
+  SUBMITTED/WORKING and artifacts), so "cloning / editing / pushing" step
+  names would need an agent change and are not shown.
+- **First-run setup** asks for the agent URL and key, provider, model, LLM
+  key, GitHub token and default repository, checks that the agent answers
+  and writes the settings file `0600`. It is skipped when the environment
+  already carries an agent URL and an LLM key, which is how the bastion
+  wrapper and any scripted install run.
+- **Slash commands** with Tab completion and history: `/repo`, `/branch`,
+  `/base`, `/status`, `/approve`, `/decline`, `/new`, `/config`,
+  `/setup`, `/quit`.
+- **Two terminal backends behind one interface** (`ari_cli/terminal.py`):
+  `prompt_toolkit` + `questionary` when attached to a terminal, plain
+  prompts with numbered menus otherwise. The libraries are imported only
+  for the terminal backend and live in the `cli` extra, so the agent
+  images and the unit tests on Windows do not need them.
+- `Rendered` now carries the raw task (`compare=False`), so the UI builds
+  the card from structured fields instead of re-parsing rendered text;
+  `bridge.start` keeps it when it appends the "earlier proposal" note.
+
+**Verified:** full suite **450 passed** in `ari-oncall-agent-worker:test`
+on the bastion, including `tests/test_ari_cli_tty.py`, which drives the
+real terminal UI through a pseudo-terminal against a fake agent: the chat,
+the arrow-key approval menu, Tab completion and the setup wizard (the
+saved file checked for content and `0600`). 17 plain-mode chat cases in
+`tests/test_ari_cli_chat.py`, 2 in `tests/test_ari_cli_session.py`
+(Ctrl-C while waiting and at the prompt). Then a pty session against the
+deployed test agent: banner, spinner, `ARI ›` answer, `/help`, Ctrl-D,
+exit 0. The approval menu has been exercised against the fake agent only.
+
+The pty tests warn that `forkpty()` runs in a process with a server
+thread. Harmless here (the child execs Python straight away), but it is
+why that fake agent is kept minimal.
+
+### Same day - an adversarial review before handing it over
+
+Three independent reviewers (conversation behaviour, terminal and platform,
+secrets/setup/tests), each finding then attacked by two verifiers trying to
+refute it: 15 confirmed, 0 refuted, 27 low-severity left unverified. Every
+confirmed one is fixed, and most of the low ones. The ones worth knowing
+about, because each would have reached a user:
+
+- **`/base` broke approvals.** It appended `base=<x>` to every line, so a
+  bare `yes` became `yes base=staging`, which `decision_word` does not
+  recognise; the "approval" went to the agent as a follow-up and burned
+  the proposal. `Bridge.start` now judges the text with directives
+  removed, and only treats yes/no as a decision when a proposal is
+  actually pending (a `yes` answering the agent's question is sent as
+  text). The appended sentence is now a condition ("if this request leads
+  to a pull request, open it against X") instead of an order, because the
+  order turned plain questions into change requests. `base_hint()` in
+  `chat_gateway/bridge.py` is the one place it is worded.
+- **Approving something never seen.** `/status` printed only "a proposal
+  is waiting", and `/approve` or `yes` would then confirm it. The chat
+  now records the id of the card it last showed and shows the card again
+  instead of confirming any other id; `/status` renders the card and menu.
+- **Losing a proposal silently.** `/new`, `/setup`, `/quit`, Ctrl-D and a
+  `/command` typed at the follow-up prompt all dropped a waiting
+  proposal, and no screen ever showed the full task id needed to recover
+  it. Leaving now prints the id with `ari approve <id>` or
+  `ari tasks follow <id>`; slash input at the follow-up prompt runs as a
+  command.
+- **Typeahead could approve.** Keys typed while the spinner ran stayed
+  queued and the arrow-key menu starts on Approve; a queued Enter picked
+  it. Input is flushed (`termios.tcflush` / `msvcrt`) before every menu
+  and confirm.
+- **Setup wrote unusable or wrong configs.** Pressing Enter through it
+  switched an OpenAI setup to Anthropic (the default came from a constant,
+  not from what was in effect); "other" with a blank name or model was
+  saved; a URL without a scheme was saved. Defaults now come from the
+  effective settings, the LLM block is validated with `llm_config()`
+  before saving, and `-` clears a value.
+- **Secrets on screen.** An API key with a trailing newline (a pasted key,
+  or a Secret made with `--from-file`) made h11 reject the header, and
+  `http_retry` copied the header value into the error text, which the
+  banner then printed. Secret fields are now stripped at the settings
+  model, and `AgentClient` replaces a `LocalProtocolError` message with
+  one that names no value. An `http://` repo URL carrying a token was
+  echoed by the scheme check; credentials are now checked first. Typer's
+  `pretty_exceptions_show_locals` is off, since setup frames hold keys.
+- **Windows.** Piped stdout uses a code page, and `→`/`✔`/`✖` raised
+  `UnicodeEncodeError` mid-proposal; stdout/stderr are reconfigured with
+  `errors="replace"` when they are not a terminal. Piped setup hung,
+  because `getpass` reads the console on Windows and `/dev/tty` on POSIX,
+  not the pipe; secrets are read from stdin when it is not a terminal.
+  `test_piped_setup_reads_every_answer_from_stdin_without_hanging` runs
+  this as a real subprocess.
+- **Agent text read as markup.** Rich parsed `app/[slug]/page.tsx` as a tag
+  (the file list on the card lost `[slug]`), and `[/tmp/x]` raised
+  `MarkupError`. Every agent string is now wrapped in `Text`.
+- **Smaller ones:** an invalid agent URL (`httpx.InvalidURL`, not a
+  `TransportError`) crashed instead of reporting; the connection check
+  took up to 3 x 60 s with no spinner and is now one attempt at 15 s with
+  one; a broken `config.toml` crashed both `ari` and `ari setup`, which
+  now reports it and lets setup replace it; the history file no longer
+  chmods the directory that holds `ARI_CONFIG_FILE`; the spinner hint no
+  longer stays on "restarting" after the agent recovers.
+
+Tests now share `tests/ari_cli_fakes.py` and fixtures in
+`tests/conftest.py` instead of one test module importing another's
+fixture. 17 new cases in `tests/test_ari_cli_chat_decisions.py`; the
+session test now proves the loop continues after Ctrl-C (it passed with
+`continue` mutated to `return` before); the pty test asserts that no
+secret reaches the screen.
+
+**Verified:** Windows 349 passed (13 modules not collectable there, as
+before); Linux **470 passed** in `ari-oncall-agent-worker:test`, including
+both pty tests; then a pty session against the deployed test agent through
+the rebuilt bastion image. The arrow-key approval menu is still exercised
+against the fake agent only.
+
+### Same day - first hands-on use on test: two gaps, one agent bug
+
+The user's first proposal went through end to end from the chat: card,
+arrow-key approval, PR #24 on `OnCall-ARI-InfraCore-testing`. The second
+request hung, and how the user tried to recover showed two gaps in the
+chat itself:
+
+- After Ctrl-C there was no way inside the chat to follow the task again
+  or to stop it; `/status` only gave a snapshot. The user then typed the
+  shell commands `ari tasks follow <id>` and `ari tasks cancel <id>` into
+  the chat, where they went to the bridge as messages (refused, since the
+  task was running). Added `/wait` (re-attach, via a new public
+  `Bridge.follow`) and `/cancel` (asks first; declines a waiting
+  proposal), every running-task notice now names them, a message typed
+  while the task runs is held back with that hint, and an `ari <command>`
+  line typed into the chat is explained instead of sent.
+- `/st` was rejected as unknown. Commands now resolve by unique prefix;
+  an ambiguous prefix lists the candidates.
+
+The hang itself was agent-side, not the CLI: task `f0d352b6` sat for 19
+minutes because the worker never noticed its `generate_change` follow-up
+opencode process exit. Evidence taken live on the worker pod: `opencode`
+pid 1185 was a zombie whose parent was `python -m api.worker` (so tini
+cannot reap it), asyncio was using `PidfdChildWatcher` (Python 3.12.15),
+and the worker held a pidfd for 1185 (fd 18) that no epoll instance in
+the process was watching, so `_do_wait`/`waitpid` never ran. The 10-10
+deadline then fired (`opencode (ari-change) timed out after 1155s (pid
+1185) and was killed`), `generate_change` retried, and the retry produced
+the proposal at 12:53 UTC. Third occurrence after 09-25 and 10-10; split
+out as its own task, since the fix belongs in `opencode_runtime`/`git_ops`
+rather than in the client.
+
+**Verified:** Windows 357 passed; Linux 478 passed in the worker image. 8 new cases in
+`tests/test_ari_cli_running.py`.
+
+## 2026-10-14 - Agent Skills: how outsiders add capabilities (II-25116, step 3)
+
+The open-source goal needs one extension point that is not engine code. That
+is now [Agent Skills](https://agentskills.io/specification): a folder with a
+`SKILL.md` and optional scripts. `docs/SKILLS.md` is the user-facing guide;
+this entry records what was verified and why the isolation looks the way it
+does.
+
+**What exists.**
+
+- `skills/` ships three examples: `tls-certificate-check` (no repository),
+  `aws-security-group-allowlist` (the leader's example; refuses to change
+  anything without an operator `config.json`), `changelog-entry` (used during
+  a code change). Operators add more under `SKILLS_DIR/<name>/`.
+- `common/skills.py` validates (spec rules, plus YAML read the way opencode's
+  js-yaml reads it), discovers bundled then deployment skills (later wins),
+  and copies them per request into
+  `<workspace>/.opencode-state/config/opencode/skills`, which opencode reads
+  as global skills because `XDG_CONFIG_HOME` is already per request. Nothing
+  is written into the clone, so nothing can leak into a pull request.
+- New capability `run_skill` (agent `ari-skill`) runs one skill with no
+  repository. The planner sees `available_skills` (name and description) in
+  its request and chooses it; the change and verify agents can load the same
+  skills by name inside a code change.
+- `ari skills validate` checks a skill offline.
+
+**opencode 1.18.31 facts this rests on**, verified in the worker image with
+`opencode debug skill`, `opencode debug agent`, real `opencode run` calls, and
+the source at tag v1.18.31 (anomalyco/opencode):
+
+- Skills are discovered from `$XDG_CONFIG_HOME/opencode/skill(s)/**`, the
+  repository's `.opencode/skill(s)`, `.claude/skills`, `.agents/skills`,
+  `~/.claude/skills`, `~/.agents/skills`, `~/.opencode/skill(s)`, and, when
+  `--dir` is not inside a git repository, every ancestor directory's
+  `.opencode`, `.claude` and `opencode.json`. Two skills with one name: the
+  winner is whichever parse finishes last, so it is not deterministic.
+  opencode does not check names against the spec.
+- `OPENCODE_DISABLE_EXTERNAL_SKILLS=1` drops the `.claude`/`.agents` scans
+  (home and project). `OPENCODE_DISABLE_PROJECT_CONFIG=1` drops project
+  `.opencode` dirs and `opencode.json` files, including ancestors.
+- The `skill` tool returns the body plus "Base directory for this skill:
+  <abs path>", which is how a model finds the scripts.
+- Permission objects are evaluated **last match wins**, and a tool is removed
+  when its last rule is `"*": "deny"`. Every new map here is written
+  broad-first. The existing `_AGENT_DEFS` maps are written the other way round:
+  `ari-change` has had no bash at all, and `verify`'s `git push` deny does
+  nothing. A target repository's `.opencode/opencode.json` also overrides our
+  agent permissions. Both are pre-existing and split into their own task.
+- A bash permission pattern is the text of each tree-sitter `command` node, so
+  `>` redirects and `VAR=x cmd` prefixes are seen and `&&`/`;`/`|` parts are
+  checked one by one. `export`/`declare` statements are not `command` nodes and
+  are never checked. A script must never take a security decision from an
+  environment variable: that is why the AWS skill reads `config.json` from a
+  fixed path next to it.
+
+**Isolation of `run_skill`.** It runs in an empty `skill-run` directory with
+its config passed by `OPENCODE_CONFIG` from outside that directory and
+`OPENCODE_DISABLE_PROJECT_CONFIG=1`, so nothing in an ancestor directory
+applies. It may read only the chosen skill's folder, has no glob/grep/list,
+web fetch or edit, may load only that one skill, and may run only that skill's
+`scripts/` (directly or via python3/python/bash/sh) plus `Bash(...)` prefixes
+from `allowed-tools`. Commands containing `/../`, `$`, a backtick or `>` are
+refused: both bundled scripts echo their arguments, so `$SECRET` as an
+argument would have printed a worker secret. `AGENT_API_KEYS`,
+`TEMPORAL_API_KEY`, `TEMPORAL_PAYLOAD_ENCRYPTION_KEY` and GitHub tokens are
+removed from its environment.
+
+**Repository skills are untrusted by default.** External `.claude`/`.agents`
+scans are off, agents may load only our skills by name, and any of our names
+that also exists in the repository or in a worker home (the real home and the
+build cache, which is `verify`'s home) is blocked, using a lenient scan that
+follows symlinks and reads names the way opencode's forgiving parser would.
+`TRUST_REPO_SKILLS=true` allows repository skills except contested names and
+opencode's built-in `customize-opencode`.
+
+**`respond` said "NOTHING WAS EXECUTED" after a skill had acted.** oncall's
+FACT line keys on `publish_pr` only, so a run whose only step was `run_skill`
+was told nothing reached any external system, which would have contradicted
+an applied security group change. `AgentMeta.direct_capabilities` names the
+steps that act directly, and the fact line now says the step ran and to report
+exactly what its output shows.
+
+**Review.** A five-lens adversarial review (security, integration, spec,
+examples, docs), each lens with an independent verifier: 25 confirmed, 10
+refuted, all 25 fixed. The ones that mattered most: the FACT line above; YAML
+values such as an impossible date raised past the validator and would have
+taken discovery, and with it every opencode call, down; repository skill names
+were read with our strict parser, so a file opencode still accepts slipped
+past the same-name block; the AWS guard rails came from environment variables;
+`$VAR` arguments leaked secrets.
+
+**Ops note.** The bastion has 1 vCPU and 2 GB RAM. Two concurrent opencode
+containers got both SIGKILLed (`exit -9`), and SSH timed out in the banner
+exchange; live runs there must be one at a time.
+
+**Live**, opencode 1.18.31 with a real model (claude-haiku-4-5) in the worker
+image on the bastion, branch code mounted:
+
+- Planner: "Is the TLS certificate of github.com still valid" planned
+  `run_skill` with `tls-certificate-check`; "please whitelist 104.245.103.27
+  vpn" planned `run_skill` with `aws-security-group-allowlist`; a README typo
+  fix in a repository planned `clone_repo` + `generate_change`; "What is a
+  deadlock?" planned nothing.
+- `run_skill` end to end in 18 s: loaded the skill, ran `check_tls.py` once,
+  reported github.com ok with 46 days left and expired.badssl.com "certificate
+  has expired". Same result after the isolation changes.
+- `ari-skill` was refused `> /tmp/report.json`, a heredoc writing a file,
+  `env`, `curl`, and reads of `/etc/os-release` and `/proc/self/environ`; no
+  file was written. The `$(...)` attempt was refused by the model itself, so
+  the `$` rule rests on the rule text and unit tests, not on a live refusal.
+- `ari-change` fixed the typo, loaded `changelog-entry` and added
+  `## [Unreleased]` / `### Fixed` to CHANGELOG.md in 29 s. With a same-named
+  skill in the repository's `.opencode/skills`, `write_config` dropped
+  `changelog-entry` from the permission and logged `skills_shadowed`.
+- Intermittently a run hit its deadline although the session had finished:
+  debug logs show "exiting loop" on time, then opencode's own teardown
+  (dispose, config reload) taking 35-52 s per step on the 1-vCPU bastion. It
+  happened to `ari-change` with no skill config as well, so it is not caused by
+  this change, and it is not root-caused. 1 of the last 5 runs stalled. Worth
+  watching in the cluster, because a teardown stall turns a finished step into
+  a timeout.
+
+**Not done here:** a Helm chart mount for `SKILLS_DIR`, and a live run of the
+AWS skill (the test worker has no AWS credentials or `boto3`).
+
+**Verified:** Windows 466 passed; Linux 616 passed in the worker image.

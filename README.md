@@ -96,6 +96,11 @@ on-call-ari-agent/
 
 ## Extending it
 
+- **New skill** (the way to add capabilities without changing this code):
+  drop an [Agent Skills](https://agentskills.io/specification) folder into
+  `skills/`, or mount it as a subfolder of `SKILLS_DIR`. The planner can run it on its
+  own, and the change agent can use it during a code change. See
+  [`docs/SKILLS.md`](docs/SKILLS.md) and `ari skills validate`.
 - **New capability**: add a module under `capabilities/`, add an entry to
   `configs/capabilities.yaml` (module path, description, tools, retry/on_failure
   policy). The planner picks it up automatically because it reads the catalog

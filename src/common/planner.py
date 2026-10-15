@@ -20,6 +20,7 @@ from common.capabilities_registry import catalog
 from common.llm.client import complete
 from common.llm_json import extract
 from common.models.plan import Plan
+from common.skills import planner_view
 
 logger = structlog.get_logger()
 
@@ -50,9 +51,11 @@ async def create_plan(prompt: str, config: dict, history: list[dict] | None = No
         description=meta.planner_description,
         domain_guidance=meta.planner_domain_guidance,
     ).format(catalog=json.dumps(catalog(), indent=2))
-    user_prompt = json.dumps(
-        {"prompt": prompt, "history": history or [], "options": config.get("options", {})}
-    )
+    request = {"prompt": prompt, "history": history or [], "options": config.get("options", {})}
+    available = planner_view()
+    if available:
+        request["available_skills"] = available
+    user_prompt = json.dumps(request)
 
     raw = await complete(config["llm"], system_prompt, user_prompt)
     plan = _parse(raw)

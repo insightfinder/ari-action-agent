@@ -129,6 +129,28 @@ capabilities:
       max_attempts: 3
       backoff_seconds: 5
 
+  run_skill:
+    module: ari_oncall_agent.capabilities.run_skill
+    description: >
+      Run one installed Agent Skill on its own, with no repository: an
+      opencode agent (ari-skill) loads the skill's instructions and may run
+      only that skill's own scripts and the commands its allowed-tools
+      grants; it cannot edit files. The installed
+      skills are listed with a name and a description in the request's
+      "available_skills". Use this step, alone and without clone_repo, when
+      one of those skills clearly fits the request and the request does not
+      ask for a change to a repository. Params: `skill` (required, the exact
+      name from "available_skills") and `instruction` (what to do with it,
+      in the user's terms, e.g. the hosts, addresses or values the request
+      names). Never use it for code changes: those go through clone_repo and
+      generate_change, where the same skills are already available to the
+      change agent.
+    tools: [opencode_skill]
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+    timeout_seconds: 600
+
   # `internal: true` — deliberately invisible to the planner. A pull
   # request is opened only through plan_task's confirmation bypass, from
   # a propose_pr proposal a person approved, so this must never appear in
