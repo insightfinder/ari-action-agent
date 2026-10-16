@@ -24,6 +24,8 @@ jobs:
             image: docker.io/insightfinderinc/ari-agent-api
           - dockerfile: Dockerfile.oncall
             image: docker.io/insightfinderinc/ari-oncall-agent-worker
+          - dockerfile: Dockerfile.chat-gateway
+            image: docker.io/insightfinderinc/ari-chat-gateway
       fail-fast: false
     env:
       IMAGE_NAME: ${{ matrix.image }}

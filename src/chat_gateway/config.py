@@ -29,6 +29,7 @@ class GatewaySettings(BaseSettings):
     repo_map: str = ""
     allowed_repo_hosts: str = "github.com"
     approvers: str = ""
+    requester_can_approve: bool = True
     options_json: str = "{}"
     poll_seconds: float = 5.0
     wait_seconds: float = 3600.0
@@ -113,6 +114,10 @@ class GatewaySettings(BaseSettings):
 
     def approver_set(self) -> set[str]:
         return {a.strip() for a in self.approvers.split(",") if a.strip()}
+
+    def check_approval_policy(self) -> None:
+        if not self.requester_can_approve and not self.approver_set():
+            raise ConfigError("REQUESTER_CAN_APPROVE is false but APPROVERS is empty, so nobody could approve a proposal")
 
     def masked(self) -> dict[str, Any]:
         shown: dict[str, Any] = {}
