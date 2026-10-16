@@ -30,8 +30,10 @@ def parse_directives(text: str) -> tuple[str, dict[str, str]]:
     directives: dict[str, str] = {}
 
     def take(match: re.Match) -> str:
-        value = match.group(2).rstrip(",;.!?").strip("`'\"<>")
-        directives[match.group(1)] = value.split("|", 1)[0]
+        value = match.group(2).rstrip(",;.!?").strip("`'\"<>").split("|", 1)[0]
+        if match.group(1) == "repo" and value and "://" not in value:
+            value = f"https://{value}"
+        directives[match.group(1)] = value
         return ""
 
     cleaned = DIRECTIVE_RE.sub(take, text)
@@ -62,8 +64,20 @@ class Bridge:
             "options": self.settings.options(),
         }
 
-    def can_approve(self, conversation: Conversation, actor: str) -> bool:
+    def can_take_part(self, conversation: Conversation, actor: str) -> bool:
         return actor == conversation.requester or actor in self.settings.approver_set()
+
+    def can_approve(self, conversation: Conversation, actor: str) -> bool:
+        if self.settings.requester_can_approve:
+            return self.can_take_part(conversation, actor)
+        return actor in self.settings.approver_set() and actor != conversation.requester
+
+    def approval_refusal(self, conversation: Conversation, actor: str) -> Rendered:
+        if self.settings.requester_can_approve:
+            return render_refusal(f"only {conversation.requester} or a configured approver can approve this")
+        if actor == conversation.requester:
+            return render_refusal("you asked for this change, so someone else has to approve it: one of the configured approvers")
+        return render_refusal("only a configured approver can approve this")
 
     async def _refresh(self, thread_key: str, conversation: Conversation) -> dict[str, Any] | None:
         if not conversation.task_id:
@@ -110,7 +124,7 @@ class Bridge:
                 return await self.approve(thread_key, requester, on_update=on_update)
             if decision == "decline":
                 return await self.decline(thread_key, requester)
-            if not self.can_approve(conversation, requester):
+            if not self.can_take_part(conversation, requester):
                 return render_refusal(
                     f"a proposal requested by {conversation.requester} is waiting for approval; "
                     f"only {conversation.requester} or a configured approver can continue this task"
@@ -134,7 +148,7 @@ class Bridge:
             )
         return rendered
 
-    def _recover(self, thread_key: str, actor: str, task_id: str) -> Conversation | Rendered:
+    def _recover(self, thread_key: str, actor: str, task_id: str, requester: str = "") -> Conversation | Rendered:
         conversation = self.store.get(thread_key)
         if conversation is not None and conversation.task_id:
             return conversation
@@ -145,7 +159,7 @@ class Bridge:
                 f"this conversation is no longer in memory; only a configured approver can act on task {task_id[:8]}"
             )
         conversation = self.store.start(thread_key, actor)
-        conversation.requester = actor
+        conversation.requester = requester
         conversation.task_id = task_id
         return conversation
 
@@ -156,13 +170,14 @@ class Bridge:
         pending_action_id: str = "",
         task_id: str = "",
         on_update: OnUpdate | None = None,
+        requester: str = "",
     ) -> Rendered:
-        recovered = self._recover(thread_key, actor, task_id)
+        recovered = self._recover(thread_key, actor, task_id, requester)
         if isinstance(recovered, Rendered):
             return recovered
         conversation = recovered
         if not self.can_approve(conversation, actor):
-            return render_refusal(f"only {conversation.requester} or a configured approver can approve this")
+            return self.approval_refusal(conversation, actor)
         task = await self._refresh(thread_key, conversation)
         if task is None or task_state(task) != INPUT_REQUIRED or not conversation.pending_action_id:
             label = state_label(task) if task else "unknown"
@@ -180,13 +195,21 @@ class Bridge:
         self.store.record_task(thread_key, resumed)
         return await self._follow(thread_key, resumed.get("id") or conversation.task_id, on_update)
 
-    async def decline(self, thread_key: str, actor: str, task_id: str = "") -> Rendered:
-        recovered = self._recover(thread_key, actor, task_id)
+    async def decline(
+        self, thread_key: str, actor: str, task_id: str = "", pending_action_id: str = "", requester: str = ""
+    ) -> Rendered:
+        recovered = self._recover(thread_key, actor, task_id, requester)
         if isinstance(recovered, Rendered):
             return recovered
         conversation = recovered
-        if not self.can_approve(conversation, actor):
+        if not self.can_take_part(conversation, actor):
             return render_refusal(f"only {conversation.requester} or a configured approver can decline this")
+        stale_task = task_id and conversation.task_id and task_id != conversation.task_id
+        if pending_action_id and not stale_task:
+            await self._refresh(thread_key, conversation)
+        stale_action = pending_action_id and pending_action_id != conversation.pending_action_id
+        if stale_task or stale_action:
+            return render_refusal("that proposal is not the one currently waiting; it may be stale")
         result = await self.client.cancel(conversation.task_id)
         task = result if result.get("id") else await self.client.get_task(conversation.task_id)
         self.store.record_task(thread_key, task)

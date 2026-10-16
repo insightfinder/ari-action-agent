@@ -30,6 +30,10 @@ cli = [
     "prompt_toolkit>=3.0.40",
     "questionary>=2.0",
 ]
+slack = [
+    "slack_bolt>=1.21",
+    "aiohttp>=3.9",
+]
 
 [project.scripts]
 ari = "ari_cli.main:app"
