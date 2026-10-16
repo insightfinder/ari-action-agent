@@ -16,7 +16,7 @@ from a2a.server.tasks import (
 )
 
 from common.a2a_server.agent_card import build_agent_card
-from common.a2a_server.auth import ApiKeyCallContextBuilder
+from common.a2a_server.auth import ApiKeyCallContextBuilder, ApiKeyMiddleware
 from common.a2a_server.executor import AriAgentExecutor
 from common.a2a_server.reconciler import reconcile_unfinished_tasks
 from common.a2a_server.task_store import build_task_store
@@ -80,12 +80,17 @@ def create_app() -> FastAPI:
     # gRPC needs its own server process/port and protobuf codegen
     # dependencies — a deliberate, separate follow-up phase, not bundled
     # in here (see docs/design.md's transport section).
+    jsonrpc_routes = create_jsonrpc_routes(request_handler, rpc_url="/", context_builder=context_builder)
+    rest_routes = create_rest_routes(request_handler, context_builder=context_builder)
     add_a2a_routes_to_fastapi(
         app,
         agent_card_routes=create_agent_card_routes(agent_card),
-        jsonrpc_routes=create_jsonrpc_routes(request_handler, rpc_url="/", context_builder=context_builder),
-        rest_routes=create_rest_routes(request_handler, context_builder=context_builder),
+        jsonrpc_routes=jsonrpc_routes,
+        rest_routes=rest_routes,
     )
+    # Every A2A operation needs a key; the agent card and /healthz do not. See auth.py for why this
+    # is a middleware and not only the context builder.
+    app.add_middleware(ApiKeyMiddleware, protected=[*jsonrpc_routes, *rest_routes])
 
     @app.get("/healthz")
     async def healthz():

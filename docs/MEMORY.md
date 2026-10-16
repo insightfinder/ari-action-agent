@@ -4511,3 +4511,92 @@ expect `already_at_target` and a status other than `new_pods_failing`.
   The fix belongs in the shared workflow/`execution_fact`.
 - `tests/test_workflow_execution.py::test_the_budget_caps_a_step_across_all_of_its_retries`
   failed once in a full run and passed on every rerun (timing).
+
+## 2026-10-16 — Small kind-agnostic `src/common/` fixes found while building the k8s kind
+
+Until now the k8s kind's only `src/common/` line was its `_AGENT_PACKAGES`
+entry. With the user's go-ahead, four shared problems it ran into are fixed
+in `common/`. Each one is kind-agnostic (no branch on an agent kind), and
+oncall behaves as before apart from what is listed. `ari-agent-demo`'s
+vendoring sync now has these files to pick up: `a2a_server/auth.py`,
+`app_factory.py`, `llm/client.py`, `agent_meta.py`, `planner.py`,
+`respond.py`, `orchestration/workflow.py`.
+
+- **A wrong or missing `x-api-key` is a 401 on REST too.** It used to be a
+  500 on `/message:send`, `/message:stream` and `/tasks/...`, and a 401 only
+  on JSON-RPC. The cause: the SDK wraps every REST handler in
+  `rest_error_handler`, which turns any non-`A2AError`, including the
+  context builder's `HTTPException`, into `500 unknown exception`. The key
+  is now checked by `ApiKeyMiddleware` (pure ASGI) before routing, but only
+  for the A2A routes. The agent card, `/healthz` and `/docs` stay open as
+  before. Watch out: the SDK mounts its REST routes again under
+  `/{tenant}`, and `/.well-known/agent-card.json` matches that mount by
+  prefix, so the middleware only counts a mount when one of its child
+  routes matches. The context builder still checks the key as a second
+  line. Callers now fail fast: `chat_gateway`/`http_retry` retry 5xx, not
+  401. Tests: `tests/test_a2a_auth.py`. `scripts/k8s_agent_live_test.py
+  auth` now requires a 401; before, it also accepted a 500.
+- **LLM provider errors no longer carry any part of the API key.**
+  OpenAI's 401 body quotes the rejected key with its first and last
+  characters (`sk-proj-****abcd`), and that text became the planning
+  failure reason, which reaches `respond`'s prompt, the reply and Temporal
+  history. `common/llm/client.py` now raises `LLMProviderError`. A 401
+  gives only provider + status. Other statuses keep their detail, with
+  key-echo and key-like strings masked (`sk-`/`pk-`/`rk-`, Google `AIza`,
+  Groq `gsk_`, bearer tokens, bare 32+ hex), and the SDK exception is not
+  chained (`from None`). This covers the planner, `respond` and every
+  capability's `llm_complete`, since all of them use this client. It was
+  never reproduced against a live provider; the tests use the response
+  shape OpenAI documents.
+- **`AgentMeta.planner_skills`** (default `True`). The k8s kind sets it
+  `False`, so its planner is never shown `available_skills`. Before this,
+  only the image env (`SKILLS_ENABLED=false` in `Dockerfile.k8s`, kept as
+  defense in depth) and `_keep_plans_safe` stood between that planner and a
+  `run_skill` step that does not exist in the kind.
+- **An approved step that raised past its retries is no longer reported as
+  "nothing was executed".** If Temporal gives up waiting on the confirmed
+  (`confirm_capability`) step, the workflow now records
+  `{"status": "interrupted", "failure": ...}` for it. That covers a
+  heartbeat, start-to-close or schedule-to-close timeout (which is what a
+  lost worker or a spent budget looks like) and a cancellation; see
+  `workflow._may_have_run`. `respond.execution_fact` then states that the
+  outcome is unknown and has to be checked, because an attempt may already
+  have written. An error the capability raises itself is still a plain
+  failure and still reported as nothing executed, e.g. the drift refusal
+  ("Nothing was changed. Ask again"). A first version also marked those
+  `interrupted`, and review caught it. Oncall's `publish_pr` gets the same
+  treatment. Tests: `test_respond.py`, and in `test_k8s_workflow.py`, the
+  `..._cut_off_by_its_timeout_...` and `..._that_refuses_...` tests.
+
+**Verified on test (2026-10-16, after review fixes):** installed from the
+chart branch with temporary images `2610161648-ii25173`, on test's existing
+Temporal namespace `jenkins-ari-agent` (the Jenkins kind is deprecated and
+nothing polls it there), task queue `k8s-ari-queue`, so nothing new was
+created in Temporal. Results:
+- `--allow-writes`: 36/36 pass. `auth` now sees 401 on every refused
+  request.
+- Two one-off checks:
+  - `gate_stale`: the drift refusal's reply says nothing was changed. It
+    does not say the outcome is unknown.
+  - A request carrying a fake OpenAI key ended with "planning failed:
+    openai rejected the API key (HTTP 401)", and no part of the key appears
+    anywhere in the task.
+- Cleanup: release and both namespaces deleted, with no `ari-k8s` cluster
+  RBAC left.
+- Not live-tested: the `interrupted` path itself. `worker_restart` still
+  ends in the retried attempt finding the change in place.
+
+**Considered and not done:**
+- *A deterministic plan that skips the LLM planner for the k8s kind.* The
+  planner does real routing here: a health question vs a change vs a plain
+  question, a request that needs both, and resolving "yes, go ahead" from
+  the history. `find_workload` skips its own model call when the name
+  appears verbatim, so there is no other call to fold the intent into, and
+  a keyword router would be worse.
+- *Multi-step resume after approval.* `apply_approved_change` already
+  verifies inside its own step.
+- *An approval naming the wrong id fails the task* (the real proposal can
+  then no longer be approved). Leaving the task in `input-required` instead
+  is a small `executor.py` change, but mcp-service's approval handling and
+  the live `gate_wrong_id` scenario both expect the failure. Change all
+  three together, or none.

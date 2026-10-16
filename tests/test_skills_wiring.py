@@ -121,6 +121,19 @@ async def test_the_planner_request_is_unchanged_when_no_skill_is_installed(monke
 
 
 @pytest.mark.asyncio
+async def test_a_kind_without_run_skill_is_not_offered_skills_even_with_skills_installed(monkeypatch):
+    from common.agent_meta import get_agent_meta
+
+    complete = AsyncMock(return_value='{"steps": [], "rationale": "x"}')
+    monkeypatch.setattr(planner, "complete", complete)
+    monkeypatch.setattr(planner, "planner_view", lambda: [{"name": "tls-certificate-check", "description": "d"}])
+    monkeypatch.setattr(planner, "get_agent_meta", lambda: get_agent_meta("k8s"))
+    monkeypatch.setattr(planner, "catalog", lambda: [])
+    await planner.create_plan("check the pods", {"llm": LLM})
+    assert "available_skills" not in json.loads(complete.await_args.args[2])
+
+
+@pytest.mark.asyncio
 async def test_external_skill_folders_are_off_for_every_opencode_run_by_default(monkeypatch, tmp_path, captured):
     monkeypatch.setattr(skills, "prepare", lambda home: [])
     monkeypatch.setattr(skills, "opencode_env", lambda: {"OPENCODE_DISABLE_EXTERNAL_SKILLS": "1"})

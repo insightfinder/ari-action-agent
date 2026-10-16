@@ -29,6 +29,7 @@ def fake(monkeypatch):
         planner_description="agent that does things",
         planner_domain_guidance="",
         planner_fallback_steps=_FALLBACK,
+        planner_skills=True,
     )
     monkeypatch.setattr(planner, "get_agent_meta", lambda: meta)
     monkeypatch.setattr(planner, "catalog", lambda: [])

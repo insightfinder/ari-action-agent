@@ -145,8 +145,11 @@ needs a genuinely separate server process (HTTP/2 + protobuf framing, not
 ASGI) and its own port/dependencies; deferred until a real caller needs it
 (§7).
 
-**Auth**: `x-api-key` header, checked against `AGENT_API_KEYS`, wired in
-via a custom `ServerCallContextBuilder` (`a2a_server/auth.py`). Every
+**Auth**: `x-api-key` header, checked against `AGENT_API_KEYS` by an ASGI
+middleware in front of the A2A routes, and again by a custom
+`ServerCallContextBuilder` (`a2a_server/auth.py`; the middleware is what
+makes a bad key a 401 on REST, where the SDK turns any in-route exception
+into a 500). The agent card and `/healthz` need no key. Every
 request also needs an `A2A-Version: 1.0` header — the SDK treats its
 absence as an older, unsupported protocol version.
 

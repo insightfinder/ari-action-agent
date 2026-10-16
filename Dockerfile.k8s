@@ -28,8 +28,9 @@ ENV PYTHONUNBUFFERED=1
 ENV AGENT_KIND=k8s
 ENV SANDBOX_ROOT=/tmp/ari-agent-sandbox
 # Agent Skills run scripts through the oncall kind's run_skill; this kind has
-# no such step and its worker holds cluster-wide patch rights, so the planner
-# is not offered any.
+# no such step and its worker holds cluster-wide patch rights. Its planner is
+# not offered any (k8s_agent/meta.py: planner_skills=False); this keeps the
+# skill loader itself off as well.
 ENV SKILLS_ENABLED=false
 
 USER 10001

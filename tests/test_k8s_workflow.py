@@ -155,3 +155,65 @@ async def test_a_refusal_completes_without_changing_anything(k8s_kind, monkeypat
     assert "ScaledObject" in result["refusal"]["reason"]
     fx.a2a_round_trip(result["refusal"])
     assert fake.patches == []
+
+
+
+async def _propose_then_approve(monkeypatch, apply_run) -> tuple[dict, "_LLM"]:
+    """A real proposal for checkout, then its approval with `apply_approved_change.run` replaced."""
+    import common.llm.client as llm_client
+    import common.planner as planner
+    from k8s_agent.capabilities import apply_approved_change
+    from k8s_agent.tools import read, write
+
+    fake = fx.FakeClient(k8s_tests._cluster())
+    monkeypatch.setattr(read, "get_client", lambda: fake)
+    monkeypatch.setattr(write, "get_client", lambda: fake)
+    llm = _LLM(
+        plan={"steps": [{"capability": "propose_change"}], "rationale": "scale"},
+        change={"action": "scale_replicas", "replicas": 5, "replicas_quote": "to 5 replicas"},
+    )
+    monkeypatch.setattr(planner, "complete", llm)
+    monkeypatch.setattr(llm_client, "complete", llm)
+    config = {"llm": {"provider": "openai", "api_key": "sk-test", "model": "gpt-x"}, "options": {}}
+    first = await _run({"prompt": "scale checkout to 5 replicas", "history": [], "config": config, "confirmed_action": None})
+
+    monkeypatch.setattr(apply_approved_change, "run", apply_run)
+    confirmed = fx.a2a_round_trip(first["pending_action"])
+    second = await _run({"prompt": "approved", "history": [], "config": config, "confirmed_action": confirmed})
+    return second, llm
+
+
+@pytest.mark.asyncio
+async def test_an_approved_apply_cut_off_by_its_timeout_is_not_reported_as_nothing_executed(k8s_kind, monkeypatch):
+    """The step outlives its time (what a lost worker looks like to the workflow). An attempt may
+    have patched the cluster, so the response must not be told that nothing was executed."""
+    import asyncio
+
+    from common.capabilities_registry import get_capability
+
+    async def hangs(ctx):
+        await asyncio.sleep(3600)
+
+    # Each attempt gets 1s instead of 900s; Temporal times both out (the retry backoff is skipped).
+    monkeypatch.setattr(get_capability("apply_approved_change"), "timeout_seconds", 1)
+    second, llm = await _propose_then_approve(monkeypatch, hangs)
+
+    assert second["status"] == "failed"
+    assert second["data"]["apply_approved_change"]["status"] == "interrupted"
+    assert "NOTHING WAS EXECUTED" not in llm.prompts[-1]
+    assert "may already have changed the target system" in llm.prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_an_approved_apply_that_refuses_is_still_nothing_executed(k8s_kind, monkeypatch):
+    """A capability that raises has decided, e.g. the drift refusal ("Nothing was changed"); that is
+    not an interruption."""
+
+    async def refuses(ctx):
+        raise RuntimeError("the Deployment changed since the proposal. Nothing was changed. Ask again.")
+
+    second, llm = await _propose_then_approve(monkeypatch, refuses)
+
+    assert second["status"] == "failed"
+    assert "apply_approved_change" not in second["data"]
+    assert "NOTHING WAS EXECUTED" in llm.prompts[-1]

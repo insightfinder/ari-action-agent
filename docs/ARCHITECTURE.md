@@ -147,6 +147,9 @@ whatever it actually is). In the order you'd naturally hit them:
   - `confirm_capability` — only set this if the kind has a
     human-in-the-loop confirm gate like Jenkins' `trigger_build` (see
     `docs/design.md` §5b); otherwise leave it `None` (the default).
+  - `planner_skills` — set `False` if the kind has no `run_skill`
+    capability, so its planner is not shown the installed Agent Skills
+    (the k8s kind does this). Defaults to `True`.
 
 ### 3.2 Register the package: `common/agent_meta.py`
 
@@ -241,4 +244,7 @@ line in `_AGENT_PACKAGES`. The one narrow exception so far: the
 `confirmed_action`/`StepContext.confirmed`) touches `common/` because
 it's genuinely a reusable *mechanism* (any future kind's own mutating
 action could opt into it via `AgentMeta.confirm_capability`), not
-because Jenkins gets special-cased.
+because Jenkins gets special-cased. Part of the same mechanism: when the
+confirmed step raises past its retries, `workflow.py` records it as
+`{"status": "interrupted"}` and `respond.execution_fact` reports the
+outcome as unknown, never as "nothing was executed".
