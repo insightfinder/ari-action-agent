@@ -52,7 +52,7 @@ async def create_plan(prompt: str, config: dict, history: list[dict] | None = No
         domain_guidance=meta.planner_domain_guidance,
     ).format(catalog=json.dumps(catalog(), indent=2))
     request = {"prompt": prompt, "history": history or [], "options": config.get("options", {})}
-    available = planner_view()
+    available = planner_view() if meta.planner_skills else []
     if available:
         request["available_skills"] = available
     user_prompt = json.dumps(request)

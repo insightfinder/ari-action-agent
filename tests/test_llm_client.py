@@ -3,10 +3,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import anthropic
+import httpx
+import openai
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from common import planner  # noqa: E402
 from common.llm import client as llm_client  # noqa: E402
 
 
@@ -75,3 +79,84 @@ def test_the_sdk_deadline_fits_inside_the_activity_that_runs_it():
     """
     worst_case = llm_client._TIMEOUT_SECONDS * (llm_client._MAX_RETRIES + 1)
     assert worst_case < 1200, f"worst-case planner call is {worst_case}s, past the activity's 1200s timeout"
+
+
+def _status_error(cls, status, message):
+    response = httpx.Response(status, request=httpx.Request("POST", "https://llm.example.com/v1"))
+    return cls(message, response=response, body=None)
+
+
+def _failing_openai(exc):
+    return SimpleNamespace(responses=SimpleNamespace(create=AsyncMock(side_effect=exc)))
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_key_error_carries_no_part_of_the_key():
+    # The shape OpenAI really answers a wrong key with: first and last characters of the key intact.
+    exc = _status_error(
+        openai.AuthenticationError,
+        401,
+        "Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-proj-****************abcd. "
+        "You can find your API key at https://platform.openai.com/account/api-keys.'}}",
+    )
+    with patch.object(llm_client, "AsyncOpenAI", return_value=_failing_openai(exc)):
+        with pytest.raises(llm_client.LLMProviderError) as raised:
+            await llm_client.complete({"provider": "openai", "api_key": "sk-x", "model": "m"}, "s", "u")
+
+    assert str(raised.value) == "openai rejected the API key (HTTP 401)"
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
+
+
+@pytest.mark.asyncio
+async def test_other_provider_errors_keep_their_detail_with_keys_masked():
+    exc = _status_error(
+        anthropic.BadRequestError,
+        400,
+        "model claude-nope not found; api key used: sk-ant-api03-abcdefgh, also sk-proj-****wxyz",
+    )
+    fake = SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(side_effect=exc)))
+    with patch.object(llm_client, "AsyncAnthropic", return_value=fake):
+        with pytest.raises(llm_client.LLMProviderError) as raised:
+            await llm_client.complete({"provider": "anthropic", "api_key": "k", "model": "m"}, "s", "u")
+
+    text = str(raised.value)
+    assert text.startswith("anthropic returned HTTP 400: model claude-nope not found")
+    assert "abcdefgh" not in text and "wxyz" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message, secret",
+    [
+        ("api_key=abc123def456 is not valid", "abc123def456"),
+        ("upstream said: Authorization: Bearer eyJhbGciOi.payload.sig failed", "eyJhbGciOi"),
+        ("key 0123456789abcdef0123456789abcdef rejected", "0123456789abcdef0123456789abcdef"),
+        ("gsk_abcdefghijk is invalid", "gsk_abcdefghijk"),
+    ],
+)
+async def test_key_shapes_in_other_errors_are_masked(message, secret):
+    exc = _status_error(openai.BadRequestError, 400, message)
+    with patch.object(llm_client, "AsyncOpenAI", return_value=_failing_openai(exc)):
+        with pytest.raises(llm_client.LLMProviderError) as raised:
+            await llm_client.complete({"provider": "openai", "api_key": "k", "model": "m"}, "s", "u")
+    assert secret not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_an_api_key_mention_without_a_key_is_left_readable():
+    exc = _status_error(openai.RateLimitError, 429, "The api key for model gpt-4o: rate limit exceeded")
+    with patch.object(llm_client, "AsyncOpenAI", return_value=_failing_openai(exc)):
+        with pytest.raises(llm_client.LLMProviderError) as raised:
+            await llm_client.complete({"provider": "openai", "api_key": "k", "model": "m"}, "s", "u")
+    assert str(raised.value).endswith("The api key for model gpt-4o: rate limit exceeded")
+
+
+@pytest.mark.asyncio
+async def test_a_planning_failure_from_a_rejected_key_names_no_key():
+    exc = _status_error(openai.AuthenticationError, 401, "Incorrect API key provided: sk-proj-****abcd.")
+    config = {"llm": {"provider": "openai", "api_key": "sk-x", "model": "m"}}
+    with patch.object(llm_client, "AsyncOpenAI", return_value=_failing_openai(exc)):
+        with pytest.raises(llm_client.LLMProviderError) as raised:
+            await planner.create_plan("check the pods", config)
+
+    assert "abcd" not in str(raised.value)

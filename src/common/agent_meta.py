@@ -26,6 +26,7 @@ from .settings import get_settings
 # cost as registering a new capability or tool.
 _AGENT_PACKAGES = {
     "oncall": "ari_oncall_agent",
+    "k8s": "k8s_agent",
 }
 
 
@@ -67,6 +68,11 @@ class AgentMeta:
     # None for an agent kind with no such default-step policy (e.g.
     # jenkins).
     default_step_policy: Optional[Callable[[Plan, dict], list[Step]]] = None
+    # Whether planner.py lists the installed Agent Skills (`available_skills`)
+    # in the planner's request. False for a kind with no `run_skill`
+    # capability: it could only plan a step that does not exist here, and the
+    # guarantee should not hang on the image remembering SKILLS_ENABLED=false.
+    planner_skills: bool = True
     direct_capabilities: tuple[str, ...] = ()
 
 
