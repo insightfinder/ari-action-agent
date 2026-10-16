@@ -3961,3 +3961,86 @@ image on the bastion, branch code mounted:
 AWS skill (the test worker has no AWS credentials or `boto3`).
 
 **Verified:** Windows 466 passed; Linux 616 passed in the worker image.
+
+## 2026-10-15 - Slack front end for the chat gateway (II-25116, step 2)
+
+People can now use the agent from Slack. `src/chat_gateway/slack.py` is a
+Bolt `AsyncApp` over Socket Mode on top of the platform-neutral `Bridge` from
+step 1; `docs/CHAT_GATEWAY.md` is the operator and user guide. The agent does
+not change: the gateway is one more A2A client, like the `ari` CLI.
+
+**Why a separate process, not part of `ari-oncall-api`.** The gateway carries
+`LLM_API_KEY` and `GITHUB_PAT` for every request; the API pod holds neither
+and is internet-facing in test. Socket Mode is one long-lived outbound
+connection that Slack load-balances events across, so the gateway must run as
+exactly one replica with `strategy: Recreate`, while the API rolls on every
+push to `test`. Keeping them apart means an agent rollout does not drop the
+Slack connection and a Slack outage cannot touch the agent.
+
+**How it behaves.**
+
+- A conversation is a thread, keyed `channel:thread_ts`; a DM is one
+  conversation keyed `channel:dm`. Mention the bot to start; replies in a
+  known thread continue without a mention. One request per thread at a time
+  (per-thread lock). Progress is one message edited in place, throttled by
+  `SLACK_PROGRESS_SECONDS`.
+- Proposals show the agent's own words plus a compact Repository / Branch /
+  Files / Tests block, with Approve (confirm dialog), Decline and Full diff
+  buttons. The button value carries thread key, task id, pending action id
+  and requester, so buttons work after a restart and a leftover Decline on an
+  older proposal is refused instead of cancelling the current task.
+- `REQUESTER_CAN_APPROVE=false` is a four-eyes rule: only someone in
+  `APPROVERS` other than the requester may approve; the requester can still
+  decline. Startup refuses `false` with an empty `APPROVERS`.
+- Approval emails come from UIE (OnCallAriApprovalDelivery), never from the
+  agent, so requests made from Slack or the CLI get buttons or a menu only.
+
+**Restarts.** The first live restart lost every conversation, and a plain
+reply in an old thread was silently ignored, which looked like the bot had
+died. Two fixes:
+
+- `SLACK_SESSION_FILE` persists conversations (atomic write, mode 0600). Only
+  ids are saved: thread key, requester, context id, task id, task state,
+  pending action id, timestamp. The request `config` (LLM key, PAT) is never
+  written; `approve()` rebuilds it from the environment. A damaged file is
+  logged and the gateway starts empty. The 24 h TTL still applies.
+- In a thread the gateway does not know, a plain reply triggers one
+  `conversations.replies` read (cached per thread, bounded at 5000 entries);
+  if the bot has written there, it posts a one-line "I no longer have this
+  conversation, mention me to start again" note, once per thread per process.
+  Threads the bot never joined stay silent. A failing read stays silent.
+
+**Slack quirks found on the way.**
+
+- `message` events also arrive for messages that mention the bot; those are
+  left to `app_mention`, or every mention would run twice.
+- Slack turns `repo=github.com/org/x` into `<http://github.com/org/x|github.com/org/x>`;
+  the label is kept, and `repo=` values without a scheme get `https://`.
+- Messages with subtype `file_share` or `thread_broadcast` are real user
+  messages and must not be dropped with the other subtypes.
+- A button click in a DM has no `thread_ts`; replies must go back to the DM,
+  not into a new thread.
+- mrkdwn needs `&`, `<`, `>` escaped outside code; `**bold**`, headings and
+  Markdown links are converted, code spans and fences are left alone, and a
+  long answer split into chunks re-balances its ``` fences.
+- The container runs as PID 1, so SIGTERM is handled explicitly or
+  `docker stop` waits for the kill timeout.
+
+**Live**, app "ARI Agent" in a private test channel, gateway on the bastion
+against the deployed test agent: a question, a thread follow-up, a DM, a
+decline (buttons closed, "Declined by"), and an approve that opened PR #25 on
+OnCall-ARI-InfraCore-testing. Reading the channel afterwards led to three
+fixes: `status` is one line instead of the whole answer again, no duplicate
+"canceled" message after a decline, and the shorter proposal text above.
+
+**Review.** A review workflow confirmed 16 unique defects; 15 were fixed. Not
+fixed: a progress edit that falls inside the throttle window is dropped, not
+deferred, so the "working" message can lag one step behind.
+
+**Not done here:** a `chatGateway` block in the `oncallari` Helm chart (one
+replica, Recreate, Secret for the Slack tokens, a small PVC for
+`SLACK_SESSION_FILE`, no ingress); the Docker Hub repository
+`insightfinderinc/ari-chat-gateway` may not exist yet; Teams is step 4.
+
+**Verified:** Windows 534 passed (six POSIX-only modules cannot be imported
+there); Linux 668 passed in the worker image with the `slack` and CLI extras.

@@ -4,7 +4,7 @@ description: Checks the TLS certificates of HTTPS endpoints and reports whether 
 compatibility: Needs python3 (standard library only) and outbound network access to the endpoints being checked.
 metadata:
   author: insightfinder
-  version: "1.1"
+  version: "1.2"
 ---
 
 # TLS certificate check
@@ -42,4 +42,4 @@ The script exits with status 1 when any target is not `ok`. That is expected and
 
 ## Report
 
-For each target, give its status and, when present, the expiry date (`not_after`), the days left and the issuer. Put targets that need attention first. Quote `error` verbatim for `invalid`, `unreachable` and `skipped` targets. Do not guess at a fix the output does not support.
+For each target, give its status and, when present, the expiry date (`not_after`), the days left and the issuer. Put targets that need attention first. Say a certificate is close to expiring only when its status is `expiring`; `ok` means at least `warn_days` remain, so do not call it close to the threshold. Quote `error` verbatim for `invalid`, `unreachable` and `skipped` targets. Do not guess at a fix the output does not support.

@@ -4,7 +4,7 @@ description: Adds one person's public IP address to the operator-configured AWS 
 compatibility: Needs python3, boto3, and AWS credentials with ec2:DescribeSecurityGroups and ec2:AuthorizeSecurityGroupIngress. The operator must add a config.json next to this SKILL.md listing the security group ids it may change.
 metadata:
   author: insightfinder
-  version: "1.1"
+  version: "1.2"
 ---
 
 # Allow an IP address into the security groups

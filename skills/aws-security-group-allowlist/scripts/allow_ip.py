@@ -55,7 +55,10 @@ def load_config(path):
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
-        raise UsageError(f"{path} does not exist, so no security group may be changed") from None
+        raise UsageError(
+            "this skill has no config.json, so no security group may be changed; an operator must add one "
+            "next to SKILL.md in the deployed copy of the skill (SKILLS_DIR/aws-security-group-allowlist/config.json)"
+        ) from None
     except (OSError, ValueError) as exc:
         raise UsageError(f"cannot read {path}: {exc}") from None
     groups = data.get("groups") if isinstance(data, dict) else None
