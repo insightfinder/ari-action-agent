@@ -21,8 +21,9 @@ def _keep_plans_safe(plan: Plan, options: dict) -> list[Step]:
 
     - Only this kind's own read and propose steps are kept. `apply_approved_change`
       is reachable only through an approved proposal (plan_task's confirmation
-      bypass), and anything else the planner names (an Agent Skill offered to
-      every kind's planner, a capability of another kind) does not exist here.
+      bypass), and anything else the planner names (an Agent Skill, which this
+      kind's planner is not even offered, or a capability of another kind)
+      does not exist here.
     - `check_health` and `propose_change` always have `find_workload` before
       them, so a name without a namespace is resolved against the live cluster
       instead of failing or silently widening to a whole namespace.
@@ -123,4 +124,6 @@ confirmation path that bypasses planning; a planned one refuses to run.
     },
     default_step_policy=_keep_plans_safe,
     confirm_capability=_MUTATING,
+    # No run_skill here, and skill scripts have no place on a worker with cluster-wide patch rights.
+    planner_skills=False,
 )
