@@ -176,6 +176,10 @@ on Windows, so run them in the worker image:
 docker run --rm -v "$PWD:/work" -w /work insightfinderinc/ari-oncall-agent-worker:test   sh -lc 'pip install -q pytest pytest-asyncio "kubernetes>=37,<38"; PYTHONPATH=/work/src python -m pytest tests/ -q'
 ```
 
+Without the `kubernetes` package the k8s kind's tests (`tests/test_k8s_*.py`)
+are skipped, not failed, so check the summary's skip count; `pip install -e ".[dev]"`
+includes it.
+
 **A green suite is not enough on its own.** Mocks always return something, so
 they cannot produce the three conditions that have actually broken this agent
 in production: a model that edits nothing while reporting that it did, a clock

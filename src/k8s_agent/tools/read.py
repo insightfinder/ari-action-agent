@@ -35,7 +35,9 @@ async def _retry(fn):
             delay *= 2
 
 
-def _selector(labels: dict | None) -> str | None:
+def _selector(labels: dict | str | None) -> str | None:
+    if isinstance(labels, str):
+        return labels or None
     return ",".join(f"{k}={v}" for k, v in labels.items()) if labels else None
 
 
@@ -67,7 +69,7 @@ async def list_deployment_views(namespace: str | None = None) -> list[dict]:
     return [views.deployment_view(r) for r in await _list_dicts("Deployment", namespace=namespace)]
 
 
-async def list_pods(namespace: str | None = None, selector: dict | None = None, active_only: bool = False) -> list[dict]:
+async def list_pods(namespace: str | None = None, selector: dict | str | None = None, active_only: bool = False) -> list[dict]:
     raws = await _list_dicts("Pod", namespace=namespace, labels=selector or None)
     pods = [views.pod_view(r) for r in raws]
     if active_only:

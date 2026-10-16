@@ -66,7 +66,32 @@ def format_memory(num_bytes: int) -> str:
         return f"{num_bytes // GI}Gi"
     if num_bytes % MI == 0:
         return f"{num_bytes // MI}Mi"
+    if num_bytes % 2**10 == 0:
+        return f"{num_bytes // 2**10}Ki"
     return str(num_bytes)
+
+
+# Smallest memory value a person plausibly means. Below it the value is almost always a unit slip
+# ("512" or "512m" for 512Mi), which the API server would accept as bytes and roll out.
+MIN_MEMORY_BYTES = 4 * MI
+
+
+def memory_request_problem(value) -> str | None:
+    """Why a requested memory value is refused, or None. `m`/`u`/`n` are legal suffixes for memory
+    (milli-bytes) but nobody means them, and many tools write "512m" for megabytes."""
+    match = _QUANTITY.match(str(value))
+    if match and match.group(2) in ("m", "u", "n"):
+        return (
+            f"memory value {value!r} uses the suffix {match.group(2)!r}, which Kubernetes reads as fractions of "
+            "a byte; write it with Mi or Gi (e.g. 512Mi)."
+        )
+    try:
+        amount = memory_bytes(value)
+    except (ValueError, TypeError):
+        return None  # reported as an invalid quantity by the caller
+    if 0 < amount < MIN_MEMORY_BYTES:
+        return f"memory value {value!r} is {amount} bytes; write it with Mi or Gi (e.g. 512Mi)."
+    return None
 
 
 def floor_memory_to_mi(num_bytes: int) -> int:

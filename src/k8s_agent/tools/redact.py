@@ -29,6 +29,10 @@ _SECRET_WORD = (
 )
 
 _PEM = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL)
+# A log tail is cut by line count and size, so it can hold half a key: a BEGIN with the rest cut off
+# (everything after it goes), or an END whose BEGIN was cut (the base64 lines before it go).
+_PEM_NO_END = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*\Z", re.DOTALL)
+_PEM_NO_BEGIN = re.compile(r"(?:^[ \t]*[A-Za-z0-9+/=]{16,}[ \t]*\r?\n)*[ \t]*-----END [A-Z0-9 ]*PRIVATE KEY-----", re.MULTILINE)
 _AUTH_HEADER = re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}")
 _URL_USERINFO = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s@]+@")
 _URL_SECRET_PARAM = re.compile(
@@ -51,6 +55,10 @@ _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}
 _KEY_VALUE = re.compile(
     rf"(?i)([\"']?[\w.-]*{_SECRET_WORD}[\w.-]*[\"']?\s*[:=]\s*[\"']?)(?!\[REDACTED\])([^\s\"',;&}}\]]+)"
 )
+# `"password": "correct horse battery"` — a quoted value is taken whole, spaces included.
+_KEY_QUOTED_VALUE = re.compile(
+    rf"(?i)([\"']?[\w.-]*{_SECRET_WORD}[\w.-]*[\"']?\s*[:=]\s*)([\"'])(?!\[REDACTED\])([^\"'\n]*)\2"
+)
 _SECRET_KEY_NAME = re.compile(rf"(?i)^[\w.-]*{_SECRET_WORD}[\w.-]*$")
 
 
@@ -60,12 +68,15 @@ def redact_text(text: str) -> str:
     if not text:
         return text
     out = _PEM.sub(REDACTED, text)
+    out = _PEM_NO_END.sub(REDACTED, out)
+    out = _PEM_NO_BEGIN.sub(REDACTED, out)
     out = _AUTH_HEADER.sub(lambda m: f"{m.group(1)} {REDACTED}", out)
     out = _URL_USERINFO.sub(lambda m: f"{m.group(1)}{REDACTED}@", out)
     out = _URL_SECRET_PARAM.sub(lambda m: f"{m.group(1)}{REDACTED}", out)
     for pattern in _PREFIXED_TOKENS:
         out = pattern.sub(REDACTED, out)
     out = _JWT.sub(REDACTED, out)
+    out = _KEY_QUOTED_VALUE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}{m.group(2)}", out)
     out = _KEY_VALUE.sub(lambda m: f"{m.group(1)}{REDACTED}", out)
     return out
 
