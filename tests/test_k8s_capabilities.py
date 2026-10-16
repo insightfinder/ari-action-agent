@@ -462,6 +462,18 @@ async def test_memory_limit_alone_is_changed(cluster):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["512m", "512", "2000u"])
+async def test_a_memory_value_without_a_real_unit_is_refused(cluster, value):
+    # "512m" is legal Kubernetes (512 milli-bytes, i.e. a 1-byte limit) and a common shorthand for megabytes.
+    llm = ScriptedLLM(_change(action="set_resources", container="app", resources={"limits": {"memory": {"value": value, "quote": f"memory limit to {value}"}}}))
+    result = await propose_change.run(
+        _ctx("propose_change", f"set the memory limit to {value} on checkout", results=_resolved("checkout"), llm=llm)
+    )
+    assert "pending_action" not in result and "Mi or Gi" in result["refusal"]["reason"]
+    assert cluster.patches == []
+
+
+@pytest.mark.asyncio
 async def test_cpu_above_node_capacity_is_clamped_and_reported(cluster):
     llm = ScriptedLLM(
         _change(
@@ -613,6 +625,27 @@ async def test_a_retried_apply_does_not_write_twice(cluster):
     again = (await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True)))["action_result"]
     assert len(_writes(cluster)) == 1
     assert again["ran"] is True and again["applied"]["already_at_target"] is True and again["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_a_retried_apply_judges_only_pods_created_since_the_proposal(cluster, monkeypatch):
+    pa = await _proposal(cluster, "scale checkout to 5", _change(action="scale_replicas", replicas=5, replicas_quote="to 5"), "checkout")
+    cluster.auto_rollout = True
+    await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True))
+    seen = {}
+    real_wait = rollout.wait_rollout
+
+    async def spy(namespace, name, target, applied_at, max_wait):
+        seen["applied_at"] = applied_at
+        return await real_wait(namespace, name, target, applied_at, max_wait)
+
+    monkeypatch.setattr(rollout, "wait_rollout", spy)
+    again = (await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True)))["action_result"]
+    assert again["applied"]["already_at_target"] is True
+    # Not None (every pod, including a crash loop from before the change), but the proposal's own time.
+    from datetime import datetime
+
+    assert seen["applied_at"] == datetime.fromisoformat(pa["created_at"]).isoformat()
 
 
 @pytest.mark.asyncio
@@ -833,3 +866,20 @@ def test_dry_run_tool_cannot_be_turned_into_a_write():
     import inspect
 
     assert list(inspect.signature(write.dry_run_patch).parameters) == ["action"]
+
+
+@pytest.mark.asyncio
+async def test_a_health_check_of_an_unmatched_name_checks_nothing_instead_of_the_namespace(cluster):
+    unmatched = {"find_workload": {"resolution": None, "candidates": ["shop/checkout", "shop/checkout-gateway"]}}
+    result = await check_health.run(_ctx("check_health", "check the checkoutt deployment", results=unmatched, options={"namespace": "shop"}))
+    report = result["report"]
+    assert report["scope"]["type"] == "unresolved" and report["findings"] == []
+    assert report["scope"]["candidates"] == ["shop/checkout", "shop/checkout-gateway"]
+    assert "Nothing was checked" in report["gaps"][0]
+
+
+@pytest.mark.asyncio
+async def test_planner_params_do_not_override_the_resolved_target(cluster):
+    ctx = _ctx("check_health", "check checkout", results=_resolved("checkout"), params={"name": "api", "namespace": "kube-system"})
+    result = await check_health.run(ctx)
+    assert result["report"]["scope"] == {"type": "deployment", "namespace": "shop", "deployment": "checkout"}

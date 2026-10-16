@@ -23,6 +23,8 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    # The k8s kind's tests skip without it; a dev install runs them.
+    "kubernetes>=37,<38",
 ]
 # The k8s kind's worker only (Dockerfile.k8s). The shared API image and the
 # oncall worker never import it, so they install without it.

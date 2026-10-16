@@ -22,16 +22,14 @@ def options(ctx: StepContext) -> dict:
 
 
 def resolved_target(ctx: StepContext) -> dict:
-    """The workload `find_workload` resolved, overridden by explicit params."""
+    """The workload `find_workload` resolved against the live cluster. Planner params never override
+    it: a name the planner passes is exactly the unchecked guess `find_workload` exists to replace."""
     resolution = (ctx.results.get("find_workload") or {}).get("resolution") or {}
     target = {
         "scope": resolution.get("scope"),
         "namespace": resolution.get("namespace"),
         "name": resolution.get("name"),
     }
-    for key in ("namespace", "name"):
-        if ctx.params.get(key):
-            target[key] = ctx.params[key]
     if target.get("name"):
         target["scope"] = "deployment"
     return target

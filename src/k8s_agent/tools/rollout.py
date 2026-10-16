@@ -149,6 +149,33 @@ def _resources_match(pods: list[dict], container: str, applied: dict) -> bool:
     return False
 
 
+def moved_away(dep: dict, target: dict) -> str | None:
+    """What no longer holds the approved value on the Deployment, or None. Something that manages the
+    Deployment (a GitOps reconcile, a Helm upgrade, a person) can put its own value back while the
+    rollout is watched; the rollout then never completes, and that is not "still in progress"."""
+    kind = target.get("kind")
+    if kind == "replicas":
+        if dep.get("replicas") != target.get("replicas"):
+            return f"spec.replicas is {dep.get('replicas')} again, not the approved {target.get('replicas')}"
+        return None
+    if kind != "resources":
+        return None
+    container = target.get("container")
+    current = next((c.get("resources") or {} for c in (dep.get("template") or {}).get("containers") or [] if c.get("name") == container), None)
+    if current is None:
+        return f"container {container} is no longer in the pod template"
+    for side, values in (target.get("resources") or {}).items():
+        for resource, value in (values or {}).items():
+            have = (current.get(side) or {}).get(resource)
+            try:
+                same = have is not None and quantities.to_units(resource, have) == quantities.to_units(resource, value)
+            except ValueError:
+                same = False
+            if not same:
+                return f"{side}.{resource} of container {container} is {have} again, not the approved {value}"
+    return None
+
+
 def _about_this_change(cond: dict, generation_ok: bool, applied_at: datetime | None) -> bool:
     """Whether a Deployment condition describes the rollout this change started.
 
@@ -237,7 +264,19 @@ async def wait_rollout(
     baseline: dict = {}
     while True:
         dep = await read.get_deployment(namespace, deployment)
-        pods = await read.list_pods(namespace, selector=dep.get("selector") or None)
+        elapsed = round(time.monotonic() - started)
+        moved = moved_away(dep, target)
+        if moved:
+            return {
+                "done": True,
+                "status": "reverted",
+                "detail": (
+                    f"The change was applied, then undone: {moved}. Something that manages this Deployment, "
+                    "most likely a GitOps reconcile or a Helm upgrade, restored its own value."
+                ),
+                "waited_seconds": elapsed,
+            }
+        pods = await read.list_pods(namespace, selector=dep.get("label_selector") or dep.get("selector") or None)
         sched_events: list[dict] = []
         ca: dict = {"available": False, "reason": "not needed"}
         if _pending(_new_pods(pods, applied)):

@@ -153,6 +153,7 @@ def deployment_view(raw: dict) -> dict:
         "observed_generation": status.get("observedGeneration"),
         "replicas": spec.get("replicas", 1),
         "selector": dict((spec.get("selector") or {}).get("matchLabels") or {}),
+        "label_selector": label_selector(spec.get("selector") or {}),
         "progress_deadline_seconds": spec.get("progressDeadlineSeconds", 600),
         "strategy": {
             "type": strategy.get("type", "RollingUpdate"),
@@ -302,6 +303,23 @@ def hpa_view(raw: dict) -> dict:
         "labels": ownership_labels(raw),
         "annotations": kept_annotations(raw),
     }
+
+
+def label_selector(selector: dict) -> str | None:
+    """A LabelSelector as the API's string form, matchExpressions included: a Deployment selected only
+    by expressions must not end up listing every pod in its namespace."""
+    terms = [f"{k}={v}" for k, v in (selector.get("matchLabels") or {}).items()]
+    for expr in selector.get("matchExpressions") or []:
+        key, op, values = expr.get("key"), expr.get("operator"), expr.get("values") or []
+        if op == "In":
+            terms.append(f"{key} in ({','.join(values)})")
+        elif op == "NotIn":
+            terms.append(f"{key} notin ({','.join(values)})")
+        elif op == "Exists":
+            terms.append(key)
+        elif op == "DoesNotExist":
+            terms.append(f"!{key}")
+    return ",".join(terms) or None
 
 
 def pdb_view(raw: dict) -> dict:

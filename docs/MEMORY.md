@@ -4441,3 +4441,73 @@ Not live-tested; the e2e above ran before it, as bo.
 - Still not testable on test: the approval email (test cannot send mail),
   Cluster Autoscaler backoff in an unrelated group, a patch call that errors
   after landing (unit-tested only).
+
+## 2026-10-16 — Pre-PR review of the k8s kind, and a 36-scenario live run from the chart
+
+Scope: this repo and the oncallari chart only (mcp-service and the other
+repos integrate the agent separately).
+
+**Fixed after review:**
+- A retried apply that found the change already in place verified it with no
+  start time, so pods from before the change (often the very crash loop the
+  change fixes) counted as its own: `new_pods_failing` straight away. It now
+  judges only pods created since the proposal (`pending_action.created_at`).
+- A replica or resource change put back during verification (a Flux
+  reconcile, a Helm upgrade) waited out the window and said `in_progress`.
+  `wait_rollout` now returns `reverted` as soon as the Deployment stops holding
+  the approved value (quantities compared as numbers, not strings).
+- "512m" memory is legal Kubernetes (milli-bytes), so it was proposed as a
+  1-byte limit. Memory with `m`/`u`/`n`, or under 4Mi, is now refused with a
+  hint to use Mi/Gi.
+- A health check of a name that matched nothing silently reported the whole
+  namespace. It now checks nothing: `scope.type: unresolved`, with candidates.
+- Planner params could override `find_workload`'s resolution (an unchecked
+  name); they no longer can.
+- A Deployment selected only by `matchExpressions` listed every pod in its
+  namespace; pods are now listed with the full selector.
+- Redaction: a log tail cut through a private key (only BEGIN, or only END)
+  and quoted multi-word secrets (`"password": "correct horse battery"`) are
+  now scrubbed.
+- `kubernetes` is in the `dev` extra: without it the k8s tests skip rather
+  than fail.
+- Chart: RBAC trimmed to exactly what `tools/client.py` calls (no `watch`,
+  no ReplicaSets/DaemonSets, no events.k8s.io, no node metrics, Flux objects
+  `get` only; `docs/examples/k8s-rbac.yaml` matches). Rendering now fails
+  without `agentApiKeys` (or with `change-me`), without a payload encryption
+  key, with `api.replicaCount` > 1, or with `serviceAccount.create=false` and
+  no name.
+
+**Live script made stricter and re-runnable:** every applied change is
+read back with kubectl; every cancelled proposal must leave the Deployment's
+generation unchanged; write scenarios put the fields they touched back with
+kubectl (the four write scenarios that used to fail on a second run now
+pass again). New: `auth`, `rbac`
+(`kubectl auth can-i` as the worker's ServiceAccount, allow and deny lists),
+`pods` (tini PID 1, uid 10001, read-only root, no token in the API pod),
+`health_cluster`, `health_missing`, `missing_target`, `ambiguous`, and the
+approval gate: `gate_text_yes`, `gate_wrong_id`, `gate_cross_task`,
+`gate_cancelled`, `gate_stale`, `gate_replay`, `double_approve`.
+
+**Verified on test (2026-10-16):** installed with the README's `helm install`
+line from the chart branch (temporary images `2610161234-ii25173`), then
+`--allow-writes`: 36/36 pass; four write scenarios rerun: pass. Everything
+deleted afterwards (release, both namespaces, Temporal namespace; helm
+removed the cluster RBAC).
+
+**Not live-tested:** the retried apply's proposal-time cutoff when an old
+failing pod exists (`worker_restart` uses e2e-slow, which has none). Cheap
+next time: propose 128Mi on e2e-memhungry, set 128Mi with kubectl, approve;
+expect `already_at_target` and a status other than `new_pods_failing`.
+
+**Shared behaviour seen, not changed (src/common, same for oncall):**
+- A missing or wrong `x-api-key` is refused, but answered 500, not 401.
+- An approval naming the wrong id fails the task, so the real proposal can
+  no longer be approved (HTTP 400); ask again for a fresh one.
+- Two approvals sent at once wrote once and the task ended `COMPLETED`
+  (workflow id = task id).
+- If a retried apply attempt itself fails at the Temporal level (worker lost
+  again, step budget spent), the response says nothing was executed and no
+  `action_result` is published, although the first attempt may have written.
+  The fix belongs in the shared workflow/`execution_fact`.
+- `tests/test_workflow_execution.py::test_the_budget_caps_a_step_across_all_of_its_retries`
+  failed once in a full run and passed on every rerun (timing).
