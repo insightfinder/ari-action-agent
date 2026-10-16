@@ -656,11 +656,11 @@ def scenario_auth(_args):
         results[f"{label}.send"] = _http_status(lambda: httpx.post(f"{url}/message:send", headers=headers, json=body, timeout=30))
         results[f"{label}.get"] = _http_status(lambda: httpx.get(f"{url}/tasks/{uuid.uuid4()}", headers=headers, timeout=30))
     card = _http_status(lambda: httpx.get(f"{url}/.well-known/agent-card.json", timeout=30))
-    # Control: the same unknown-task read with the right key is not a server error, so a 500 above is the
-    # key being refused. (The shared A2A server answers a refused key with 500, not 401: the SDK wraps the
-    # auth hook's HTTPException; src/common, recorded in docs/MEMORY.md.)
+    # Control: the same unknown-task read with the right key gets past the key check (the SDK's 404).
+    # A refused key is a 401 on REST too since 2026-10-16 (common/a2a_server/auth.py's middleware); it
+    # used to be a 500, which is why this scenario once accepted one.
     control = _http_status(lambda: httpx.get(f"{url}/tasks/{uuid.uuid4()}", headers=_headers(), timeout=30))
-    ok = card == 200 and control != 500 and all(code in (401, 403, 500) for code in results.values())
+    ok = card == 200 and control not in (401, 500) and all(code == 401 for code in results.values())
     return ok, f"card={card} control_with_key={control} {results}"
 
 
