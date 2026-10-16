@@ -86,6 +86,26 @@ def _flagged_keys(findings: list[dict], pods: list[dict]) -> set[tuple[str, str]
 
 
 async def run(ctx: StepContext) -> dict:
+    found = ctx.results.get("find_workload")
+    if found is not None and not found.get("resolution"):
+        # A name that matches nothing (or several things) is not widened to the whole namespace: the
+        # report would look like an answer about a workload it never looked at.
+        candidates = found.get("candidates") or []
+        return finish(
+            {
+                "report": {
+                    "scope": {"type": "unresolved", "namespace": None, "deployment": None, "candidates": candidates},
+                    "as_of": datetime.now(timezone.utc).isoformat(),
+                    "findings": [],
+                    "gaps": [
+                        "Nothing was checked: the request did not match exactly one Deployment, namespace or the "
+                        "whole cluster"
+                        + (f"; candidates: {', '.join(candidates)}." if candidates else ".")
+                        + " Name the Deployment (or the namespace) as it appears in the cluster."
+                    ],
+                }
+            }
+        )
     target = resolved_target(ctx)
     scope = target.get("scope")
     namespace = target.get("namespace") or options(ctx).get("namespace")
@@ -98,7 +118,7 @@ async def run(ctx: StepContext) -> dict:
     if scope == "deployment":
         dep = await ctx.tool("get_deployment")(namespace, target["name"])
         deployments = [dep]
-        pods = await ctx.tool("list_pods")(namespace, dep.get("selector") or None)
+        pods = await ctx.tool("list_pods")(namespace, dep.get("label_selector") or dep.get("selector") or None)
     else:
         deployments = await ctx.tool("list_deployment_views")(namespace)
         pods = await ctx.tool("list_pods")(namespace)

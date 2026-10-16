@@ -268,6 +268,9 @@ def _plan_resources(ctx, dep, change, nodes, pods, headroom):
             continue
         if isinstance(entry, str):
             entry = {"value": entry, "quote": None}
+        problem = quantities.memory_request_problem(entry.get("value")) if resource == "memory" else None
+        if problem:
+            return None, refusal(f"{resource} {side}: {problem}")
         if not policy.quote_in_prompt(entry.get("quote"), ctx.prompt, entry.get("value"), resource):
             return None, refusal(
                 f"{resource} {side} was not explicitly requested with a value; CPU and memory are changed only "

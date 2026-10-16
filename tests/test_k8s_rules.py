@@ -44,6 +44,14 @@ def test_memory_bytes(raw, num):
     assert quantities.memory_bytes(raw) == num
 
 
+def test_memory_is_always_formatted_with_a_unit_when_it_has_one():
+    assert quantities.format_memory(3 * 2**10) == "3Ki"
+    assert quantities.format_memory(1000) == "1000"
+    assert quantities.memory_request_problem("512Mi") is None
+    assert "suffix 'm'" in quantities.memory_request_problem("512m")
+    assert "bytes" in quantities.memory_request_problem("1024")
+
+
 def test_format_round_trips_and_rejects_garbage():
     assert quantities.format_cpu(2000) == "2"
     assert quantities.format_cpu(1500) == "1500m"
@@ -96,6 +104,21 @@ def test_redact_text_scrubs_known_token_formats(token):
 def test_redact_text_scrubs_pem_blocks():
     pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----"
     assert "MIIabc" not in redact.redact_text(f"key:\n{pem}\n")
+
+
+def test_redact_text_scrubs_half_a_pem_block_cut_by_the_log_tail():
+    body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nBKcwggSjAgEAAoIBAQDf3xq9Yb1ZyQ2c\n"
+    head_only = redact.redact_text("starting\n-----BEGIN PRIVATE KEY-----\n" + body)
+    assert "MIIEvQ" not in head_only and head_only.startswith("starting\n")
+    tail_only = redact.redact_text("starting\n" + body + "-----END PRIVATE KEY-----\nready")
+    assert "MIIEvQ" not in tail_only and "BKcwgg" not in tail_only
+    assert tail_only.startswith("starting\n") and tail_only.endswith("ready")
+
+
+def test_redact_text_takes_a_quoted_secret_whole():
+    out = redact.redact_text('config {"password": "correct horse battery", "user": "app"}')
+    assert "horse" not in out and "battery" not in out and '"user": "app"' in out
+    assert redact.redact_text(out) == out
 
 
 def test_redact_obj_replaces_values_under_secret_named_keys():
@@ -615,3 +638,50 @@ async def test_a_rollout_that_stays_up_through_the_window_succeeds(monkeypatch):
     applied_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
     verdict = await rollout.wait_rollout("shop", "checkout", {"kind": "replicas", "replicas": 1}, applied_at, 600)
     assert verdict["status"] == "succeeded" and verdict["stable_for_seconds"] >= rollout.STABILITY_SECONDS
+
+
+def test_label_selector_keeps_match_expressions():
+    selector = {
+        "matchLabels": {"app": "web"},
+        "matchExpressions": [
+            {"key": "tier", "operator": "In", "values": ["a", "b"]},
+            {"key": "canary", "operator": "DoesNotExist"},
+            {"key": "zone", "operator": "Exists"},
+            {"key": "env", "operator": "NotIn", "values": ["dev"]},
+        ],
+    }
+    assert views.label_selector(selector) == "app=web,tier in (a,b),!canary,zone,env notin (dev)"
+    only_expressions = views.deployment_view({"metadata": {"name": "w"}, "spec": {"selector": {"matchExpressions": [{"key": "app", "operator": "In", "values": ["w"]}]}}})
+    assert only_expressions["selector"] == {} and only_expressions["label_selector"] == "app in (w)"
+
+
+@pytest.mark.asyncio
+async def test_a_change_undone_during_the_rollout_is_reported_as_reverted(monkeypatch):
+    applied = views.deployment_view(fx.deployment(replicas=3))
+    put_back = views.deployment_view(fx.deployment(replicas=2))  # a GitOps reconcile restores its own value
+    looks = iter([applied, put_back])
+
+    async def get_deployment(namespace, name):
+        return next(looks)
+
+    async def list_pods(namespace, selector=None):
+        return []
+
+    clock = iter(range(0, 10_000, 5))
+    monkeypatch.setattr(rollout.read, "get_deployment", get_deployment)
+    monkeypatch.setattr(rollout.read, "list_pods", list_pods)
+    monkeypatch.setattr(rollout.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(rollout, "POLL_SECONDS", 0)
+    applied_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    verdict = await rollout.wait_rollout("shop", "checkout", {"kind": "replicas", "replicas": 3}, applied_at, 600)
+    assert verdict["status"] == "reverted" and "spec.replicas is 2 again" in verdict["detail"]
+
+
+def test_moved_away_compares_resource_quantities_not_strings():
+    dep = views.deployment_view(fx.deployment())
+    container = dep["template"]["containers"][0]
+    container["resources"] = {"limits": {"memory": "1024Mi", "cpu": "0.5"}}
+    target = {"kind": "resources", "container": container["name"], "resources": {"limits": {"memory": "1Gi", "cpu": "500m"}}}
+    assert rollout.moved_away(dep, target) is None
+    container["resources"] = {"limits": {"memory": "512Mi", "cpu": "500m"}}
+    assert "limits.memory" in rollout.moved_away(dep, target)

@@ -499,14 +499,20 @@ a request never carries cluster credentials.
    `verification.scheduling.cause`: `node_provisioning_failed` when
    Cluster Autoscaler could not add a node for these pods, e.g. an EC2
    quota; `autoscaler_cannot_help`; or `failed_scheduling`), `reverted`
-   (the autoscaler's bounds were changed back, e.g. by a GitOps
-   reconcile), or `verification_unavailable` (applied, but the rollout
-   could not be checked). Every value in a proposal must be stated in the
-   quote the model extracted it from ("3 replicas" cannot back 2024).
+   (the approved value was put back while or after it was verified —
+   replicas, resources or the autoscaler's bounds — e.g. by a GitOps
+   reconcile or a Helm upgrade), or `verification_unavailable` (applied,
+   but the rollout could not be checked). Every value in a proposal must
+   be stated in the quote the model extracted it from ("3 replicas"
+   cannot back 2024), and a memory value must carry a real unit: `512m`
+   (Kubernetes reads it as milli-bytes) or anything under 4Mi is refused.
 
 A request the agent will not act on completes normally with a `refusal`
 artifact (`reason`, plus e.g. the autoscaler's current bounds or the
-candidate Deployments) — nothing is proposed or changed.
+candidate Deployments) — nothing is proposed or changed. A health check
+whose target does not match exactly one Deployment (or a namespace, or the
+cluster) checks nothing: its `health_report.scope.type` is `unresolved`,
+with the `candidates`, rather than a report on the whole namespace.
 
 ### Lasting changes
 

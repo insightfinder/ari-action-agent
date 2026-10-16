@@ -93,6 +93,13 @@ def _drift_since_proposal(proposal: dict, dep: dict, autoscaler: dict | None) ->
     return changes
 
 
+def _proposed_at(proposal: dict) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(proposal.get("created_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _same_quantity(resource: str, have, want) -> bool:
     try:
         return have is not None and quantities.to_units(resource, have) == quantities.to_units(resource, want)
@@ -164,7 +171,9 @@ async def run(ctx: StepContext) -> dict:
     if already:
         # An earlier attempt of this step (or someone else) already put the approved values in place.
         applied = {"already_at_target": True, "note": "the cluster already held the approved values; nothing was written again"}
-        applied_at = None
+        # When it was written is unknown here, but not before the proposal: pods from before it (often the
+        # very crash loop this change fixes) must not be judged as the change's own.
+        applied_at = _proposed_at(proposal)
     else:
         try:
             applied = await ctx.tool("patch_workload")(action)

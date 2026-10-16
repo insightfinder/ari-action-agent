@@ -52,19 +52,29 @@ helm --kube-context $CTX install ari-k8s charts/oncallari -n ari-k8s-agent \
 kubectl --context $CTX -n ari-k8s-agent port-forward svc/ari-k8s-api 18002:80 &
 ARI_API_KEY="$(kubectl --context $CTX -n ari-k8s-agent get secret ari-k8s-secret -o jsonpath='{.data.AGENT_API_KEYS}' | base64 -d)" \
 ARI_API_DEPLOYMENT=ari-k8s-agent/ari-k8s-api ARI_API_SERVICE=ari-k8s-agent/ari-k8s-api ARI_WORKER_DEPLOYMENT=ari-k8s-agent/ari-k8s-worker \
-  python scripts/k8s_agent_live_test.py --allow-writes
+KUBE_CONTEXT=$CTX python scripts/k8s_agent_live_test.py --allow-writes
 ```
+
+The chart refuses to render without `agentApiKeys` (or with `change-me`) and
+without a payload encryption key, unless `existingSecret` is set.
 
 `ARI_API_DEPLOYMENT`/`ARI_API_SERVICE` enable `resume_after_restart`, which
 restarts the API between a proposal and its approval (the task store volume
-must carry the proposal over). `fix_stuck` raises `e2e-memhungry`'s memory
-limit; re-apply `fixtures.yaml` to make it OOM again. Remove with
-`helm uninstall ari-k8s -n ari-k8s-agent` and delete the namespace (the PVC
-goes with it).
+must carry the proposal over). `ARI_WORKER_DEPLOYMENT` enables
+`worker_restart` and, with the API one, the `rbac` and `pods` checks of the
+installed chart (ServiceAccount permissions, tini as PID 1, non-root,
+read-only root filesystem, no token in the API pod). Every write scenario
+puts the fixture fields it changed back with kubectl afterwards, so the run
+can be repeated; after an interrupted run, re-apply `fixtures.yaml`.
 
 Cleanup:
 
 ```bash
+# Chart install: helm removes its ClusterRole/Binding and kube-system Role/Binding (ari-k8s, ari-k8s-ca-status)
+helm --kube-context $CTX uninstall ari-k8s -n ari-k8s-agent
+kubectl --context $CTX delete namespace ari-k8s-e2e ari-k8s-agent
+
+# agent.yaml install instead
 kubectl --context $CTX delete namespace ari-k8s-e2e ari-k8s-agent
 kubectl --context $CTX delete clusterrolebinding,clusterrole ari-k8s-agent
 kubectl --context $CTX -n kube-system delete rolebinding,role ari-k8s-agent-ca-status
