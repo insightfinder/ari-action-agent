@@ -37,7 +37,7 @@ def isolated_protected_branches_config(tmp_path, monkeypatch):
 
 # From configs/oncall/protected_branches.yaml -- a real configured repo,
 # not a fixture, since these tests exercise the actual blacklist.
-_PROTECTED_REPO = {"url": "https://github.com/insightfinder/InfrastructureCore", "pat": "ghp_x"}
+_PROTECTED_REPO = {"url": "https://github.com/example-org/example-repo", "pat": "ghp_x"}
 
 
 def test_agent_defs_all_use_primary_mode():
@@ -241,7 +241,7 @@ def test_write_config_never_leaks_one_repos_denies_into_anothers(tmp_path, monke
     config_path.write_text(
         "default_protected_branches: [main, master]\n"
         "protected_branches:\n"
-        "  https://github.com/insightfinder/InfrastructureCore: [canary]\n"
+        "  https://github.com/example-org/example-repo: [canary]\n"
     )
     monkeypatch.setattr(protected_branches_module, "config_file", lambda name: config_path)
     protected_branches_module._load.cache_clear()
@@ -252,7 +252,7 @@ def test_write_config_never_leaks_one_repos_denies_into_anothers(tmp_path, monke
         write_config(
             str(repo_dir),
             {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"},
-            {"url": "https://github.com/insightfinder/InfrastructureCore", "pat": "ghp_x"},
+            {"url": "https://github.com/example-org/example-repo", "pat": "ghp_x"},
         )
         path = write_config(
             str(repo_dir), {"provider": "openai", "api_key": "sk-x", "model": "gpt-5"}, {"url": "https://github.com/x/y", "pat": "t"}

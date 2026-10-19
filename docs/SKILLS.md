@@ -4,6 +4,97 @@ Skills are how you add capabilities to the ARI agent without touching its code. 
 
 The engine-level extension points (`configs/<kind>/capabilities.yaml`, `tools.yaml`, `AgentMeta`) are for maintainers of this repository. Skills are for everyone else.
 
+## Write your first skill
+
+This walk-through adds a skill that checks whether web pages answer, and tries it against a local agent. It takes about ten minutes once the agent runs locally (see "Run it locally" in the [README](../README.md)).
+
+**1. Create the folder.** The folder name is the skill's name: lowercase letters, digits and hyphens.
+
+```
+skills/http-status/
+  SKILL.md
+  scripts/check.py
+```
+
+**2. Write `SKILL.md`.** The `description` is the only thing the agent reads before choosing a skill, so name the task and the words people use for it.
+
+```markdown
+---
+name: http-status
+description: Checks whether web pages or HTTP endpoints answer, with which status code and how fast. Use when someone asks if a site or URL is up, down, reachable, or returning errors.
+compatibility: Needs python3 (standard library only) and outbound network access to the URLs being checked.
+metadata:
+  author: your-team
+  version: "1.0"
+---
+
+# HTTP status
+
+Run the bundled script once, with every URL from the request:
+
+    python3 <this skill's directory>/scripts/check.py <url> [<url> ...]
+
+It prints one JSON document. `results` has one entry per URL with `ok`, `status` (the HTTP code), `seconds`, or `error` when nothing answered. Exit code 1 means at least one URL is not ok; that is the expected way to report it, not a failure of the script.
+
+Report each URL with its status code and time, and say plainly which ones are down.
+```
+
+**3. Write the script.** Standard library only, arguments in, one JSON document out:
+
+```python
+import argparse
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+def check(url: str, timeout: float) -> dict:
+    started = time.monotonic()
+    request = urllib.request.Request(url, headers={"User-Agent": "ari-skill-http-status"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    except Exception as exc:
+        return {"url": url, "ok": False, "error": str(exc)}
+    return {"url": url, "ok": status < 400, "status": status, "seconds": round(time.monotonic() - started, 2)}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("urls", nargs="+")
+    parser.add_argument("--timeout", type=float, default=10)
+    args = parser.parse_args()
+    results = [check(u if "://" in u else f"https://{u}", args.timeout) for u in args.urls]
+    print(json.dumps({"results": results}, indent=2))
+    return 0 if all(r["ok"] for r in results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+Run it yourself once: `python3 skills/http-status/scripts/check.py example.com`.
+
+**4. Validate it.**
+
+```
+ari skills validate skills/http-status
+```
+
+**5. Ask the agent.** The local `docker compose` setup mounts `skills/` into the worker, and skills are re-read for every request, so no restart is needed:
+
+```
+ari send "is example.com up?"
+```
+
+The planner sees the new skill's description and plans a `run_skill` step; the answer quotes the status code and time from your script. If the agent answers from general knowledge instead, the description did not match the question: make it name the words people actually use.
+
+**6. Ship it.** Contribute it to this repository under `skills/`, or keep it private and mount a folder of your own skills at `SKILLS_DIR` in your deployment (see [Where skills come from](#where-skills-come-from)). Read [What a skill is allowed to do](#what-a-skill-is-allowed-to-do) before writing a skill that changes anything.
+
 ## What a skill looks like
 
 ```

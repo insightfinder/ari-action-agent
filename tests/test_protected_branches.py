@@ -10,28 +10,29 @@ from ari_oncall_agent.protected_branches import is_protected, protected_branches
 
 
 def test_repo_slug_normalizes_scheme_and_dot_git_suffix():
-    assert repo_slug("https://github.com/insightfinder/InfrastructureCore") == "insightfinder/infrastructurecore"
-    assert repo_slug("https://github.com/insightfinder/InfrastructureCore.git") == "insightfinder/infrastructurecore"
-    assert repo_slug("http://github.com/InsightFinder/InfrastructureCore") == "insightfinder/infrastructurecore"
+    assert repo_slug("https://github.com/example-org/example-repo") == "example-org/example-repo"
+    assert repo_slug("https://github.com/example-org/example-repo.git") == "example-org/example-repo"
+    assert repo_slug("http://github.com/Example-Org/Example-Repo") == "example-org/example-repo"
 
 
 def test_configured_repo_reports_its_own_branches_plus_the_defaults():
     # From configs/oncall/protected_branches.yaml -- a real repo entry,
     # not a fixture, since this file is the actual configurable blacklist.
-    # main/master come from default_protected_branches, added on top of
-    # (not instead of) this repo's own dev/staging/test entry.
-    branches = protected_branches("https://github.com/insightfinder/InfrastructureCore")
-    assert branches == {"dev", "staging", "test", "main", "master"}
+    # main/master/dev/staging/test come from default_protected_branches,
+    # added on top of (not instead of) this repo's own `release` entry.
+    branches = protected_branches("https://github.com/example-org/example-repo")
+    assert branches == {"release", "dev", "staging", "test", "main", "master"}
 
 
 def test_protected_branches_matches_regardless_of_dot_git_suffix_or_scheme():
-    assert is_protected("https://github.com/insightfinder/InfrastructureCore.git", "dev")
-    assert is_protected("http://github.com/insightfinder/InfrastructureCore", "staging")
+    assert is_protected("https://github.com/example-org/example-repo.git", "release")
+    assert is_protected("http://github.com/Example-Org/example-repo", "release")
+    assert not is_protected("https://github.com/other-org/other-repo", "release")
 
 
 def test_main_and_master_are_protected_by_default_for_the_configured_repo_too():
-    assert is_protected("https://github.com/insightfinder/InfrastructureCore", "main")
-    assert is_protected("https://github.com/insightfinder/InfrastructureCore", "master")
+    assert is_protected("https://github.com/example-org/example-repo", "main")
+    assert is_protected("https://github.com/example-org/example-repo", "master")
 
 
 @pytest.fixture
