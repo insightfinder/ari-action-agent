@@ -257,7 +257,7 @@ def test_the_bundled_skill_ships_without_a_configuration():
         (["10.0.0.5"], CONFIG, "not a public address"),
         (["104.245.103.0/24"], CONFIG, "only a single address"),
         (["not-an-ip"], CONFIG, "is not an IP address"),
-        (["104.245.103.27"], None, "does not exist, so no security group may be changed"),
+        (["104.245.103.27"], None, "this skill has no config.json, so no security group may be changed; an operator must add one next to SKILL.md in the deployed copy of the skill (SKILLS_DIR/aws-security-group-allowlist/config.json)"),
         (["104.245.103.27"], "{not json", "cannot read"),
         (["104.245.103.27"], {"groups": []}, "must list the allowed security group ids"),
         (["104.245.103.27"], {"groups": ["sg-a"], "permissions": 22}, "must be text"),

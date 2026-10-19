@@ -91,3 +91,59 @@ def test_forget_drops_a_conversation():
     store.forget("th")
     store.forget("missing")
     assert store.get("th") is None
+
+
+def test_a_file_backed_store_survives_a_restart_without_keeping_secrets(tmp_path):
+    path = tmp_path / "state" / "sessions.json"
+    clock = Clock()
+    store = SessionStore(path=path, clock=clock)
+    store.start("th", "alice")
+    store.record_task("th", _paused(), config={"llm": {"api_key": "sk-secret"}, "repo": {"pat": "ghp_secret"}})
+    text = path.read_text(encoding="utf-8")
+    assert "sk-secret" not in text and "ghp_secret" not in text
+    again = SessionStore(path=path, clock=clock)
+    conversation = again.get("th")
+    assert (conversation.requester, conversation.task_id, conversation.context_id, conversation.pending_action_id) == ("alice", "t1", "c1", "act-1")
+    assert conversation.task_state == "TASK_STATE_INPUT_REQUIRED"
+    assert conversation.config == {}
+
+
+def test_expired_conversations_are_dropped_on_load_and_from_the_file(tmp_path):
+    path = tmp_path / "sessions.json"
+    clock = Clock()
+    store = SessionStore(path=path, clock=clock, ttl_seconds=60)
+    store.start("old", "alice")
+    clock.now += 61
+    again = SessionStore(path=path, clock=clock, ttl_seconds=60)
+    assert again.get("old") is None
+    assert '"old"' not in path.read_text(encoding="utf-8")
+
+
+def test_a_damaged_file_starts_empty_instead_of_failing(tmp_path):
+    path = tmp_path / "sessions.json"
+    path.write_text("{not json", encoding="utf-8")
+    assert len(SessionStore(path=path)) == 0
+    path.write_text('{"conversations": [{"thread_key": ""}, "junk", {"thread_key": "ok", "updated_at": "nan-ish"}]}', encoding="utf-8")
+    assert len(SessionStore(path=path)) == 0
+
+
+def test_forget_and_an_unwritable_path_do_not_raise(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x", encoding="utf-8")
+    store = SessionStore(path=blocker / "sessions.json")
+    store.start("th", "alice")
+    store.forget("th")
+    assert store.get("th") is None
+
+
+def test_the_saved_file_is_private(tmp_path):
+    import os
+    import stat
+
+    import pytest
+
+    if os.name != "posix":
+        pytest.skip("file modes are POSIX only")
+    path = tmp_path / "sessions.json"
+    SessionStore(path=path).start("th", "alice")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600

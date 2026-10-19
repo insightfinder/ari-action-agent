@@ -37,6 +37,15 @@ cli = [
     "prompt_toolkit>=3.0.40",
     "questionary>=2.0",
 ]
+slack = [
+    "slack_bolt>=1.21",
+    "aiohttp>=3.9",
+]
+teams = [
+    "microsoft-agents-hosting-aiohttp>=1.8,<2",
+    "microsoft-agents-authentication-msal>=1.8,<2",
+    "aiohttp>=3.9",
+]
 
 [project.scripts]
 ari = "ari_cli.main:app"
