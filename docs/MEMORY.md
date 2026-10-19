@@ -4044,3 +4044,66 @@ replica, Recreate, Secret for the Slack tokens, a small PVC for
 
 **Verified:** Windows 534 passed (six POSIX-only modules cannot be imported
 there); Linux 668 passed in the worker image with the `slack` and CLI extras.
+
+## 2026-10-19 - Microsoft Teams front end for the chat gateway (II-25116, step 4)
+
+`src/chat_gateway/teams.py` puts the same `Bridge` behind Microsoft Teams;
+`python -m chat_gateway teams` runs it, `docs/CHAT_GATEWAY.md` has the setup.
+Built on the Microsoft 365 Agents SDK for Python 1.8.0
+(`microsoft-agents-hosting-aiohttp`, `microsoft-agents-authentication-msal`),
+the successor of the Bot Framework SDK. Only `CloudAdapter`, the JWT
+decorator and proactive `continue_conversation` are used; the SDK's
+`AgentApplication` routing is not, so the gateway logic stays plain dicts and
+is tested with a fake poster.
+
+**How it differs from Slack, and why.**
+
+- Teams cannot be reached through an outbound socket. Microsoft POSTs each
+  activity to `/api/messages`, so the gateway needs public HTTPS. The handler
+  validates the Microsoft token (SDK decorator; 401 otherwise), returns 202
+  at once and runs the turn in a background task, sending every reply
+  proactively. Holding the request open for a minutes-long task would make
+  Teams retry it after about 15 s and start the work twice.
+- Conversation key is `conversation.id`: a channel thread
+  (`19:...@thread.tacv2;messageid=...`), a group chat, or the personal chat.
+  In channels Teams only delivers messages that @mention the bot, so every
+  reply there needs a mention, and the Slack "forgotten thread" hint has no
+  equivalent: any message the bot receives is addressed to it.
+- Users are keyed by `aadObjectId` (lower-cased). Messages from any tenant but
+  `TEAMS_TENANT_ID` are dropped before anything else.
+- Proposals are Adaptive Cards with `Action.Submit` buttons carrying the same
+  thread / task / pending action / requester data as Slack's buttons. A click
+  arrives as a message activity with `value` and `replyToId` = the card. The
+  card is rebuilt without its submit buttons after a decision from an
+  in-memory copy (bounded at 500); after a restart the rebuilt card only has
+  the decision note.
+- Teams markdown drops single line breaks, so lone `\n` outside code fences
+  becomes `\n\n`.
+- `chunks`, `proposal_text` and `says_nothing_new` moved from `slack.py` to
+  `rendering.py` so both front ends share them.
+
+**Getting it into Teams (the slow part was permissions, not code).** The
+user could create the bot in the Developer Portal (Entra app registration was
+allowed), but custom app upload was disabled for normal users, and the Teams
+admin center refused them. "Submit an app to your org" plus an admin approval
+worked instead; the app then shows under Built for your org. Code, endpoint
+and secret changes need no resubmission; package changes do.
+`scripts/teams_app_package.py` builds the package (manifest 1.17, icons drawn
+in code, no Pillow).
+
+**Live**, 2026-10-19, gateway on the bastion behind a Cloudflare quick tunnel
+(the URL changes whenever the tunnel container restarts), against the
+deployed test agent: personal chat (`hi`, a TLS question answered via
+`run_skill`, `status`), a channel post with an @mention, a proposal card,
+Decline (task canceled, card closed with "Declined by"), and Approve, which
+opened PR #26 on OnCall-ARI-InfraCore-testing. All 11 POSTs got 202, no
+warnings in the log. The client secret was checked separately by acquiring a
+Bot Framework token with MSAL.
+
+**Not done here:** the Helm chart (`chatGateway` block with a Service and an
+HTTPS ingress for Teams), and four-eyes was not exercised live in Teams (unit
+tests only).
+
+**Verified:** Windows 549 passed (six POSIX-only modules cannot be imported
+there); Linux 684 passed in the worker image with the slack, teams and CLI
+extras, including the SDK wiring test.

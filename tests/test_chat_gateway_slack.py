@@ -387,7 +387,7 @@ def test_the_entry_point_explains_a_missing_slack_extra(monkeypatch, capsys):
     from chat_gateway import __main__ as entry
 
     monkeypatch.setitem(sys.modules, "slack_bolt", None)
-    assert entry.main() == 2
+    assert entry.main([]) == 2
     assert "needs the 'slack' extra" in capsys.readouterr().err
 
 

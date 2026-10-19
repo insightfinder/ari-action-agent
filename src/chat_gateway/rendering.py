@@ -135,3 +135,48 @@ def render_refusal(text: str) -> Rendered:
 
 def render_outage(error: object) -> Rendered:
     return Rendered(text=f"agent unavailable ({error}); still waiting, the run continues on the agent", state="unavailable")
+
+def chunks(text: str, size: int) -> list[str]:
+    remaining = text
+    parts: list[str] = []
+    while len(remaining) > size:
+        cut = remaining.rfind("\n", 0, size)
+        if cut < size // 2:
+            cut = size
+        part = remaining[:cut]
+        remaining = remaining[cut:].lstrip("\n")
+        if part.count("```") % 2:
+            part += "\n```"
+            remaining = "```\n" + remaining
+        parts.append(part)
+    if remaining or not parts:
+        parts.append(remaining)
+    return parts
+
+
+
+def proposal_text(rendered: Rendered) -> str:
+    task = rendered.task or {}
+    spoken = status_text(task)
+    action = pending_action(task) or {}
+    if not spoken or not action:
+        return rendered.text
+    details = []
+    repo = action.get("repo") or action.get("repo_url")
+    if repo:
+        details.append(f"**Repository:** {repo}")
+    if action.get("branch") or action.get("base_ref"):
+        details.append(f"**Branch:** {action.get('branch') or '?'} → {action.get('base_ref') or '?'}")
+    files = [str(f) for f in action.get("changed_files") or [] if f] if isinstance(action.get("changed_files"), list) else []
+    if files:
+        shown = ", ".join(files[:MAX_FILES_LISTED]) + (f" (+{len(files) - MAX_FILES_LISTED} more)" if len(files) > MAX_FILES_LISTED else "")
+        details.append(f"**Files:** {shown}")
+    verification = action.get("verification")
+    if isinstance(verification, dict) and verification.get("status"):
+        details.append(f"**Tests:** {verification['status']}")
+    return spoken + ("\n\n" + "\n".join(details) if details else "")
+
+
+
+def says_nothing_new(rendered: Rendered) -> bool:
+    return rendered.state != INPUT_REQUIRED and not status_text(rendered.task or {}) and not rendered.links
