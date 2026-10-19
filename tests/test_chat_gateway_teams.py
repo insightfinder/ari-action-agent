@@ -118,6 +118,9 @@ def test_settings_refuse_ids_that_cannot_work():
     with pytest.raises(ConfigError, match="TEAMS_TENANT_ID"):
         teams.TeamsSettings(teams_app_id=APP, teams_app_password="x", teams_tenant_id="contoso").check()
     teams.TeamsSettings(teams_app_id=APP, teams_app_password="x", teams_tenant_id=TENANT).check()
+    with pytest.raises(ConfigError, match="TEAMS_MESSAGES_PATH"):
+        teams.TeamsSettings(teams_app_id=APP, teams_app_password="x", teams_tenant_id=TENANT, teams_messages_path="api").check()
+    teams.TeamsSettings(teams_app_id=APP, teams_app_password="x", teams_tenant_id=TENANT, teams_messages_path="/teams/api/messages").check()
 
 
 def test_a_proposal_card_carries_the_decision_and_the_diff_link():
