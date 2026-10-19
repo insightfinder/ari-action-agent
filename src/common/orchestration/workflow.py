@@ -17,7 +17,8 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
+from temporalio.exceptions import ActivityError, CancelledError, TimeoutType
+from temporalio.exceptions import TimeoutError as ActivityTimeoutError
 
 # A ceiling on the whole pipeline, not on any one step.
 #
@@ -116,6 +117,18 @@ def _activity_failure_detail(exc: ActivityError) -> str:
     if cause is not None and getattr(cause, "message", None):
         return cause.message
     return str(cause) if cause is not None else str(exc)
+
+
+def _may_have_run(exc: ActivityError) -> bool:
+    """Whether a step that failed may have done its work anyway: Temporal stopped waiting for it (a
+    heartbeat, start-to-close or schedule-to-close timeout, or a cancellation) — a lost worker looks
+    like this — rather than the capability raising. A raised error is the capability's own verdict,
+    e.g. apply_approved_change's "Nothing was changed" refusal, and is reported as such. A
+    schedule-to-start timeout means no attempt ever started."""
+    cause = exc.cause
+    if isinstance(cause, CancelledError):
+        return True
+    return isinstance(cause, ActivityTimeoutError) and cause.type != TimeoutType.SCHEDULE_TO_START
 
 
 def _fallback_message(status: str, artifacts: dict[str, Any], failure_reason: str | None) -> str:
@@ -292,6 +305,11 @@ class AriAgentWorkflow:
                 if not on_failure:
                     final_status = "failed"
                     failure_reason = f"{capability} failed: {_activity_failure_detail(exc)}"
+                    if step.get("confirmed") and _may_have_run(exc):
+                        # The approved, mutating step was cut off, not refused: an attempt may have
+                        # written before the worker was lost or the budget ran out. Without a result
+                        # here, `respond` would be told this step never ran and say nothing changed.
+                        results[capability] = {"status": "interrupted", "failure": _activity_failure_detail(exc)}
                     break
                 step_result = {"status": "inconclusive", "failure": _activity_failure_detail(exc)}
 

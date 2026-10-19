@@ -1,10 +1,11 @@
 # Repo structure, and how to add a new agent kind
 
 This repo hosts a small shared framework plus any number of independent
-"agent kinds" built on top of it — today, two: the on-call agent
-(`ari_oncall_agent/`) and the Jenkins agent (`jenkins_agent/`). This doc
-maps the repo and gives the concrete, step-by-step checklist for adding
-a third. `docs/design.md` §0 covers the same split conceptually; this
+"agent kinds" built on top of it — today the on-call agent
+(`ari_oncall_agent/`) and the Kubernetes agent (`k8s_agent/`); the Jenkins
+agent (`jenkins_agent/`, on its own `jenkins-agent` branch) is deprecated
+and kept only as a reference. This doc maps the repo and gives the
+concrete, step-by-step checklist for adding another. `docs/design.md` §0 covers the same split conceptually; this
 doc is the practical "what files do I actually touch" companion,
 written against the real second agent kind that was actually built this
 way — every step below points at a real file, not a hypothetical one.
@@ -31,11 +32,14 @@ src/
     schemas.py         documents this kind's own request config shape
     meta.py            this kind's AgentMeta instance
 
-  jenkins_agent/       the other agent kind's own code — same shape
-    capabilities/      resolve_target, inspect, diagnose, propose_action, execute_action
-    tools/              opencode_cli.py (Jenkins MCP wiring), jenkins_rest.py
+  k8s_agent/           the Kubernetes agent kind — same shape, no opencode
+    capabilities/      find_workload, check_health, propose_change, apply_approved_change
+    tools/             client.py (in-cluster ServiceAccount), read.py, write.py, rollout.py,
+                        views.py + redact.py (what may leave the cluster), pure rule modules
     schemas.py
     meta.py
+
+  jenkins_agent/       DEPRECATED, only on the `jenkins-agent` branch
 
   api/                 thin deployable entrypoints only, zero agent-specific logic
     main.py             `uvicorn api.main:app` — the A2A/FastAPI process
@@ -43,11 +47,11 @@ src/
 
 configs/
   oncall/capabilities.yaml, tools.yaml     declarative registries for that kind
-  jenkins/capabilities.yaml, tools.yaml    same, for the other kind
+  k8s/capabilities.yaml, tools.yaml        same, for the Kubernetes kind
 
 Dockerfile.api          shared API image — used by every agent kind's API deployment
 Dockerfile.oncall       the on-call agent's worker image (git + go/java/maven + opencode)
-Dockerfile.jenkins      the Jenkins agent's worker image (opencode only, no git/build tools)
+Dockerfile.k8s          the Kubernetes agent's worker image (no shell tooling, non-root)
 
 docs/
   design.md                        current-state architecture reference
@@ -63,7 +67,7 @@ tests/                  one flat directory, no per-agent-kind subfolders;
                         don't have a kind in the name
 
 .github/workflows/docker-build-push.yml
-                        builds + pushes all three images on push to main/staging/test
+                        builds + pushes the API image and each kind's worker image on push to main/staging/test
 ```
 
 **The Helm chart lives in a separate repo** —
@@ -107,9 +111,10 @@ whatever it actually is). In the order you'd naturally hit them:
 - `capabilities/<name>.py` per capability — each just
   `async def run(ctx: StepContext) -> dict`, reading `ctx.config`/
   `ctx.params`/`ctx.results` and calling whatever it needs via
-  `ctx.tool("name")`. Look at `jenkins_agent/capabilities/inspect.py` for
-  the simplest possible shape, `execute_action.py` for one that gates a
-  mutating action behind confirmation.
+  `ctx.tool("name")`. Look at `k8s_agent/capabilities/check_health.py`
+  for a read-only one, `k8s_agent/capabilities/apply_approved_change.py`
+  (or oncall's `publish_pr.py`) for one that gates a mutating action
+  behind confirmation.
 - `tools/<name>.py` — thin wrappers around whatever this agent kind
   actually talks to. If it's opencode-driven, copy the shape of
   `jenkins_agent/tools/opencode_cli.py`: a `CAPABILITY_AGENTS` map
@@ -118,11 +123,13 @@ whatever it actually is). In the order you'd naturally hit them:
   `mode: "primary"` is required or `--agent` silently falls back to
   opencode's default agent), `write_config()`, and a `run_opencode()`
   wrapper delegating to `common/opencode_runtime.py`'s agent-kind-agnostic
-  subprocess/tracing mechanics. If it's a direct REST integration instead
-  (no opencode), look at `jenkins_agent/tools/jenkins_rest.py`.
+  subprocess/tracing mechanics. If it's a direct API integration instead
+  (no opencode), look at `k8s_agent/tools/` — typed client calls, every
+  read reduced to whitelisted views and every result redacted before it
+  leaves the capability. (The deprecated Jenkins kind on the
+  `jenkins-agent` branch has the opencode-driven example.)
 - `schemas.py` — a documentation-only pydantic model of what this kind
-  expects inside its own top-level config key (see
-  `jenkins_agent/schemas.py`'s `JenkinsConfig`). Nothing at runtime
+  expects in its config `DataPart` (see `k8s_agent/schemas.py`). Nothing at runtime
   actually validates against it today — capabilities just read
   `ctx.config["slack"]` as a plain dict — but it's the one place a
   caller-facing shape is written down.
@@ -140,6 +147,9 @@ whatever it actually is). In the order you'd naturally hit them:
   - `confirm_capability` — only set this if the kind has a
     human-in-the-loop confirm gate like Jenkins' `trigger_build` (see
     `docs/design.md` §5b); otherwise leave it `None` (the default).
+  - `planner_skills` — set `False` if the kind has no `run_skill`
+    capability, so its planner is not shown the installed Agent Skills
+    (the k8s kind does this). Defaults to `True`.
 
 ### 3.2 Register the package: `common/agent_meta.py`
 
@@ -234,4 +244,7 @@ line in `_AGENT_PACKAGES`. The one narrow exception so far: the
 `confirmed_action`/`StepContext.confirmed`) touches `common/` because
 it's genuinely a reusable *mechanism* (any future kind's own mutating
 action could opt into it via `AgentMeta.confirm_capability`), not
-because Jenkins gets special-cased.
+because Jenkins gets special-cased. Part of the same mechanism: when the
+confirmed step raises past its retries, `workflow.py` records it as
+`{"status": "interrupted"}` and `respond.execution_fact` reports the
+outcome as unknown, never as "nothing was executed".

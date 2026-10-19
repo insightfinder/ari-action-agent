@@ -86,9 +86,10 @@ def _proposal_exists(meta, step_results: dict) -> bool:
 
 
 def execution_fact(meta, step_results: dict) -> str:
-    """Whether this agent kind's one mutating capability actually ran,
-    stated as a fact rather than left for the response-writing model to
-    work out from the step results.
+    """Whether this agent kind's one mutating capability actually ran — or
+    started and was cut off, so nobody can say (`interrupted`, recorded by
+    workflow.py) — stated as a fact rather than left for the
+    response-writing model to work out from the step results.
 
     It does not reliably work it out. On 2026-10-05 a run whose plan was
     only `resolve_target` produced "Action executed: Trigger Buggy
@@ -98,8 +99,9 @@ def execution_fact(meta, step_results: dict) -> str:
     the model sees a proposal among the results and narrates the obvious
     next thing. So the absence is computed here and said out loud.
 
-    Empty for an agent kind with no `confirm_capability` (oncall), which
-    has no single step that means "something outside was changed".
+    Only the `direct_capabilities` fact (or nothing) for an agent kind
+    with no `confirm_capability`, which has no single step that means
+    "something outside was changed".
     """
     capability = meta.confirm_capability
     direct = [name for name in getattr(meta, "direct_capabilities", ()) if step_results.get(name)]
@@ -115,6 +117,14 @@ def execution_fact(meta, step_results: dict) -> str:
         return direct_fact
 
     result = step_results.get(capability)
+    if isinstance(result, dict) and result.get("status") == "interrupted":
+        return (
+            f"FACT: the `{capability}` step was cut off before it finished ({result.get('failure')}). "
+            "It may already have changed the target system before it stopped, or it may not; this run "
+            "cannot tell which. Do not write that nothing was executed, and do not write that it "
+            "succeeded: say the outcome is unknown and must be checked on the target system before "
+            "anyone tries again."
+        )
     ran = bool(result) and not (isinstance(result, dict) and result.get("status") == "failed")
     if ran:
         return (
