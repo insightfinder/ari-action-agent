@@ -15,7 +15,8 @@ A2A-protocol agent kinds can sit on top of:
 |---|---|---|
 | `oncall` | Clones a repo, diagnoses a bug/feature request, fixes it, opens a PR | `ari_oncall_agent/` |
 | `k8s` | Checks Pod health of the cluster it runs in; proposes and, once approved, applies Deployment scaling (replicas, or KEDA/HPA min/max on explicit request) and CPU/memory changes (explicit request only) | `k8s_agent/` |
-| `jenkins` | **Deprecated** — no longer maintained or deployed. Reads/diagnoses a Jenkins job or build | `jenkins_agent/` (on the `jenkins-agent` branch only) |
+
+A third kind, `jenkins`, is deprecated and lives only on the `jenkins-agent` branch.
 
 > **The `k8s` kind** is documented in `docs/DEVELOPER_GUIDE.md` §10. It
 > uses no opencode and no shell: every cluster operation is a typed API
@@ -24,10 +25,6 @@ A2A-protocol agent kinds can sit on top of:
 > isolation is the reason it is a separate kind rather than more
 > capabilities on `oncall`: the oncall worker runs opencode's `ari-verify`
 > with open bash, which must never share a pod with a cluster-write token.
->
-> **The Jenkins kind** was released from its own `jenkins-agent` branch and
-> is now deprecated. Parts of this document (§3's tables, §5b, §7) still
-> describe it alongside `oncall`; read those as history.
 
 **Package layout** (`src/`):
 
@@ -38,10 +35,11 @@ A2A-protocol agent kinds can sit on top of:
   client, and `opencode_runtime.py` (the generic opencode
   subprocess/event-parsing/tracing mechanics — see §5). None of this
   imports from either agent package.
-- **`ari_oncall_agent/`** / **`jenkins_agent/`** — everything specific to
-  one agent kind: its capabilities, its own thin `tools/opencode_cli.py`
-  wrapper (scoped opencode agent definitions + per-request config
-  writing), its `schemas.py`, and its `meta.py` (below).
+- **`ari_oncall_agent/`** / **`k8s_agent/`** — everything specific to
+  one agent kind: its capabilities, its tools (for `oncall`, a thin
+  `tools/opencode_cli.py` wrapper with scoped opencode agent definitions +
+  per-request config writing; `k8s` uses no opencode), its `schemas.py`,
+  and its `meta.py` (below).
 - **`api/`** — thin deployable entrypoints only: `api/main.py` (`uvicorn
   api.main:app`) and `api/worker.py` (`python -m api.worker`). Both just
   call into `common/`; neither contains agent-kind-specific logic.
@@ -62,6 +60,7 @@ class AgentMeta:
     planner_fallback_steps: list[dict]   # steps used when the planner's own output is malformed
     respond_domain_note: str             # what `respond` should cover, beyond the generic framing
     artifacts: dict[str, str]            # artifact name -> "capability.result_key" to surface on the Task
+    confirm_capability: str | None       # capability an approved pending_action resumes into (§5b)
 ```
 
 Every place that used to hardcode on-call-specific wording or a
@@ -77,8 +76,8 @@ Deployments are independently toggleable in the Helm chart and can scale
 separately.
 
 The rest of this section (§1–§6) describes the on-call agent's own
-pipeline in detail; §5b covers the Jenkins agent's own integration; §7–§8
-cover deployment and limitations for both.
+pipeline in detail; §5b covers the human-in-the-loop approval gate both
+agent kinds use; §7–§8 cover deployment and limitations.
 
 ## 1. What this is
 
@@ -161,12 +160,12 @@ alongside it as a `DataPart` on the same `Message` — see
 field in this config; delivering a result asynchronously is the A2A
 protocol's own concern (`pushNotificationConfig`), not this agent's.
 
-**State**: `InMemoryTaskStore` and `InMemoryPushNotificationConfigStore` —
-deliberate, not a shortcut. This agent stores no request state of its own
-by design; these only give `tasks/get` and best-effort per-task
-`history` something to read within one process's lifetime. A restart
-means callers re-register, same as re-submitting a request against any
-stateless service.
+**State**: A2A tasks live in `InMemoryTaskStore`, or, when
+`TASK_STORE_ROOT` is set, in a `FileTaskStore` on a persistent volume
+(`a2a_server/task_store.py`), so a task paused for approval survives an
+API restart. Push-notification configs stay in
+`InMemoryPushNotificationConfigStore`. Beyond that the agent stores no
+request state of its own; Temporal's history is the audit trail.
 
 **The executor** (`a2a_server/executor.py:AriAgentExecutor.execute()`):
 
@@ -176,32 +175,37 @@ stateless service.
    task/context).
 2. Enqueues the initial `Task` object (state `SUBMITTED`) — this is what
    lets a non-blocking caller's response return immediately.
-3. Starts `AriAgentWorkflow` via the Temporal client, with the A2A task ID
+3. If the config carries a `confirm_pending_action`, resolves it against
+   this task's own `pending_action` artifact and fails the task if nothing
+   matches (§5b).
+4. Starts `AriAgentWorkflow` via the Temporal client, with the A2A task ID
    as the workflow ID.
-4. Awaits the workflow's result (this can take minutes; that's fine —
+5. Awaits the workflow's result (this can take minutes; that's fine —
    it's one of many concurrent asyncio tasks in the API process, and it's
    exactly what lets a *blocking* caller's connection stay open until
    completion).
-5. Maps the result onto `Task` artifacts (`root_cause`, `pull_request`
-   when present) and a final status update (§4).
+6. Maps the result onto `Task` artifacts (whatever `AgentMeta.artifacts`
+   declares and the run produced — for oncall `pending_action`,
+   `root_cause`, `pull_request`) and a final status update (§4).
 
 Not implemented, deliberately: fine-grained per-capability progress as
 separate status updates (Temporal's own workflow history already has that
 detail — this reports `SUBMITTED → WORKING → one terminal state`).
 `TASK_STATE_INPUT_REQUIRED` (a genuine paused "waiting on your reply"
-flow) *is* implemented, but only for one specific case today — the
-Jenkins agent's `trigger_build` confirmation gate (§5b) — not as a
-general mechanism `respond` (§4) can invoke; every other case still
-always gets a definitive answer instead of a pause.
+flow) *is* implemented, but only for the approval gate (§5b) — a step
+that proposes a change and stops for a person's approval (oncall's
+`propose_pr`, k8s's `propose_change`) — not as a general mechanism
+`respond` (§4) can invoke; every other case still always gets a
+definitive answer instead of a pause.
 
 ## 3. Core abstractions
 
-| Abstraction | What it is | Where (on-call) | Where (Jenkins) |
+| Abstraction | What it is | Where (on-call) | Where (k8s) |
 |---|---|---|---|
-| **Request** | Config model — this agent kind's own connection info, `llm`, options. Self-contained, immutable. | `ari_oncall_agent/schemas.py` (`RepoConfig`, `LLMConfig`, `RequestConfig`) | `jenkins_agent/schemas.py` (`JenkinsConfig`, `JenkinsAuthConfig`) |
+| **Request** | Config model — this agent kind's own connection info, `llm`, options. Self-contained, immutable. | `ari_oncall_agent/schemas.py` (`RepoConfig`, `LLMConfig`, `RequestConfig`) | `k8s_agent/schemas.py` (`K8sRequestConfig`, `K8sOptions`) |
 | **Plan** | Ordered list of `Step`s (capability + params), produced per-request by the planner. | `common/models/plan.py`, `common/planner.py` (shared) | same |
-| **Capability** | One pipeline step's behavior. Declared in `configs/<agent_kind>/capabilities.yaml` (description, tools, retry, on_failure); implemented as `run(ctx) -> dict`. | `clone_repo`, `generate_change`, `verify`, `publish_pr` in `ari_oncall_agent/capabilities/` | `resolve_target`, `inspect`, `diagnose`, `propose_action`, `execute_action` in `jenkins_agent/capabilities/` |
-| **Tool** | A concrete callable a capability may use. Declared in `configs/<agent_kind>/tools.yaml`. | `git_clone`, `opencode`, `repo_cache`, ... in `ari_oncall_agent/tools/` | `opencode`, `jenkins_stop_build`, ... in `jenkins_agent/tools/` |
+| **Capability** | One pipeline step's behavior. Declared in `configs/<agent_kind>/capabilities.yaml` (description, tools, retry, on_failure); implemented as `run(ctx) -> dict`. | `clone_repo`, `generate_change`, `verify`, `propose_pr`, `publish_pr`, `run_skill` in `ari_oncall_agent/capabilities/` | `find_workload`, `check_health`, `propose_change`, `apply_approved_change` in `k8s_agent/capabilities/` |
+| **Tool** | A concrete callable a capability may use. Declared in `configs/<agent_kind>/tools.yaml`. | `git_clone`, `opencode`, `repo_cache`, ... in `ari_oncall_agent/tools/` | `list_pods`, `dry_run_patch`, `patch_workload`, ... in `k8s_agent/tools/` |
 
 Both agent kinds share the same `respond` capability (`common/respond.py`,
 `internal: true` in both YAMLs) — it's 100% mechanically generic once its
@@ -235,13 +239,13 @@ new capabilities/tools/catalog entries, not a rewrite. Adding a whole new
    (`common/agent_meta.py`, oncall's own in `ari_oncall_agent/meta.py`) to
    the raw plan, if it has one — a deterministic, code-level correction
    for a "by default" behavior that prompt guidance alone can't reliably
-   guarantee. Oncall's: `publish_pr` is opt-*out* (the reverse of
+   guarantee. Oncall's: `propose_pr` is opt-*out* (the reverse of
    `verify`) — always appended when `generate_change` ran and the
    planner's own step list omitted it, unless `options.skip_pr` or the
    planner's own `skip_publish_pr: true` (set only when the request
    itself said not to open a PR) says otherwise. Confirmed live this
    split was necessary, not just theoretical: a smaller/cheaper planner
-   model inconsistently included `publish_pr` for the exact same kind of
+   model inconsistently included the PR step for the exact same kind of
    request across separate runs, purely from wording in its own system
    prompt — the same reliability gap `clone_repo` had (§6's
    `require_cloned_repo`), just for a default-behavior policy instead of
@@ -306,18 +310,18 @@ belongs in an activity. For the on-call agent:
 
 (`pull_request` — not `pr` — is the actual key; an earlier version of
 this doc and the workflow disagreed on this, one real inconsistency this
-restructuring unified, see `docs/MEMORY.md`.) The Jenkins agent instead
-surfaces `pending_action` (from `propose_action`) and `action_result`
-(from `execute_action`) when present.
+restructuring unified, see `docs/MEMORY.md`.) A run that paused for
+approval carries `pending_action` instead of `pull_request` (§5b). The
+`k8s` kind surfaces `pending_action`, `health_report`, `action_result`
+and `refusal` when present.
 
 `status`: `completed | failed | no_action | needs_approval` (the last one
-reserved — no policy/approval gate exists yet). `common/a2a_server/
+set when a step pauses for approval, §5b). `common/a2a_server/
 executor.py` maps this onto the real A2A wire shape: `message` becomes
 the completed `Task`'s final `Message`, every `AgentMeta.artifacts` key
 present in the result becomes a named `Artifact`, and `status` maps onto
 `TaskState` (`completed`/`no_action` → `TASK_STATE_COMPLETED`, `failed` →
-`TASK_STATE_FAILED`, `needs_approval` → `TASK_STATE_INPUT_REQUIRED`,
-unused today).
+`TASK_STATE_FAILED`, `needs_approval` → `TASK_STATE_INPUT_REQUIRED`).
 
 `message` is never a template. It comes from `respond` (`common/
 respond.py`, shared by every agent kind — §3) — an `internal: true`
@@ -332,11 +336,15 @@ conversation history, and whatever step results exist:
 - **Steps ran** → `respond` synthesizes root cause, what changed and why,
   verify status, and the PR link into one coherent summary.
 - **Pipeline gave up** → `respond` explains what's blocking it.
+- **Paused for approval** (`needs_approval`, §5b) → `respond` says what is
+  proposed and that it is waiting for confirmation, as a plain statement,
+  not as a failure.
 - **Always states things definitively, never a dangling question.** A
   caller may block, poll, or register a webhook, and `respond` has no idea
   which — so its system prompt forbids ending with a question or an offer
-  conditioned on a reply, since this agent doesn't implement
-  `TASK_STATE_INPUT_REQUIRED` (§2). If `respond` itself fails after
+  conditioned on a reply; the only paused state is the structured
+  approval gate (§2), which a caller answers with a structured
+  confirmation, not a reply to prose. If `respond` itself fails after
   retries, a templated one-liner is used as a last resort — the request
   must never come back with no message at all.
 
@@ -357,10 +365,10 @@ if the primary path raises — kept deliberately, not removed, as a safety
 net for whatever an unusual repo/auth state might need that a fixed
 git/REST sequence can't adapt to. The subprocess/event-parsing/tracing
 mechanics described below (process invocation, `--format json` NDJSON
-parsing, `_build_trace`) live in `common/opencode_runtime.py` and are
-shared verbatim with the Jenkins agent (§5b) — only the scoped agent
+parsing, `_build_trace`) live in `common/opencode_runtime.py`, so any
+agent kind that drives opencode shares them — only the scoped agent
 definitions and per-request config (`write_config`) are agent-kind-
-specific, in each agent's own thin `tools/opencode_cli.py`.
+specific, in that agent's own thin `tools/opencode_cli.py`.
 
 - **Per-request `opencode.json`**, written into the cloned repo right
   after clone and torn down with the rest of the sandbox:
@@ -368,7 +376,9 @@ specific, in each agent's own thin `tools/opencode_cli.py`.
   a shared one), and — since GitHub credentials are also per-request —
   `mcp.github` pointed at `https://api.githubcopilot.com/mcp/` with
   `Authorization: Bearer <repo.pat>` and `oauth: false` (forces PAT auth),
-  used only by `publish_pr`'s fallback (see above). Kept out of the repo's
+  used only by the `ari-publish` agent, which nothing runs since
+  `publish_pr`'s opencode fallback was removed (`publish_pr.py`'s
+  docstring). Kept out of the repo's
   own git history via `.git/info/exclude`, not `.gitignore` (which
   opencode itself could edit).
 - **Four scoped opencode agents**, each `mode: "primary"` (required for
@@ -376,11 +386,10 @@ specific, in each agent's own thin `tools/opencode_cli.py`.
   (read-only, `edit: deny`), `ari-change` (`edit: allow`, no build tooling),
   `ari-verify` (`edit: deny`, broad `bash: allow` since test/build
   commands are unpredictable per-repo), `ari-publish` (`edit: deny`, the
-  *only* agent with `github_*` MCP tools enabled — reached only as
-  `publish_pr`'s fallback). `analyze`/`generate_change`/`verify` each call
+  *only* agent with `github_*` MCP tools enabled; still defined, no
+  longer called). `analyze`/`generate_change`/`verify` each call
   `opencode run --agent <name> ...` with only the matching agent on every
-  run; `publish_pr` only calls it (as `ari-publish`) when its primary path
-  fails.
+  run.
 - **One ephemeral `opencode run` process per capability step**, not a
   long-lived `opencode serve` — a Temporal activity is a self-contained
   unit of work, and Temporal doesn't guarantee two activities for the same
@@ -396,9 +405,7 @@ specific, in each agent's own thin `tools/opencode_cli.py`.
   `"text"` or `"tool"` (tool parts carry `tool`/`callID`/
   `state.{status,input,output,error}`); a fatal error arrives as a
   top-level `{"type": "error", ...}` event on stdout, not stderr.
-  `publish_pr`'s fallback reads the PR URL out of the matching GitHub MCP
-  tool call's result, with a regex-over-response-text fallback, same as
-  the original implementation. `generate_change` captures the diff via
+  `generate_change` captures the diff via
   plain `git diff HEAD` rather than trusting opencode's own account of
   what it changed.
 
@@ -409,169 +416,103 @@ is constructed per call since the key is per-request, never global.
 Unrelated to opencode's own LLM calls, which it manages itself via
 `provider.apiKey` in the per-request `opencode.json`.
 
-## 5b. opencode + Jenkins MCP integration (Jenkins agent)
+## 5b. The approval gate (human in the loop)
 
-The Jenkins agent has no repo of its own and clones nothing — every real
-action against a target Jenkins goes through opencode's built-in MCP
-client pointed at *that Jenkins's own* [MCP Server
-plugin](https://plugins.jenkins.io/mcp-server/) (`jenkins_agent/
-tools/opencode_cli.py:write_config`, mirroring the on-call agent's GitHub
-MCP wiring in §5). Jenkins connection details (base URL, auth, CA bundle)
-are **not** deployment config — they travel per-request in the `jenkins`
-`DataPart`, exactly like the on-call agent's `repo` block (see
-`docs/DEVELOPER_GUIDE.md`).
+Each agent kind has one action that a person must approve before it
+happens — oncall opening a pull request, k8s patching a Deployment. The
+mechanism lives in
+`common/` and is agent-kind-agnostic. An agent kind turns it on by
+splitting the mutating work into a *propose* step and an *apply* step, and
+by naming the apply step as `AgentMeta.confirm_capability` (§0):
 
-**Capabilities**: `resolve_target` (turns the prompt into a concrete
-job/build) → `inspect` (status/history/queue questions) or `diagnose`
-(failure analysis, same `SUMMARY:`-marker + enforcement-retry pattern as
-the on-call agent's `generate_change`) → `propose_action` (resolves a
-requested change into a `pending_action`, never executes) → `execute_action`
-(the only capability allowed to actually trigger or stop a build).
+| Agent kind | Propose step | Apply step (`confirm_capability`) |
+|---|---|---|
+| `oncall` | `propose_pr` | `publish_pr` |
+| `k8s` | `propose_change` | `apply_approved_change` |
 
-**The confirm-before-execute gate is enforced at least twice,
-independently, for every action — and a third time, specifically for
-`trigger_build`:**
+**Pausing.** The propose step does everything short of the irreversible
+action and returns a `pending_action` (carrying a fresh `id`) plus
+`requires_approval: true`. `orchestration/workflow.py`'s step loop stops
+on `requires_approval` and sets `status: "needs_approval"`; `respond`
+still runs, as after any other ending (§4). `a2a_server/executor.py`
+publishes `pending_action` as an artifact and maps the status onto the
+real A2A `TASK_STATE_INPUT_REQUIRED` — a genuine paused "waiting for your
+input" task, not a completed one. Both kinds list `pending_action` first
+in `AgentMeta.artifacts` and it is the only artifact carrying an `id`,
+because a confirmation is resolved against the first artifact that has
+one.
 
-1. **Structurally, in opencode's own permission scoping.** Every
-   capability except `execute_action` runs as the `ari-jenkins-read`
-   opencode agent, which has every `jenkins_*` MCP tool denied outright —
-   a mutating call is refused by opencode itself regardless of what the
-   model attempts. Only `execute_action` runs as `ari-jenkins-act`, the
-   one agent with `jenkins_*` allowed.
-2. **Structurally, in `execute_action.py`'s own code.** It refuses to run
-   at all unless `ctx.params` already carries a concrete, non-stale
-   (< 30 minutes old) confirmed `action`/`job`/`parameters` — never
-   inferred from a bare "yes". For `stop_build`, carrying a prior
-   `propose_action`'s exact `pending_action` fields into a later
-   confirmation turn's params is the planner's job (its domain guidance
-   says so explicitly) — a conversational "yes, go ahead" is enough, same
-   as it always was; if there's nothing concrete to confirm,
-   `execute_action` should never have been scheduled, and it fails loudly
-   rather than guessing.
-3. **For `trigger_build` only — a hard, protocol-level gate, not an LLM's
-   inference.** `propose_action` flags a `trigger_build` proposal with
-   `requires_approval: true`; `orchestration/workflow.py`'s step loop
-   turns that into `status: "needs_approval"`, which
-   `a2a_server/executor.py` maps onto the real A2A `TASK_STATE_
-   INPUT_REQUIRED` (this is what the caller sees — a genuine paused
-   "waiting for your input" task, not a completed one). Confirming
-   requires a follow-up `message/send` on the *same* `task_id` carrying a
-   structured `confirm_pending_action: {"id": "..."}` field — not a plain
-   "yes". `executor.py` resolves that id deterministically against this
-   task's own previously published `pending_action` artifact (real,
-   persisted across turns in `a2a-sdk`'s `InMemoryTaskStore` — verified
-   directly against the installed SDK, not assumed from the spec — so no
-   LLM ever reconstructs the action/job/parameters from chat text for
-   this one action). This resolved `confirmed_action` bypasses the LLM
-   planner entirely (`orchestration/activities.py`'s `plan_task` builds a
-   one-step plan directly) and sets a `StepContext.confirmed` flag that
-   `execute_action.py` checks for `trigger_build` specifically — a flag
-   the planner's own JSON output structurally cannot set, since it only
-   ever populates a step's `params` (a plain `dict`), never a sibling
-   field on the step itself (`common/models/plan.py`'s `Step` schema has
-   no such field, and pydantic drops anything extra). Without this,
-   layers 1–2 alone would not have stopped the *existing* planner from
-   still independently scheduling an unconfirmed `trigger_build` from a
-   misread "yes" — layer 3 is what actually makes this a hard gate rather
-   than a second path alongside the soft one. See
-   [`docs/INPUT_REQUIRED_INTEGRATION.md`](INPUT_REQUIRED_INTEGRATION.md)
-   for the caller-side contract — what's actually sent over the wire and
-   exactly what a caller needs to send back.
+**Resuming.** Confirming requires a follow-up `message/send` on the
+*same* `task_id` whose config `DataPart` carries a structured
+`confirm_pending_action: {"id": "..."}` — not a plain "yes". `executor.py`
+(`_find_pending_action`) resolves that id deterministically against this
+task's own previously published artifacts, which the API's task store
+keeps across turns of a non-terminal task (`common/a2a_server/
+task_store.py`: in memory, or on disk when `task_store_root` is set). No LLM ever
+reconstructs the proposal from chat text. If nothing matches, the task
+fails with that explanation. A match is passed to the workflow as
+`confirmed_action`. Declining is `tasks/{id}:cancel`. See
+[`docs/INPUT_REQUIRED_INTEGRATION.md`](INPUT_REQUIRED_INTEGRATION.md) for
+the caller-side contract — what is actually sent over the wire and
+exactly what a caller needs to send back.
 
-Stopping a build goes through a **direct REST call**
-(`jenkins_agent/tools/jenkins_rest.py`), not opencode+MCP — confirmed live
-against a real Jenkins (below) that the plugin's tool list has no
-stop/cancel tool at all, so this isn't a workaround for an untested edge
-case, it's the only way to stop a build. Triggering goes through
-opencode+MCP. Mutations are never auto-retried by the engine (`configs/
-jenkins/capabilities.yaml`'s `retry.max_attempts: 1` for `execute_action`)
-— a timed-out trigger may have already succeeded, and a duplicate build
-is worse than surfacing the timeout.
+**Bypassing the planner.** Given a `confirmed_action`,
+`orchestration/activities.py`'s `plan_task` calls no LLM at all: it builds
+a one-step plan that runs `confirm_capability` with the confirmed
+artifact as its `params` and `confirmed: True`. The normal planning branch
+always sets `confirmed: False`. The resume is a separate Temporal workflow
+execution, so it gets its own pipeline budget (§4) rather than whatever
+the proposing run left.
 
-**Verified live** against a real Jenkins instance (2026-09-18, Jenkins
-2.568.3, MCP Server plugin 0.203.v12a_6f2a_01d72 — see `docs/MEMORY.md`
-for the full session): the plugin's real MCP endpoint
-(`{base_url}/mcp-server/mcp`) is a streamable-HTTP JSON-RPC transport
-(`initialize` → `Mcp-Session-Id` response header → `notifications/
-initialized` → `tools/list`, the latter returned as a single SSE `data:`
-event, not plain JSON). It exposes exactly 19 tools, each carrying the
-plugin's own `readOnlyHint`/`destructiveHint` annotations: 15 read-only
-(`getJob`, `getJobs`, `getBuild`, `getBuildLog`, `searchBuildLog`,
-`getQueueItem`, `getTestResults`, `whoAmI`, `getStatus`, `getJobScm`,
-`getBuildScm`, `getBuildChangeSets`, `findJobsWithScmUrl`,
-`getFlakyFailures`, `getReplayScripts`) and exactly 4 destructive
-(`triggerBuild`, `updateBuild`, `rebuildBuild`, `replayBuild`) — confirming
-there is genuinely no stop/cancel tool. Separately, opencode's own docs
-were checked directly and confirm its MCP tool-naming rule verbatim:
-*"MCP server tools are registered with server name as prefix... use
-`mymcpservername_*`"* — so this codebase's `"jenkins_*": false` deny
-pattern for `ari-jenkins-read` matches real behavior, not just an analogy
-to GitHub's `github_*` (the previous state of this doc's caveat).
+**The gate is enforced in more than one place:**
 
-**Not yet verified live**, because it requires an actual `opencode run`
-against a real Jenkins with real credentials, which the same session
-could not complete (Claude Code's own safety classifier blocks writing
-real secrets into `opencode.json`, and running it manually was deferred
-by the operator): that the `jenkins_*` deny pattern is actually *applied*
-at runtime by this specific opencode version against this specific MCP
-server (docs confirm the rule; never observed in a live log), and
-correctness of any capability's actual output (`resolve_target`/
-`inspect`/`diagnose`/`propose_action`) against a real job. `execute_action`
-has had zero real runs of any kind. See `scripts/jenkins_agent_local_test.py`
-for the harness built to close this gap — it deliberately only wires the
-four read-only capabilities.
+1. **`StepContext.confirmed`.** Set only by the bypass above. The
+   planner's JSON output can only ever populate a step's `params`, never a
+   sibling field on the step (`common/models/plan.py`'s `Step` has no such
+   field, and pydantic drops anything extra), so a plan cannot forge it.
+   Both apply steps refuse to run when it is false.
+2. **The shape of the confirmed proposal.** `publish_pr` requires
+   `action: "open_pull_request"` and every field a pull request needs;
+   `apply_approved_change` requires one of its known actions plus the
+   proposal's `id`, target and `snapshot`. A confirmation resolved against
+   some other artifact, or one from an older version of the agent, fails
+   loudly instead of acting on half a proposal.
+3. **Keeping the apply step out of plans.** For oncall, `publish_pr` is
+   `internal: true`, so it is absent from `catalog()` and the planner
+   cannot choose it; `get_capability()`, which the bypass uses, does not
+   filter internal capabilities, so the resume still resolves it. For
+   k8s, `apply_approved_change` is in the catalog, but the kind's
+   `default_step_policy` (`k8s_agent/meta.py`) drops every step outside
+   its read and propose steps. The k8s kind adds a structural layer on
+   top: `patch_workload`, the only real write, is in the `tools` list of
+   `apply_approved_change` alone (`configs/k8s/capabilities.yaml`), and
+   `propose_change` gets only `dry_run_patch`, which is always a
+   server-side dry run.
 
-Also not yet verified live: the `trigger_build` confirm gate's actual
-pause → follow-up `message/send` → resume round-trip through a real
-deployed API process and Temporal worker. Every piece of it was verified
-directly against source (the installed `a2a-sdk`'s artifact-continuation
-behavior, `Step`'s pydantic schema dropping unknown fields) rather than
-assumed, and the full unit-test suite covers every new code path in
-isolation — but no real HTTP round-trip against a live instance has
-exercised it end to end yet.
+**What was approved is what is applied.** Neither apply step re-derives
+the action. `publish_pr` takes every field from the confirmed proposal:
+its branch name is derived from the request id, the resume runs under a
+different id, and a freshly derived name would not be the branch that was
+pushed and approved. `apply_approved_change` re-reads the target first and
+compares it with the proposal's `snapshot`, refusing if anything the
+change depends on has moved in the meantime, and writes at most once — a
+retried attempt that finds the approved values already in place verifies
+instead of writing again.
 
-## 5c. The same gate, for the on-call agent's pull requests
-
-The on-call agent reuses §5b's three layers verbatim for the one thing it
-does that reaches outside the sandbox: opening a pull request. Nothing in
-`common/` changed to allow it — the mechanism was already generic, and
-turning it on for this agent kind is four lines of `ari_oncall_agent/meta.py`
-plus a capability.
-
-- **Pausing.** `propose_pr` returns `requires_approval`, which the step
-  loop turns into `status: "needs_approval"` → `TASK_STATE_INPUT_REQUIRED`.
-- **Resuming.** `AgentMeta.confirm_capability` is `"publish_pr"`, so
-  `plan_task`'s bypass runs that one step with the approved proposal as its
-  params and `confirmed: True`, skipping the planner entirely.
-- **The gate.** `publish_pr` refuses any step where `ctx.confirmed` is
-  false, and refuses a confirmed proposal that is not an
-  `open_pull_request` one with every field a pull request needs.
-
-Two things differ from the Jenkins case, both consequences of this agent
-owning a working tree:
-
-**The branch is pushed before the pause, not after the approval.** The
-approval is human-speed, and the resume is a *separate* Temporal workflow
-execution: `workflow.py` runs `cleanup_workspace` on the way out of the
-pausing run, and the sandbox root is on no persistent volume, so a worker
-restart during the approval window would take the change with it. Pushing
-first leaves the approval as one idempotent REST call that needs no
-working tree. The accepted cost is a branch visible on the target
-repository before anyone approved it — quieter than a pull request, but
-not nothing on a repository that builds every pushed branch.
-
-**`publish_pr` is `internal: true`.** The planner must not be able to
-schedule it at all; §5b's Jenkins gate relies on `execute_action` being
-plannable but refusing unconfirmed work, which leaves prompt guidance as
-the only thing discouraging a plan from trying. Here the capability is
-simply absent from `catalog()`, so there is nothing to discourage.
-`get_capability()` — which the confirmation bypass uses — does not filter
-internal capabilities, so the resume still resolves it.
+**For oncall, the branch is pushed before the pause, not after the
+approval.** The approval is human-speed, and the resume is a *separate*
+Temporal workflow execution: `workflow.py` runs `cleanup_workspace` on the
+way out of the pausing run, and the sandbox root is on no persistent
+volume, so a worker restart during the approval window would take the
+change with it. Pushing first leaves the approval as one idempotent REST
+call that needs no working tree. The accepted cost is a branch visible on
+the target repository before anyone approved it — quieter than a pull
+request, but not nothing on a repository that builds every pushed branch.
 
 ## 6. Repo caching & dynamic branches (on-call agent)
 
-On-call-agent-specific — the Jenkins agent has no repo of its own, so
-none of this applies to it (§5b). Two related requirements: many requests
+On-call-agent-specific — the `k8s` kind has no repo of its own, so none
+of this applies to it. Two related requirements: many requests
 target the same repo over time
 (repeat incidents against the same service), so re-cloning from the
 remote every time wastes time/bandwidth/disk; and a single prompt can name
@@ -611,7 +552,7 @@ deliberately small (5Gi) rather than sized to never fill up.
 **Dynamic branches**: `clone_repo` accepts an optional `ref` step param
 (which branch to check out — falls back to `repo.ref`, then to the
 remote's own detected default branch when neither is set), and
-`publish_pr` accepts an optional `base_ref` step param (which branch the
+`propose_pr` accepts an optional `base_ref` step param (which branch the
 PR targets — falls back to the same default, independently of whatever
 `ref` was). The planner's system prompt reads the prompt for named
 branches and sets these params.
@@ -633,12 +574,12 @@ failed-then-retried clone, no matching on git's own error text.
 remote — git supports this natively.
 
 **`StepContext.require_cloned_repo`** (`common/capabilities_base.py`):
-`generate_change`/`verify`/`publish_pr` call this instead of reading
+`generate_change`/`verify`/`propose_pr` call this instead of reading
 `repo_dir` directly — it raises immediately and clearly if `clone_repo`
 never actually ran, rather than silently falling back to the empty
 sandbox root (`repo_dir`'s own fallback, correct for a repo-less chat
 prompt or an agent kind with no `clone_repo` capability at all, e.g.
-Jenkins) and only failing three layers down inside opencode with an
+`k8s`) and only failing three layers down inside opencode with an
 opaque `Unexpected server error`. Confirmed live: a planner using a
 smaller/cheaper model produced a step list that included `generate_change`
 but dropped `clone_repo` — exactly this failure, caught and fixed by
@@ -656,26 +597,19 @@ unaffected, only a direct push to the branch itself is blocked).
 (`default_protected_branches` in the same file, itself configurable — an
 explicit `[]` is the only way to turn it off, omitting the key keeps the
 default), added on top of whatever a repo's own entry lists, not a
-replacement for it. Two different enforcement points, because there are
-two different ways `publish_pr` can end up pushing:
-- Its deterministic primary path (`tools/git_ops.py:push`) always targets
-  a freshly generated `ari/<slug>-<request-id>` branch, never an existing
-  one, so a hard veto there (`publish_pr.run`, checked before anything
-  touches git) is unreachable in normal operation — kept as defense-in-
-  depth against a future change letting a caller-supplied branch name
-  reach that point.
-- Its opencode + GitHub MCP **fallback** (`ari-publish`, real `git push`
-  bash access, only reached if the primary path fails) is the one path
-  that actually needs protecting: `tools/opencode_cli.py:write_config`
-  computes explicit bash-permission `deny` entries for the common `git
-  push` forms against each of this repo's protected branches, and the
-  fallback's own instruction names them in plain language too.
-  **Best-effort, not a hard guarantee** — opencode's permission matching
-  is prefix + trailing-wildcard only, so it can't semantically parse
-  every possible git push invocation, and it has no visibility at all
-  into the GitHub MCP server's own tools. Real branch protection
-  configured on the GitHub repo itself (restrict who/what can push) is
-  the only guarantee, and covers the MCP path too — see
+replacement for it. Two enforcement points:
+- The deterministic push (`tools/git_ops.py:push`, from `propose_pr`)
+  always targets a freshly generated `ari/<slug>-<request-id>` branch,
+  never an existing one; `publish_pr` additionally refuses a protected
+  branch before it does anything, as defense-in-depth against a future
+  change letting a caller-supplied branch name reach that point.
+- `tools/opencode_cli.py:write_config` adds bash-permission `deny`
+  entries for the common `git push` forms against each protected branch
+  to the opencode agents. **Best-effort, not a hard guarantee** —
+  opencode's permission matching is prefix + trailing-wildcard only, so
+  it can't semantically parse every possible git push invocation. Real
+  branch protection configured on the GitHub repo itself (restrict
+  who/what can push) is the only guarantee — see
   `protected_branches.py`'s own docstring.
 
 `ari-verify`'s bash permission denies `git push*` unconditionally
@@ -685,10 +619,10 @@ otherwise fully open for arbitrary build tooling.
 
 ## 7. Deployment images
 
-Three dedicated Dockerfiles at the repo root, not one dual-entrypoint
-image — chosen so each process only carries the toolchain it actually
-needs, and so the two agent kinds' worker images can differ completely
-without bloating either:
+One shared API Dockerfile plus one worker Dockerfile per agent kind at
+the repo root, not one dual-entrypoint image — chosen so each process
+only carries the toolchain it actually needs, and so the agent kinds'
+worker images can differ completely without bloating each other:
 
 - **`Dockerfile.api`** — the FastAPI/A2A process (`uvicorn api.main:app`).
   Agent-kind-agnostic and shared by both agent kinds' API Deployments
@@ -723,18 +657,18 @@ without bloating either:
     with a per-request build sandbox (Docker-outside-of-Docker or an
     external build service) if the language spread outgrows "just add it
     to the image."
-- **`Dockerfile.jenkins`** — the Jenkins agent's worker (`python -m
-  api.worker`, `AGENT_KIND=jenkins`). Deliberately much smaller: only
-  Node.js 22 + the same pinned `opencode-ai` version, no git and none of
-  the build toolchain above — this agent never clones or builds anything
-  (§5b), so none of that is needed.
+- **`Dockerfile.k8s`** — the `k8s` kind's worker (`python -m
+  api.worker`, `AGENT_KIND=k8s`). Deliberately minimal: no git, no build
+  toolchain, no Node and no opencode, running as a non-root user — every
+  cluster operation is a typed Kubernetes API call (§0), so nothing in it
+  needs a shell.
 
 **Helm chart** (`insightfinder/charts`, `charts/oncallari`): each agent
 kind is an independently toggleable block (`ariOncallAgent.enabled`,
-`ariJenkinsAgent.enabled`) with its own api+worker Deployment pair, own
-Secret, Service, and Ingress, and its own Temporal namespace/task queue
-(`oncall-ari-agent`/`oncall-ari-queue` and `jenkins-ari-agent`/
-`jenkins-ari-queue` respectively) against one shared Temporal dev server.
+`ariK8sAgent.enabled`) with its own api+worker Deployment pair and its
+own Temporal namespace/task queue (`oncall-ari-agent`/`oncall-ari-queue`
+by default for oncall, `k8s-ari-agent`/`k8s-ari-queue` in
+`deploy/k8s-agent-e2e/`).
 Both agent kinds' API Deployments reference the same `Dockerfile.api`
 image (different `.api.image` value in the chart only because the chart
 allows pinning them independently, not because the image differs); each
@@ -763,41 +697,12 @@ tracing below, not a guess).
 
 - **gRPC transport** not implemented — needs its own server process/port
   and `grpcio`/`grpcio-tools` dependencies. Deferred, not abandoned.
-- **`TASK_STATE_INPUT_REQUIRED`** not implemented — no genuine paused
-  "waiting for your reply" flow; a caller follows up by sending a new
-  message in the same context instead.
+- **`TASK_STATE_INPUT_REQUIRED`** is used only by the approval gate
+  (§5b) — there is no general paused "waiting for your reply" flow; for
+  anything else a caller follows up by sending a new message in the same
+  context instead.
 - **Push-notification delivery retry semantics** are the SDK's
   `BasePushNotificationSender`'s concern, not audited here.
-- **No repo-cache eviction/GC** — fine for a bounded set of well-known
-  repos.
 - Concurrency/volume expectations are not yet established — informs
   worker replica count and Temporal task-queue sizing.
 - Git providers beyond GitHub/GitLab are untested.
-
-**Still open, Jenkins agent** (see §5b for what *is* verified):
-
-- **No jenkins_agent capability has completed a real end-to-end run** —
-  everything verified so far is at the raw MCP-protocol/plugin level, not
-  through an actual `opencode run`. `execute_action` in particular has
-  never run at all, against anything.
-- **`JenkinsConfig.allow_mutations`** (`jenkins_agent/schemas.py`) is
-  design intent only — nothing in code enforces it today. The only real
-  enforcement is the two-layer gate in §5b (opencode's own tool
-  permissions, plus `execute_action`'s own confirmed-action check); a
-  request-level "force read-only regardless of what the token could do"
-  switch doesn't exist yet.
-- **No Jenkins-side RBAC recommendation is enforced by this codebase** —
-  the design assumes a caller *may* supply a restricted, read-only
-  service-account token, but nothing here requires or checks that. A
-  token belonging to a full-access account gets exactly the same
-  treatment; Jenkins's own permissions are the only backstop in that
-  case, not anything in this agent.
-- **TLS/CA-bundle env var handling for opencode's Node MCP client**
-  (`NODE_EXTRA_CA_CERTS`/`NODE_TLS_REJECT_UNAUTHORIZED` in `tls_env()`) is
-  Node's own documented mechanism but has never been exercised against a
-  real self-signed/private-CA Jenkins.
-- **A single Jenkins request travels over plain HTTP** if `jenkins.
-  base_url` is `http://` (as the one real instance checked so far is) —
-  the Basic-auth header goes over the wire unencrypted in that case. Not
-  a code gap to fix here; a deployment/network concern for whoever
-  configures `base_url`.

@@ -4746,3 +4746,84 @@ tests only).
 **Verified:** Windows 549 passed (six POSIX-only modules cannot be imported
 there); Linux 684 passed in the worker image with the slack, teams and CLI
 extras, including the SDK wiring test.
+
+## 2026-10-19 - Open-source cleanup: a quickstart that runs, a README to start from, no Jenkins in the docs (II-25116, step 5)
+
+The last step of II-25116: make the repository usable by someone outside
+the company. Done after the k8s kind (II-25173, PR #14) merged into `test`,
+so the README and design docs are edited on top of its rewrite instead of
+conflicting with it.
+
+**Things that were broken, now fixed and run for real.**
+
+- `scripts/run_api.sh`, `scripts/run_worker.sh` and `docker-compose.yaml`
+  still ran `ari_agent.main:app` / `ari_agent.orchestration.worker`, a
+  package split up on 2026-09-18, and compose built a `Dockerfile` that does
+  not exist. Now `api.main:app` / `api.worker`, `Dockerfile.api` /
+  `Dockerfile.oncall`, `src/`, `configs/` and `skills/` mounted, and
+  `host.docker.internal` mapped so the containers reach the dev Temporal.
+- `.env.example` now works as-is against `deploy/temporal-dev`
+  (`host.docker.internal:7233`, namespace `default`, no TLS, the current
+  queue name `oncall-ari-queue` instead of the pre-rename
+  `oncall-ari-fix-queue`).
+- Verified on the bastion from a clean copy: dev Temporal up, `docker
+  compose up --build` (3 min), agent card 200, `ari send "is example.com
+  up?"` answered in 19 s through the tutorial's skill (Temporal history:
+  `skill: http-status`, command `scripts/check.py example.com`).
+- Found while verifying: the compose containers run as root and wrote
+  root-owned `__pycache__` into the mounted `src/`, which the user then
+  cannot delete. Compose sets `PYTHONDONTWRITEBYTECODE=1`; the README's test
+  command mounts the tree read-only and installs only dependencies. Both
+  re-run: 875 passed, no file in the tree owned by anyone but the user.
+
+**Open-source surface.**
+
+- `LICENSE`: Apache-2.0 (the user's choice for now; the leader may still
+  decide otherwise).
+- `README.md` rewritten as the entry point: what it is, the three ways to
+  use it (A2A, `ari`, Slack/Teams), Agent Skills first among the extension
+  points, agent kinds, a local quickstart, deployment, layout, testing,
+  contributing, license. It says plainly that `ari` needs `DEFAULT_REPO_URL`
+  even for a question: the agent does not validate `repo`, but the shared
+  bridge refuses to send a request without one. Left as is; a repo-less
+  question would need the planner to know there is no repository, or a
+  code-change plan crashes on `ctx.config["repo"]`.
+- `docs/SKILLS.md` starts with "Write your first skill" (`http-status`),
+  the exact files of which were extracted from the doc and run as above.
+- `configs/oncall/protected_branches.yaml` named a company repository whose
+  entry only repeated the defaults; replaced by `example-org/example-repo:
+  [release]`, tests moved to it.
+- The commit identity (`support@insightfinder.com`) is now settings
+  `COMMIT_AUTHOR_NAME` / `COMMIT_AUTHOR_EMAIL`, same defaults. Not
+  `GIT_AUTHOR_*`: git reads those itself and they would leak into every
+  subprocess.
+- `deploy/k8s/` kept (the user asked to), brought in line with the chart:
+  one replica each with `Recreate`, PVCs for the task store and both caches,
+  real commands and images, `pvcs.yaml`, a README saying it is for scratch
+  clusters.
+
+**Jenkins in the docs.** The Jenkins kind lives only on the `jenkins-agent`
+branch. `design.md` lost its Jenkins section; the approval gate it was
+explained through is now its own §5b, built on oncall's `propose_pr` ->
+`publish_pr` and k8s's `propose_change` -> `apply_approved_change`, every
+claim checked against the code. `INPUT_REQUIRED_INTEGRATION.md`'s examples
+are now oncall's real `pending_action` fields; `DEVELOPER_GUIDE.md` §9 is a
+two-line pointer (its sample client did not exist here); `ARCHITECTURE.md`
+uses the k8s kind as the worked example. Also corrected on the way: the
+executor docstring that called `INPUT_REQUIRED` out of scope, design.md's
+"in-memory task store only", "no cache eviction", and the removed
+`publish_pr` opencode fallback still described as live.
+
+**Deliberately not changed.** `common/` still names Jenkins capabilities
+(`_OPENCODE_CAPABILITIES` in `capabilities_base.py`) and Jenkins in a few
+comments. The `jenkins-agent` branch still merges `common/` from `test`, so
+removing those names would silently break it on its next merge. CI image
+names stay hard-coded to `docker.io/insightfinderinc`; a fork edits the
+workflow.
+
+**Open questions found, not fixed.** A task that pauses twice holds two
+`pending_action` artifacts; the chat gateway reads the last one, and a
+comment in `meta.py` says MCP Service reads the first. Not verified live.
+
+**Verified:** Windows 576 passed (six POSIX-only modules cannot be imported
+there); Linux 875 passed, nothing skipped, in the worker image with every extra.

@@ -7,29 +7,33 @@ explains *why* this exists and how it's built; this doc is the
 integration contract — what you will see on the wire, and exactly what
 to send back.
 
-**Scope today: the Jenkins agent's `trigger_build` action, and every
-on-call run that is about to open a pull request.** On-call pauses at
+**Scope today: every on-call run that is about to open a pull request,
+and every change the Kubernetes agent proposes.** On-call pauses at
 `propose_pr`, after the change is made and its branch is pushed, and
-opens the pull request only once you confirm. Everything else
-(`stop_build`, an on-call request that asked for no PR, a plain
-question) completes without ever producing
+`publish_pr` opens the pull request only once you confirm. The `k8s`
+kind pauses at `propose_change`, and `apply_approved_change` changes the
+cluster only once you confirm. Everything else (an on-call request that
+asked for no PR, an on-call `run_skill` run, a k8s health check or
+refusal, a plain question) completes without ever producing
 `TASK_STATE_INPUT_REQUIRED` — see the
-[comparison table](#what-pauses-and-what-does-not) at the end if you're
-integrating against both agents.
+[comparison table](#what-pauses-and-what-does-not) at the end.
 
-The wire contract below is identical for both: same task state, same
-`pending_action` artifact, same structured confirmation. Only the
+The wire contract below is identical for both kinds: same task state,
+same `pending_action` artifact, same structured confirmation. Only the
 contents of the artifact differ, and you do not need to understand them
 — you echo the `id` back. Read `docs/DEVELOPER_GUIDE.md` first if
 you haven't already — this doc assumes you know `message/send`, the
 three response patterns, and how multi-turn `context_id`/`task_id`
-continuation works.
+continuation works. The k8s kind's own summary of the same round trip is
+`docs/DEVELOPER_GUIDE.md` §10. A working caller of this contract is the
+chat gateway's client (`src/chat_gateway/a2a_client.py`, `confirm()` and
+`cancel()`), which the `ari` CLI and the Slack/Teams front ends use.
 
 ## 1. The sequence, end to end
 
 ```
 1. You send a message/send asking for a change
-   ("deploy checkout-service to staging")
+   ("fix the NullPointerException in OrderService and open a PR")
         │
         ▼
 2. Task status becomes TASK_STATE_INPUT_REQUIRED
@@ -44,7 +48,8 @@ continuation works.
         │                                                            │
         ▼                                                            ▼
 5. Task status becomes a normal terminal state again          Task status becomes
-   (COMPLETED or FAILED), carrying an "action_result" artifact TASK_STATE_CANCELED
+   (COMPLETED or FAILED), carrying the result artifact:       TASK_STATE_CANCELED
+   "pull_request" (on-call) or "action_result" (k8s)
 ```
 
 Nothing about steps 1–2 or 4–5 depends on which of the three response
@@ -55,20 +60,20 @@ per-pattern specifics.
 
 ## 2. What the agent actually sends you (step 2)
 
-A real captured shape (illustrative — this exact sequence has been
-verified against the SDK's source and by unit tests, not yet against a
-live deployed run — see `docs/MEMORY.md`, 2026-09-18):
+An on-call proposal (illustrative — the field names and shapes are taken
+from `propose_pr.py`, the values are made up; this is not a captured
+response):
 
 ```json
 {
   "task": {
-    "id": "9f2e...",
+    "id": "9f2e1c3a-...",
     "contextId": "4c8d...",
     "status": {
       "state": "TASK_STATE_INPUT_REQUIRED",
       "message": {
         "role": "ROLE_AGENT",
-        "parts": [{ "text": "I'm ready to trigger deploy/checkout-service with ENV=staging (defaults to production; you asked for staging explicitly). Confirm to proceed." }]
+        "parts": [{ "text": "Found the cause: OrderService.total() dereferences a null discount. I fixed it and pushed branch ari/ari-fix-null-discount-in-order-total-9f2e1c3a; the pull request against main is waiting for your approval. Compare: https://github.com/org/shop/compare/main...ari/ari-fix-null-discount-in-order-total-9f2e1c3a" }]
       }
     },
     "artifacts": [
@@ -76,26 +81,55 @@ live deployed run — see `docs/MEMORY.md`, 2026-09-18):
         "name": "pending_action",
         "parts": [{ "data": {
           "id": "b2c1e4a0-...",
-          "action": "trigger_build",
-          "job": "deploy/checkout-service",
-          "parameters": { "ENV": "staging" },
-          "build_number": null,
-          "reasoning": "ENV defaults to \"production\"; user asked for staging explicitly",
-          "jenkins_url": "https://jenkins.example.com",
-          "created_at": "2026-09-18T22:00:00+00:00"
+          "action": "open_pull_request",
+          "action_name": "Open pull request",
+          "repo": "org/shop",
+          "repo_url": "https://github.com/org/shop",
+          "branch": "ari/ari-fix-null-discount-in-order-total-9f2e1c3a",
+          "base_ref": "main",
+          "title": "ARI: Fix null discount in order total",
+          "body": "...",
+          "changed_files": ["src/main/java/shop/OrderService.java"],
+          "root_cause": { "summary": "...", "evidence": [] },
+          "key_hunks": "diff --git a/src/main/java/shop/OrderService.java b/src/main/java/shop/OrderService.java\n@@ ...",
+          "verification": { "status": "not run", "detail": "" },
+          "compare_url": "https://github.com/org/shop/compare/main...ari/ari-fix-null-discount-in-order-total-9f2e1c3a",
+          "branch_pushed": true,
+          "created_at": "2026-10-19T10:00:00+00:00"
         }}]
+      },
+      {
+        "name": "root_cause",
+        "parts": [{ "data": { "summary": "...", "evidence": [] } }]
       }
     ]
   }
 }
 ```
 
+`verification.status` is one of `passed`, `skipped`, `not run`,
+`failed` or `inconclusive`; a proposal can carry an unverified change,
+and this field says so rather than leaving it to be inferred.
+
+A k8s proposal has the same envelope and a different `pending_action`
+body: `id`, `action` (`scale_replicas` | `set_autoscaler_bounds` |
+`set_resources`) plus that action's own fields (`namespace`,
+`deployment`, and `replicas`, `autoscaler`/`min`/`max`, or
+`container`/`resources`), `action_name`, `before`/`after`, `risk_tier`,
+`risks`, the server-side `dry_run` result, `snapshot` and `created_at`,
+among others — `docs/DEVELOPER_GUIDE.md` §10 lists them. Numbers in it
+come back as doubles (`3.0`), because artifacts travel as protobuf
+`Value`s.
+
 **What to actually check, in order of reliability:**
 
 1. `task.status.state == "TASK_STATE_INPUT_REQUIRED"` — this is the
    authoritative signal. Check this, not the message text.
 2. Find the artifact named `"pending_action"` in `task.artifacts` and
-   read its `data` — this is what you need for step 4, verbatim.
+   read its `data` — its `id` is what you need for step 4, verbatim. A
+   task that paused more than once (see §7) carries one `pending_action`
+   artifact per proposal; the chat gateway takes the last one
+   (`src/chat_gateway/tasks.py`, `artifacts()`).
 3. `task.status.message`'s text is for a human to read (show it in your
    UI/chat), not for your code to parse. Don't try to detect "is this
    asking for confirmation" from the message string — the state field
@@ -104,7 +138,8 @@ live deployed run — see `docs/MEMORY.md`, 2026-09-18):
 **Do not construct or guess the `pending_action.id` yourself.** It's a
 server-generated UUID; the only valid one is whatever this exact
 `pending_action` artifact says. A human approving this in your UI should
-be approving *this specific artifact's data* (job, parameters, reasoning)
+be approving *this specific artifact's data* (repository, branch, title,
+changed files, key hunks — or, for k8s, the object and its before/after)
 — not just clicking a generic "yes" that your integration then sends as
 free text (see §5 for why that does nothing).
 
@@ -119,9 +154,8 @@ free text (see §5 for why that does nothing).
   `TASK_STATE_WORKING`, same as always — but **stop polling and treat
   `TASK_STATE_INPUT_REQUIRED` as a real poll-terminal state**, not a
   transient one. The task will sit at `INPUT_REQUIRED` indefinitely
-  (until you confirm or it's evicted with the rest of the in-memory task
-  store on a process restart) — polling further will just keep returning
-  the same state.
+  (until you confirm, decline, or the task store loses it — see §7) —
+  polling further will just keep returning the same state.
 - **Webhook** (`task_push_notification_config`): one of the delivered
   `statusUpdate` payloads will carry `status.state ==
   "TASK_STATE_INPUT_REQUIRED"`. Treat this delivery as "stop and get a
@@ -144,9 +178,11 @@ API surface — with:
   { "confirm_pending_action": { "id": "b2c1e4a0-..." } }
   ```
   using the exact `id` from the artifact in §2. You still need to supply
-  `jenkins`/`llm` config alongside it (same as any other request to this
+  the rest of the config alongside it (same as any other request to this
   agent) — the confirm field is additive, not a replacement for the rest
-  of the config shape.
+  of the config shape. For on-call that means `repo` (with a `pat`:
+  `publish_pr` opens the pull request through the GitHub REST API with
+  it) and `llm`; for k8s, `llm`.
 
 ```python
 import uuid
@@ -162,11 +198,12 @@ resp = httpx.post(
             "task_id": task_id,          # from the paused task
             "role": "ROLE_USER",
             "parts": [
-                {"text": "confirming the proposed deploy"},  # for the human-readable log; not parsed
+                {"text": "approved"},  # for the human-readable log; not parsed
                 {"data": {
                     "confirm_pending_action": {"id": pending_action_id},
-                    "jenkins": jenkins_config,
+                    "repo": repo_config,
                     "llm": llm_config,
+                    "options": {},
                 }},
             ],
         }
@@ -174,6 +211,11 @@ resp = httpx.post(
     timeout=600,
 )
 ```
+
+This is the same message `AgentClient.confirm()` in
+`src/chat_gateway/a2a_client.py` builds: the conversation's own config
+with `confirm_pending_action` added, sent on the paused task's
+`task_id` and `context_id`.
 
 A plain text part is still worth sending (shown above) purely for the
 conversation's own readability/audit trail — the confirm logic itself
@@ -183,24 +225,35 @@ looks at it — see `docs/design.md` §5b).
 
 ## 5. What happens after you confirm
 
-- **Resolves correctly** → `execute_action` runs, and the completed Task
-  (now back to `TASK_STATE_COMPLETED`/`TASK_STATE_FAILED`, whichever the
-  trigger actually resulted in) carries an `action_result` artifact.
-- **The id doesn't resolve** (typo, wrong task_id, already handled, the
-  in-memory task store lost it across a process restart) → the Task goes
-  straight to `TASK_STATE_FAILED` with a message explaining why, rather
-  than silently falling through to normal planning. Don't retry the same
-  confirm blindly — if it didn't resolve once, it won't resolve again;
-  ask the agent to propose the action fresh instead.
-- **More than 30 minutes passed** since the proposal → rejected as stale
-  (`execute_action`'s own check, independent of and in addition to the
-  confirm mechanism itself) — same "propose it again" recovery.
+- **Resolves correctly** → the kind's confirm capability runs as the
+  only step of a new run (`publish_pr` for on-call,
+  `apply_approved_change` for k8s), and the Task goes back to
+  `TASK_STATE_COMPLETED`/`TASK_STATE_FAILED`, whichever that step
+  actually resulted in. On-call adds a `pull_request` artifact
+  (`{"url": ..., "branch": ...}`); k8s adds an `action_result` artifact.
+  The proposal's own artifacts stay on the task.
+- **The id doesn't resolve** (typo, wrong task_id, already handled) →
+  the Task goes straight to `TASK_STATE_FAILED` with a message
+  explaining why, rather than silently falling through to normal
+  planning. That failure is terminal, so the real proposal on the same
+  task can no longer be confirmed either. Don't retry the same confirm
+  blindly — ask the agent to propose the change fresh instead.
+- **The proposal no longer holds** → the confirm capability refuses and
+  the Task ends `TASK_STATE_FAILED`, with the same "ask again" recovery.
+  `publish_pr` refuses a proposal that is not an `open_pull_request`
+  proposal or lacks `branch`, `base_ref`, `title` or `repo`.
+  `apply_approved_change` re-reads the target and refuses if anything
+  the change depends on moved since the proposal's `snapshot` (unless
+  the target already holds the approved values). Neither checks the
+  proposal's age; the approval window is the caller's to enforce.
 - **Sending a plain "yes" instead of the structured field does
   nothing** — there is no code path that turns free text into a
-  `trigger_build` confirmation. This is deliberate (`docs/design.md`
-  §5b's layer 3) — if your integration only sends text, `trigger_build`
-  will simply never execute, and the task will just stay at
-  `INPUT_REQUIRED`.
+  confirmation. This is deliberate (`docs/design.md` §5b's layer 3):
+  the planner is told never to schedule `publish_pr` or
+  `apply_approved_change`, the k8s kind drops them from any plan, and
+  both refuse to run unless the step came from the confirmation bypass.
+  A free-text reply on the paused task just runs an ordinary new turn
+  (§7).
 
 ## 6. Declining
 
@@ -247,21 +300,27 @@ a real paused task, so this shouldn't come up in normal use.
 
 - **A second, unrelated message on the same paused `task_id`** (not a
   confirm — some other question or request) is accepted normally and
-  runs an ordinary new planning turn; it doesn't automatically continue
-  or cancel the pending proposal, which just keeps waiting.
+  runs an ordinary new planning turn on that task. If that turn ends
+  without a new proposal, the task is in a terminal state and the
+  earlier proposal can no longer be confirmed; if it proposes again, the
+  task pauses with a new `pending_action`. The chat gateway tells the
+  user so (`STALE_PROPOSAL_NOTE` in `src/chat_gateway/bridge.py`).
 - **Sending the same `confirm_pending_action` twice**, after the first
-  one already resolved the task to a terminal state, will very likely
-  be refused outright at the SDK level (a terminal-state task refuses a
-  further `message/send` for that `task_id`) — verified this refusal
-  exists for the general terminal-state case, but the exact behavior for
-  two *concurrent* confirms racing each other before either completes
-  has not been specifically verified. Don't rely on a specific outcome
-  here: send one confirm and wait for its result before considering a
-  retry.
-- **This only works within one running server process.** `InMemoryTaskStore`
-  doesn't persist across a restart — a paused task lost to a restart
-  can't be resumed; you'd get the "could not find a pending action"
-  failure from §5 if you tried.
+  one already resolved the task to a terminal state, is refused at the
+  SDK level (a terminal-state task refuses a further `message/send` for
+  that `task_id`). Two confirms sent at once were tried live against the
+  k8s kind (`docs/MEMORY.md`, 2026-10-16): the change was written once
+  and the task ended `COMPLETED`. On-call's `publish_pr` looks up an
+  existing open pull request for the branch before creating one. Still,
+  send one confirm and wait for its result before considering a retry.
+- **Whether a paused task survives an API restart depends on the
+  deployment.** With `TASK_STORE_ROOT` unset the API keeps tasks in
+  `InMemoryTaskStore`, and a restart loses the paused task: a confirm
+  afterwards is refused with HTTP 404 for the task. With
+  `TASK_STORE_ROOT` set (the Helm chart mounts a volume for it), tasks
+  are also written to disk and survive a restart; they are pruned after
+  `TASK_STORE_MAX_AGE_SECONDS` (default 7 days)
+  (`src/common/a2a_server/task_store.py`).
 - **Once declined (cancelled), it's final** — `TASK_STATE_CANCELED` is a
   terminal state, so a later confirm attempt against that same `task_id`
   will be refused, not silently re-open the proposal. Propose it again
@@ -269,12 +328,12 @@ a real paused task, so this shouldn't come up in normal use.
 
 ## What pauses, and what does not
 
-| | `trigger_build` (jenkins) and `propose_pr` (on-call) | `stop_build`, and anything with nothing to approve |
+| | `propose_pr` (on-call) and `propose_change` (k8s) | Anything with nothing to approve |
 |---|---|---|
-| Pause mechanism | Hard: real `TASK_STATE_INPUT_REQUIRED` | Soft: task completes normally, message asks for confirmation in plain language |
-| How you confirm | Structured `confirm_pending_action: {"id": ...}` field, same `task_id` | Plain "yes, go ahead" text, same `context_id` |
-| Who decides it's a confirmation | Deterministic server-side artifact lookup, no LLM | The planner's LLM, reading conversation history |
-| Free-text "yes" alone | Does nothing | Works, as it always has |
+| Pause mechanism | Hard: real `TASK_STATE_INPUT_REQUIRED` | None: the task completes normally |
+| How you confirm | Structured `confirm_pending_action: {"id": ...}` field, same `task_id` | Nothing to confirm |
+| Who decides it's a confirmation | Deterministic server-side artifact lookup, no LLM | — |
+| Free-text "yes" alone | Does nothing to the proposal; runs a new turn (§7) | An ordinary follow-up message |
 
 See `docs/design.md` §5b for the design behind the hard gate.
 
@@ -287,3 +346,7 @@ committing afterwards would be gone. The proposal carries a
 `compare_url` for exactly this reason: it is the whole diff, where the
 `key_hunks` field is only an excerpt sized for an email. Declining
 (§6) leaves that branch behind; nothing deletes it.
+
+The k8s kind has no such side effect: `propose_change` changes nothing
+in the cluster (it runs only a server-side dry run), so declining leaves
+nothing behind.

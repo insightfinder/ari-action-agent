@@ -2,26 +2,22 @@
 
 Each agent kind on this codebase is its own A2A server deployment with
 its own base URL and Agent Card: the **on-call agent** (§1–§8 below —
-clones a repo, fixes it, opens a PR), the **Kubernetes agent** (§10 —
+clones a repo, fixes it, opens a PR) and the **Kubernetes agent** (§10 —
 checks Pod health, and proposes and, once approved, applies scaling and
-CPU/memory changes), and the **Jenkins agent** (§9 — deprecated: no longer
-maintained or deployed, kept for reference). All are genuine
+CPU/memory changes). Both are genuine
 [A2A (Agent2Agent) protocol](https://a2a-protocol.org) servers, built on
 the official [`a2a-sdk`](https://pypi.org/project/a2a-sdk/) (a Linux
 Foundation project), serving both the **JSON-RPC** and **REST/HTTP+JSON**
 transports the spec defines (gRPC is a deliberate, separate follow-up —
 see `docs/design.md` §2), and everything about §1–§8 (discovery, auth,
 `message/send`, the three response patterns, cancellation, errors)
-applies identically to the Jenkins agent — only the Agent Card content
-and the config `DataPart` shape differ, which §9 covers.
+applies identically to the Kubernetes agent — only the Agent Card content
+and the config `DataPart` shape differ, which §10 covers. A third kind,
+the Jenkins agent, is deprecated (§9).
 
 Everything below for the on-call agent is verified against a real running
 instance, not just read off the spec — exact request/response bodies are
-copied from real captured traffic, not hand-written. The Jenkins agent's
-own MCP integration has been verified at the protocol level against a
-real production Jenkins (see `docs/MEMORY.md`, 2026-09-18) but **not yet
-through an actual end-to-end A2A call** — §9's examples are illustrative
-of the intended shape, not captured live traffic.
+copied from real captured traffic, not hand-written.
 
 If you already have an A2A client library, you can likely skip straight to
 [§5 Config `DataPart` shape](#5-this-agents-config-datapart-shape) — that's
@@ -205,7 +201,12 @@ task moved through its lifecycle:
 
 ## 4. What you get back for a real fix
 
-For a request that actually touches a repo, the completed `Task` carries
+A request that changes a repository first pauses: the task goes to
+`TASK_STATE_INPUT_REQUIRED` with a `pending_action` artifact describing the
+pull request it is ready to open, and nothing is opened until you confirm
+it on the same task. That round trip is
+[`docs/INPUT_REQUIRED_INTEGRATION.md`](INPUT_REQUIRED_INTEGRATION.md).
+After the confirmation, the completed `Task` carries
 `artifacts` in addition to the final message — the root cause (if analysis
 ran) and the PR link (if one was opened), as structured `DataPart`s, not
 just embedded in the text:
@@ -300,129 +301,14 @@ OPENAI_API_KEY=sk-... GITHUB_PAT=ghp_... python docs/examples/sample_client.py t
 OPENAI_API_KEY=sk-... GITHUB_PAT=ghp_... python docs/examples/sample_client.py task-webhook
 ```
 
-The Jenkins agent has its own sibling example,
-[`docs/examples/jenkins_sample_client.py`](examples/jenkins_sample_client.py)
-— see §9.
+The Kubernetes agent has its own sibling example,
+[`docs/examples/k8s_sample_client.py`](examples/k8s_sample_client.py)
+— see §10.
 
-## 9. The Jenkins agent
+## 9. The Jenkins agent (deprecated)
 
-A separate deployment, own base URL, own Agent Card (`skills[0].id ==
-"jenkins_read_diagnose_act"`) — but the same `message/send` operation and
-the same three response patterns as §3. Only the config `DataPart` shape
-differs.
-
-### Config `DataPart` shape
-
-```jsonc
-{
-  "jenkins": {
-    "base_url": "https://jenkins.example.com",
-    "auth": {
-      "type": "api_token",        // or "bearer", "basic"
-      "user": "svc-ari-jenkins",  // required for api_token/basic
-      "token": "..."
-    },
-    "verify_tls": true,
-    "ca_bundle": null,             // optional — PEM content (not a path), for a private/internal CA
-    "allow_mutations": true        // design intent only today — not yet enforced in code, see docs/design.md §8
-  },
-  "llm": {
-    "provider": "anthropic",
-    "api_key": "sk-ant-...",
-    "model": "claude-sonnet-5"
-  }
-}
-```
-
-Jenkins connection details are per-request, exactly like the on-call
-agent's `repo` block — never deployment-level config. This is deliberate:
-this agent stores no credentials between requests.
-
-### Reading vs. diagnosing vs. changing something
-
-A plain status/history question ("how's the checkout-service deploy
-job doing?") runs `resolve_target` → `inspect` and answers directly — no
-confirmation needed, nothing mutates. A failure question ("why has the
-nightly build been red since Tuesday?") runs `resolve_target` →
-`diagnose` instead, and the final message includes the diagnosed cause
-with evidence (failing step, first real error line), not just a
-pass/fail restatement.
-
-A requested **change** ("deploy checkout-service to staging", "stop that
-build") never executes on the first turn. It runs `resolve_target` →
-`propose_action`, which resolves the job and every parameter but calls
-nothing mutating (`propose_action`'s opencode agent has every mutating
-Jenkins tool denied outright — see `docs/design.md` §5b), and the Task
-carries a `pending_action` artifact:
-
-```json
-{
-  "artifacts": [
-    {
-      "name": "pending_action",
-      "parts": [{ "data": {
-        "id": "b2c1...",
-        "action": "trigger_build",
-        "job": "deploy/checkout-service",
-        "parameters": { "ENV": "staging" },
-        "reasoning": "ENV defaults to \"production\"; user asked for staging explicitly",
-        "jenkins_url": "https://jenkins.example.com",
-        "created_at": "2026-09-18T22:00:00+00:00"
-      }}]
-    }
-  ]
-}
-```
-
-**How you confirm it differs by action** (see `docs/design.md` §5b for
-the full three-layer gate):
-
-- **`trigger_build`** — a hard gate, not a chat reply. The Task's status
-  is genuinely `TASK_STATE_INPUT_REQUIRED` (not `COMPLETED`) — this agent
-  *does* implement that state for this one action, unlike the on-call
-  agent (§3). See
-  [`docs/INPUT_REQUIRED_INTEGRATION.md`](INPUT_REQUIRED_INTEGRATION.md)
-  for the full integration contract (detecting it across all three
-  response patterns, edge cases, a runnable snippet); summary: send a
-  follow-up `message/send` on the **same `task_id`** whose config
-  `DataPart` carries a structured field instead of free text:
-  ```json
-  { "confirm_pending_action": { "id": "b2c1..." } }
-  ```
-  This id must match a `pending_action` artifact already on that exact
-  task — the server resolves it deterministically from the task's own
-  history, never from an LLM's reading of a "yes." A wrong/stale/unknown
-  id fails clearly rather than silently doing nothing. There is no
-  free-text way to confirm a `trigger_build` — a plain "yes, go ahead" on
-  its own does not execute it.
-- **`stop_build`** — unchanged, conversational. Send a follow-up
-  `message/send` in the same `context_id` with a plain "yes, go ahead"
-  reply; the planner reads history and, recognizing a confirmation of a
-  specific prior proposal, schedules `execute_action` with those exact
-  fields itself. A bare "yes" with no matching proposal in history does
-  nothing, and a confirmation more than 30 minutes after the proposal is
-  rejected as stale either way.
-
-Once genuinely confirmed, `execute_action` runs and the Task's status
-returns to a normal terminal state, carrying an `action_result` artifact
-instead. Stopping a build goes through a direct REST call under the hood,
-not opencode — see `docs/design.md` §5b for why (no stop/cancel tool
-exists in the real plugin, confirmed live).
-
-### Sample client
-
-[`docs/examples/jenkins_sample_client.py`](examples/jenkins_sample_client.py)
-demonstrates the read/diagnose/propose flow (agent-card, a status
-question, a failure diagnosis, and a change proposal) — deliberately does
-**not** include a mode that confirms and executes an action, consistent
-with this codebase's general posture of never wiring an automatic
-confirm-and-mutate path in example/test code.
-
-```bash
-pip install httpx
-JENKINS_BASE_URL=https://jenkins.example.com JENKINS_USER=... JENKINS_TOKEN=... \
-  ANTHROPIC_API_KEY=sk-ant-... python docs/examples/jenkins_sample_client.py propose
-```
+The Jenkins agent kind is deprecated and is not on this branch; its code
+and its documentation live on the `jenkins-agent` branch.
 
 ## 10. The Kubernetes agent (`k8s` kind)
 

@@ -22,6 +22,8 @@ import asyncio
 import os
 from urllib.parse import urlsplit, urlunsplit
 
+from common.settings import get_settings
+
 
 # Every git call here is a short, bounded operation — the slowest, `clone`
 # of a large monorepo, is seconds to a couple of minutes. None of them has
@@ -237,8 +239,9 @@ async def commit(workdir: str, title: str, body: str = "") -> None:
     """A fixed, generic author identity — this commit is ARI's, not any
     individual's, same reasoning as opencode's own agents never being
     asked to impersonate a person."""
+    settings = get_settings()
     args = [
-        "git", "-c", "user.email=support@insightfinder.com", "-c", "user.name=ARI Agent",
+        "git", "-c", f"user.email={settings.commit_author_email}", "-c", f"user.name={settings.commit_author_name}",
         "commit", "-m", title,
     ]
     if body:

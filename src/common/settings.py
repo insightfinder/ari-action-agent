@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     agent_api_keys: str = "change-me-dev-key"
 
     agent_name: str = "ARI On-Call Agent"
+
+    commit_author_name: str = "ARI Agent"
+    commit_author_email: str = "support@insightfinder.com"
     agent_public_url: str = "http://localhost:8000"
 
     sandbox_root: str = "/tmp/ari-agent-sandbox"

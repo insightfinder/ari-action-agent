@@ -6,9 +6,9 @@ metadata:
     app: ari-oncall-agent
     component: worker
 spec:
-  # Scale workers independently of API replicas — this is where opencode
-  # sandboxes, git clones, and LLM calls actually run.
-  replicas: 3
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ari-oncall-agent
@@ -19,27 +19,40 @@ spec:
         app: ari-oncall-agent
         component: worker
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: worker
-          image: ari-oncall-agent:latest
-          command: ["python", "-m", "ari_agent.orchestration.worker"]
+          image: docker.io/insightfinderinc/ari-oncall-agent-worker:main
+          env:
+            - name: AGENT_KIND
+              value: oncall
+            - name: SANDBOX_ROOT
+              value: /var/lib/ari-agent/sandbox
+            - name: REPO_CACHE_ROOT
+              value: /var/lib/ari-agent/repo-cache
+            - name: BUILD_CACHE_ROOT
+              value: /var/lib/ari-agent/build-cache
+            - name: MAX_CONCURRENT_ACTIVITIES
+              value: "1"
           envFrom:
             - secretRef:
                 name: ari-oncall-agent-env
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: 2000m, memory: 6Gi }
           volumeMounts:
             - name: sandbox
               mountPath: /var/lib/ari-agent/sandbox
             - name: repo-cache
               mountPath: /var/lib/ari-agent/repo-cache
+            - name: build-cache
+              mountPath: /var/lib/ari-agent/build-cache
       volumes:
         - name: sandbox
           emptyDir: {}
-        # emptyDir here (like `sandbox`) means each replica gets its own
-        # independent repo cache, reset on pod restart — still valuable
-        # for that pod's own request stream, but not shared cluster-wide.
-        # For the caching benefit to apply across all replicas, replace
-        # this with a PVC backed by a ReadWriteMany volume (e.g. NFS/EFS)
-        # mounted at the same path on every replica — see
-        # docs/design.md §7 and REPO_CACHE_ROOT in .env.example.
         - name: repo-cache
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: ari-oncall-agent-repo-cache
+        - name: build-cache
+          persistentVolumeClaim:
+            claimName: ari-oncall-agent-build-cache

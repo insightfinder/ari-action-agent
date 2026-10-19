@@ -27,7 +27,7 @@ src/
                         other agent-kind-agnostic mechanics
 
   ari_oncall_agent/    one agent kind's own code
-    capabilities/      clone_repo, analyze, generate_change, verify, publish_pr
+    capabilities/      clone_repo, generate_change, verify, propose_pr, publish_pr, run_skill
     tools/             git_ops.py, repo_cache.py, opencode_cli.py (GitHub MCP wiring)
     schemas.py         documents this kind's own request config shape
     meta.py            this kind's AgentMeta instance
@@ -63,7 +63,7 @@ docs/
 
 tests/                  one flat directory, no per-agent-kind subfolders;
                         filenames say which kind they cover
-                        (test_jenkins_capabilities.py, etc.) — common/ tests
+                        (test_k8s_capabilities.py, etc.) — common/ tests
                         don't have a kind in the name
 
 .github/workflows/docker-build-push.yml
@@ -73,9 +73,10 @@ tests/                  one flat directory, no per-agent-kind subfolders;
 **The Helm chart lives in a separate repo** —
 `insightfinder/charts`, `charts/oncallari/` — not here. It has its own
 per-agent-kind structure mirroring this one: `templates/ari-oncall-agent/`
-and `templates/ari-jenkins-agent/`, each a self-contained set of
-api-deployment/worker-deployment/secret/service/ingress manifests, plus
-one shared `_helpers.tpl` and `values.yaml`.
+and `templates/ari-k8s-agent/`, each a self-contained set of
+api-deployment/worker-deployment/secret/service/ingress manifests (plus
+the kind's own PVCs, and RBAC for the k8s kind), plus one shared
+`_helpers.tpl` and `values.yaml`.
 
 ## 2. The one rule that keeps this scaling cleanly
 
@@ -86,7 +87,7 @@ through exactly one declarative contract: `AgentMeta`
 the Agent Card's description/skill, the planner's domain guidance, what
 counts as an artifact, which capability resolves a confirmed
 human-in-the-loop action — it reads a field off `get_agent_meta()`,
-never an `if agent_kind == "jenkins"` branch. If you find yourself
+never an `if agent_kind == "k8s"` branch. If you find yourself
 writing that branch anywhere under `common/`, that's the signal the
 thing you're branching on belongs in `AgentMeta` instead.
 
@@ -117,7 +118,7 @@ whatever it actually is). In the order you'd naturally hit them:
   behind confirmation.
 - `tools/<name>.py` — thin wrappers around whatever this agent kind
   actually talks to. If it's opencode-driven, copy the shape of
-  `jenkins_agent/tools/opencode_cli.py`: a `CAPABILITY_AGENTS` map
+  `ari_oncall_agent/tools/opencode_cli.py`: a `CAPABILITY_AGENTS` map
   (capability name → scoped opencode agent name), `_AGENT_DEFS` (each
   opencode agent's `permission`/`tools` block — least privilege,
   `mode: "primary"` is required or `--agent` silently falls back to
@@ -126,12 +127,11 @@ whatever it actually is). In the order you'd naturally hit them:
   subprocess/tracing mechanics. If it's a direct API integration instead
   (no opencode), look at `k8s_agent/tools/` — typed client calls, every
   read reduced to whitelisted views and every result redacted before it
-  leaves the capability. (The deprecated Jenkins kind on the
-  `jenkins-agent` branch has the opencode-driven example.)
+  leaves the capability.
 - `schemas.py` — a documentation-only pydantic model of what this kind
   expects in its config `DataPart` (see `k8s_agent/schemas.py`). Nothing at runtime
   actually validates against it today — capabilities just read
-  `ctx.config["slack"]` as a plain dict — but it's the one place a
+  `ctx.config` as a plain dict — but it's the one place a
   caller-facing shape is written down.
 - `meta.py` — the `AgentMeta` instance. This is the contract with
   `common/`; every field is required to make the agent function, most
@@ -145,8 +145,10 @@ whatever it actually is). In the order you'd naturally hit them:
   - `artifacts` — `{"artifact_name": "capability.result_key"}` — which
     capability results become named A2A artifacts.
   - `confirm_capability` — only set this if the kind has a
-    human-in-the-loop confirm gate like Jenkins' `trigger_build` (see
-    `docs/design.md` §5b); otherwise leave it `None` (the default).
+    human-in-the-loop confirm gate like the k8s kind's
+    `propose_change` → `apply_approved_change` (or oncall's
+    `propose_pr` → `publish_pr`; see `docs/design.md` §5b); otherwise
+    leave it `None` (the default).
   - `planner_skills` — set `False` if the kind has no `run_skill`
     capability, so its planner is not shown the installed Agent Skills
     (the k8s kind does this). Defaults to `True`.
@@ -157,7 +159,7 @@ One line in `_AGENT_PACKAGES`:
 ```python
 _AGENT_PACKAGES = {
     "oncall": "ari_oncall_agent",
-    "jenkins": "jenkins_agent",
+    "k8s": "k8s_agent",
     "slack": "slack_agent",
 }
 ```
@@ -165,7 +167,7 @@ This is genuinely the only place `common/` names a specific package.
 
 ### 3.3 The registries: `configs/slack/capabilities.yaml`, `configs/slack/tools.yaml`
 
-Same shape as `configs/jenkins/{capabilities,tools}.yaml` — each
+Same shape as `configs/k8s/{capabilities,tools}.yaml` — each
 capability entry names its module, description (goes into the planner's
 catalog), which tools it may call, and its retry/`on_failure` policy.
 Every agent kind also registers the shared `common.respond` capability
@@ -181,7 +183,7 @@ Add `"src/slack_agent"` to `[tool.hatch.build.targets.wheel]`'s
 
 Only if this kind needs a different toolchain than the two that already
 exist (`Dockerfile.oncall`'s full git/go/java/maven/opencode stack,
-`Dockerfile.jenkins`'s much lighter opencode-only one). No new API
+`Dockerfile.k8s`'s Python-only one with no shell tooling). No new API
 Dockerfile — `Dockerfile.api` is already agent-kind-agnostic and shared
 by every kind's API deployment.
 
@@ -196,9 +198,10 @@ One new entry in the `matrix.include` list:
 ### 3.7 The Helm chart (separate repo: `insightfinder/charts`)
 
 - A new `templates/ari-slack-agent/` directory, copied from
-  `templates/ari-jenkins-agent/` and renamed throughout — api-deployment,
-  worker-deployment, secret, service, ingress. Drop the repo-cache PVC
-  unless this kind clones repos like the on-call agent does.
+  `templates/ari-k8s-agent/` and renamed throughout — api-deployment,
+  worker-deployment, secret, service, ingress, task-store PVC. Drop the
+  RBAC unless this kind calls the Kubernetes API, and add a repo-cache
+  PVC only if it clones repos like the on-call agent does.
 - New `_helpers.tpl` entries with a distinct suffix
   (`insightfinder.ariSlackAgent*`, `-slack-api`/`-slack-worker`/
   `-slack-secret`) — never reuse another kind's suffix, that's what
@@ -213,12 +216,12 @@ One new entry in the `matrix.include` list:
 
 ### 3.8 Tests
 
-At minimum, mirroring what exists for Jenkins: a `tests/test_slack_
+At minimum, mirroring what exists for the k8s kind: a `tests/test_slack_
 capabilities.py` covering each capability's `run()` against a `StepContext`
-built by hand (see `test_jenkins_capabilities.py`'s `_ctx()` helper), and
+built by hand (see `test_k8s_capabilities.py`'s `_ctx()` helper), and
 adding `"slack"` to `tests/test_agent_meta.py`'s
 `test_fallback_steps_only_name_capabilities_that_kind_actually_has` —
-its loop is a hardcoded tuple (`for kind in ("oncall", "jenkins"):`), not
+its loop is a hardcoded tuple (`for kind in ("oncall", "k8s"):`), not
 auto-discovered from `_AGENT_PACKAGES`, so a new kind needs adding there
 by hand or its fallback-steps-vs-registry check silently never runs for
 it.
@@ -227,9 +230,9 @@ it.
 
 - `docs/design.md` §0's table gets a new row.
 - `docs/DEVELOPER_GUIDE.md` gets a new numbered section for this kind's
-  own config `DataPart` shape, same pattern as §9's Jenkins section.
+  own config `DataPart` shape, same pattern as §10's Kubernetes section.
 - A new `docs/examples/slack_sample_client.py`, mirroring the existing
-  two.
+  `sample_client.py` and `k8s_sample_client.py`.
 
 ## 4. What you should almost never need to touch
 
@@ -240,11 +243,12 @@ per-kind `domain_guidance` *content*, which lives in `meta.py`), or
 Every one of those is already generic over `AgentMeta`; a new kind
 should only ever need a new package, a new `configs/<kind>/`, and one
 line in `_AGENT_PACKAGES`. The one narrow exception so far: the
-`trigger_build` confirm-gate mechanism (`requires_approval`/
-`confirmed_action`/`StepContext.confirmed`) touches `common/` because
-it's genuinely a reusable *mechanism* (any future kind's own mutating
-action could opt into it via `AgentMeta.confirm_capability`), not
-because Jenkins gets special-cased. Part of the same mechanism: when the
+confirm-gate mechanism (`requires_approval`/`confirmed_action`/
+`StepContext.confirmed`) touches `common/` because it's genuinely a
+reusable *mechanism* (oncall's `publish_pr` and k8s's
+`apply_approved_change` both opt into it via
+`AgentMeta.confirm_capability`, and any future kind's own mutating
+action can too), not because one kind gets special-cased. Part of the same mechanism: when the
 confirmed step raises past its retries, `workflow.py` records it as
 `{"status": "interrupted"}` and `respond.execution_fact` reports the
 outcome as unknown, never as "nothing was executed".
