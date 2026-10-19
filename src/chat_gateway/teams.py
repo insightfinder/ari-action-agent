@@ -58,6 +58,7 @@ class TeamsSettings(BaseSettings):
     teams_session_file: str = ""
     teams_host: str = "0.0.0.0"
     teams_port: int = 3978
+    teams_messages_path: str = "/api/messages"
 
     @field_validator("teams_app_id", "teams_app_password", "teams_tenant_id", mode="before")
     @classmethod
@@ -71,6 +72,8 @@ class TeamsSettings(BaseSettings):
             raise ConfigError("TEAMS_APP_PASSWORD is empty; add a client secret for the bot")
         if not GUID.match(self.teams_tenant_id):
             raise ConfigError("TEAMS_TENANT_ID must be the Microsoft 365 tenant id (a GUID)")
+        if not self.teams_messages_path.startswith("/") or self.teams_messages_path == "/healthz":
+            raise ConfigError("TEAMS_MESSAGES_PATH must be a path starting with / (and not /healthz)")
 
     def allowed_teams(self) -> set[str]:
         return {t.strip() for t in self.teams_allowed_teams.split(",") if t.strip()}
@@ -449,15 +452,16 @@ async def run() -> None:
 
     app = web.Application()
     app["agent_configuration"] = connections.get_default_connection_configuration()
-    app.router.add_post("/api/messages", messages)
+    app.router.add_post(settings.teams_messages_path, messages)
     app.router.add_get("/healthz", health)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, settings.teams_host, settings.teams_port).start()
     logger.info(
-        "listening on %s:%s for Teams bot %s; agent %s",
+        "listening on %s:%s%s for Teams bot %s; agent %s",
         settings.teams_host,
         settings.teams_port,
+        settings.teams_messages_path,
         settings.teams_app_id,
         gateway.bridge.settings.ari_agent_url,
     )
