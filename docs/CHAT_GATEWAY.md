@@ -1,6 +1,6 @@
-# Chat gateway: talking to the agent from Slack
+# Chat gateway: talking to the agent from Slack and Microsoft Teams
 
-The chat gateway is a small separate process that lets people use the ARI agent from Slack. It holds the Slack connection, turns messages into A2A requests to the agent, follows each task, and shows approvals as buttons. The agent itself does not change; the gateway is just another client, like the `ari` CLI ([CLI.md](CLI.md)), and shares its bridge code in `src/chat_gateway/`.
+The chat gateway is a small separate process that lets people use the ARI agent from Slack or Microsoft Teams. One process serves one platform: `python -m chat_gateway slack` or `python -m chat_gateway teams` (default `slack`, or set `CHAT_PLATFORM`). Everything below is about Slack until the [Microsoft Teams](#microsoft-teams) section, which lists only what differs. It holds the Slack connection, turns messages into A2A requests to the agent, follows each task, and shows approvals as buttons. The agent itself does not change; the gateway is just another client, like the `ari` CLI ([CLI.md](CLI.md)), and shares its bridge code in `src/chat_gateway/`.
 
 ## What people see
 
@@ -108,3 +108,45 @@ Set `SLACK_SESSION_FILE` so a restart does not lose the conversations. In the im
 - A button on an older proposal in the same thread is refused once a newer task has taken its place, so a leftover Decline cannot cancel the current work.
 - The gateway polls the agent every `POLL_SECONDS` (default 5) while a task runs. It does not need an inbound webhook.
 - Slack shows at most about 3,000 characters per block, so long answers are split across several messages.
+
+## Microsoft Teams
+
+Same conversations, same approval rules, same agent settings (`ARI_AGENT_URL`, `LLM_*`, `GITHUB_PAT`, `APPROVERS`, `REQUESTER_CAN_APPROVE` and the rest of the table above). What differs:
+
+- **Teams calls the gateway, not the other way round.** Teams has no Socket Mode: Microsoft POSTs every message to `https://<your host>/api/messages`, so the gateway needs a public HTTPS address (an ingress, or a tunnel while testing). It listens on `TEAMS_PORT` (default 3978) and answers `GET /healthz` without authentication. Every POST must carry a token issued by Microsoft for this bot; anything else gets 401. The gateway answers each POST at once and does the work afterwards, sending its replies as new messages, because Teams retries a request that takes longer than about 15 seconds.
+- **In a channel, every message must mention the bot.** Teams only delivers channel messages that @mention the bot, including replies in a thread the bot started. In a one-to-one chat with the bot no mention is needed. A conversation is a channel thread, a group chat, or the one-to-one chat.
+- **Proposals are Adaptive Cards** with Approve, Decline and Full diff buttons. After a decision the card keeps Full diff and says who decided. Teams cards have no confirmation dialog, so Approve acts on the first click.
+- **People are identified by their Microsoft Entra object id** (`aadObjectId`), so `APPROVERS` and `TEAMS_ALLOWED_USERS` hold object ids, not names or e-mail addresses. An admin can look them up in the Entra admin center under Users.
+- Messages from any tenant other than `TEAMS_TENANT_ID` are ignored.
+
+### Creating the bot and the Teams app
+
+1. In the Teams Developer Portal (https://dev.teams.microsoft.com) open **Tools > Bot management > New bot**. Copy the bot id: that is `TEAMS_APP_ID`.
+2. Under **Client secrets** add a secret: that is `TEAMS_APP_PASSWORD`. It is shown once.
+3. Under **Configure** set the endpoint address to `https://<your host>/api/messages`. Under **Channels** make sure Microsoft Teams is enabled.
+4. `TEAMS_TENANT_ID` is your Microsoft 365 tenant id (Entra admin center > Overview, or the "Organization ID" on most Microsoft admin error pages).
+5. Build the app package and install it:
+
+   ```
+   python scripts/teams_app_package.py --bot-id <TEAMS_APP_ID> --name "ARI Agent" --developer "<your org>" --website https://<your site> --out ari-agent-teams.zip
+   ```
+
+   In Teams open **Apps > Manage your apps > Upload an app**. **Upload a custom app** needs an admin to allow custom app upload for you (Teams admin center > Teams apps > Setup policies). Without it, choose **Submit an app to your org** and have an admin approve it in Teams admin center > Teams apps > Manage apps; it then appears under **Built for your org**. Creating the bot in step 1 also needs permission to register applications in Microsoft Entra.
+6. To use it in a channel, choose **Add to a team** on the app and pick a standard channel.
+
+Changing the code, the endpoint address or the secret does not need a new package. Changing the package (name, icons, commands) needs another upload, or another approval.
+
+### Teams variables
+
+| Variable | Meaning |
+|---|---|
+| `TEAMS_APP_ID` | The bot id, a GUID. Required. |
+| `TEAMS_APP_PASSWORD` | A client secret of the bot. Required. |
+| `TEAMS_TENANT_ID` | The Microsoft 365 tenant id, a GUID. Required. Messages from other tenants are ignored. |
+| `TEAMS_ALLOWED_TEAMS` | Comma-separated team ids (the team's `id` or its Microsoft 365 group id) the bot answers in. Empty: every team it is added to. When set, chats outside a team are refused. |
+| `TEAMS_ALLOWED_USERS` | Comma-separated Entra object ids allowed to use it. Empty: everyone who can reach the bot. |
+| `TEAMS_PROGRESS_SECONDS` | Minimum seconds between edits of the "working" message. Default 5. |
+| `TEAMS_SESSION_FILE` | Where conversations are saved, as `SLACK_SESSION_FILE`. Empty: memory only. |
+| `TEAMS_HOST`, `TEAMS_PORT` | Where the gateway listens. Default `0.0.0.0` and `3978`. |
+
+Run it like the Slack gateway: one replica, `strategy: Recreate`, the same image with the command `python -m chat_gateway teams`, plus a Service and an HTTPS ingress for `/api/messages`.
