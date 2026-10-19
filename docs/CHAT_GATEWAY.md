@@ -148,5 +148,6 @@ Changing the code, the endpoint address or the secret does not need a new packag
 | `TEAMS_PROGRESS_SECONDS` | Minimum seconds between edits of the "working" message. Default 5. |
 | `TEAMS_SESSION_FILE` | Where conversations are saved, as `SLACK_SESSION_FILE`. Empty: memory only. |
 | `TEAMS_HOST`, `TEAMS_PORT` | Where the gateway listens. Default `0.0.0.0` and `3978`. |
+| `TEAMS_MESSAGES_PATH` | The path Teams posts to. Default `/api/messages`. Set it to match the ingress when the gateway shares a host with something else, e.g. `/teams/api/messages`. |
 
 Run it like the Slack gateway: one replica, `strategy: Recreate`, the same image with the command `python -m chat_gateway teams`, plus a Service and an HTTPS ingress for `/api/messages`.
