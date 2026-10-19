@@ -142,6 +142,25 @@ async def test_commit_always_uses_the_fixed_ari_agent_identity(remote_and_clone)
 
 
 @pytest.mark.asyncio
+async def test_a_deployment_can_set_the_commit_identity(remote_and_clone, monkeypatch):
+    from common.settings import get_settings
+
+    _, work = remote_and_clone
+    monkeypatch.setenv("COMMIT_AUTHOR_NAME", "Fixer Bot")
+    monkeypatch.setenv("COMMIT_AUTHOR_EMAIL", "fixer@example.org")
+    get_settings.cache_clear()
+    try:
+        (work / "a.py").write_text("x = 3\n")
+        await git_ops.add(str(work), ["a.py"])
+        await git_ops.commit(str(work), "Fix the thing")
+    finally:
+        get_settings.cache_clear()
+
+    author = _output("log", "-1", "--pretty=%an <%ae>", cwd=work).strip()
+    assert author == "Fixer Bot <fixer@example.org>"
+
+
+@pytest.mark.asyncio
 async def test_commit_raises_clearly_when_nothing_is_staged(remote_and_clone):
     _, work = remote_and_clone
     with pytest.raises(RuntimeError, match="git commit failed"):
