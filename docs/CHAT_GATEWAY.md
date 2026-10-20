@@ -89,7 +89,7 @@ Set `SLACK_SESSION_FILE` so a restart does not lose the conversations. In the im
 | `SLACK_ALLOWED_USERS` | Comma-separated user ids allowed to use it. Empty: everyone who can see the bot. Someone not on the list who mentions the bot gets a short refusal; their plain replies in a bot thread are ignored. |
 | `SLACK_PROGRESS_SECONDS` | Minimum seconds between edits of the "working" message. Default 5. |
 | `SLACK_SESSION_FILE` | Where conversations are saved, for example `/data/sessions.json`. The directory must be writable. Empty: memory only, so a restart forgets every conversation. |
-| `ARI_AGENT_URL`, `ARI_API_KEY` | The agent's A2A endpoint and one of the keys in its `AGENT_API_KEYS`. In the cluster use the service, not the public ingress. |
+| `ARI_AGENT_URL`, `ARI_API_KEY` | Where requests go and the key for it: an agent's A2A endpoint and one of its `AGENT_API_KEYS`, or, to reach several agents from one chat, the [Coordinator](COORDINATOR.md) and one of its keys. |
 | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL` | Sent with every request; the agent has no model key of its own. |
 | `GITHUB_PAT` | Lets the agent push branches and open pull requests. |
 | `DEFAULT_REPO_URL`, `DEFAULT_REPO_REF` | The repository used when a message names none. |

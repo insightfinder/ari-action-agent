@@ -1,0 +1,10 @@
+agents:
+  - name: oncall
+    url_env: ONCALL_AGENT_URL
+    api_key_env: ONCALL_AGENT_API_KEY
+    forward_config: [repo, llm, options, system_prompt]
+  - name: k8s
+    url_env: K8S_AGENT_URL
+    api_key_env: K8S_AGENT_API_KEY
+    forward_config: [llm, options]
+default_agent: oncall
