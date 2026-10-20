@@ -70,6 +70,21 @@ reader acts on the difference.
 """
 
 
+def _proposal_exists(meta, step_results: dict) -> bool:
+    """Whether a proposal for the confirm step was actually produced.
+
+    Read from `meta.artifacts["pending_action"]` ("<step>.<field>") so it
+    holds for any agent kind without a second place to declare the same
+    thing.
+    """
+    ref = (getattr(meta, "artifacts", None) or {}).get("pending_action")
+    if not ref or "." not in ref:
+        return False
+    step, _, field = ref.partition(".")
+    result = step_results.get(step)
+    return isinstance(result, dict) and bool(result.get(field))
+
+
 def execution_fact(meta, step_results: dict) -> str:
     """Whether this agent kind's one mutating capability actually ran,
     stated as a fact rather than left for the response-writing model to
@@ -97,11 +112,22 @@ def execution_fact(meta, step_results: dict) -> str:
             f"FACT: the `{capability}` step ran in this request. Report what it returned, "
             "including whether the target system actually accepted the action."
         )
-    return (
+    nothing_ran = (
         f"FACT: NOTHING WAS EXECUTED. The `{capability}` step did not run in this request, "
-        "so no action reached any external system. Anything in the results is a proposal "
-        "awaiting confirmation, never a completed action. Do not write that an action was "
+        "so no action reached any external system. Do not write that an action was "
         "executed, triggered, run, started, stopped or applied."
+    )
+    if _proposal_exists(meta, step_results):
+        return (
+            f"{nothing_ran} There IS a proposal awaiting confirmation; say what it would do "
+            "and that it needs approval."
+        )
+    return (
+        f"{nothing_ran} FACT: NOTHING WAS PROPOSED EITHER. No proposal was produced in this "
+        "request, so there is nothing for anyone to approve and no approval request was "
+        "sent. Do not write that an action is proposed, pending, awaiting approval or "
+        "awaiting confirmation. Say plainly what the request did establish, and that no "
+        "action was proposed."
     )
 
 
