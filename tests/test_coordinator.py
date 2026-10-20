@@ -175,7 +175,12 @@ async def test_the_conversation_sticks_to_its_agent_when_routing_fails(env, agen
     assert artifacts(done)["route"] == {"agent": "k8s", "reason": "the routing model gave no usable answer", "decided_by": "fallback"}
     assert len(k8s.sends) == 2 and oncall.sends == []
     assert complete.calls[1]["current_agent"] == "k8s"
-    assert complete.calls[1]["recent_turns"] == [{"agent": "k8s", "request": "pods ok?"}]
+    assert complete.calls[1]["recent_turns"] == [{"agent": "k8s", "request": "pods ok?", "answer": "healthy"}]
+    follow_up = k8s.sends[1]["message"]["parts"][0]["text"]
+    assert follow_up.startswith("Earlier in this conversation")
+    assert "User: pods ok?" in follow_up and "k8s agent answered: healthy" in follow_up
+    assert follow_up.endswith("Current request: and now?")
+    assert k8s.sends[0]["message"]["parts"][0]["text"] == "pods ok?"
 
 
 @pytest.mark.asyncio
@@ -225,6 +230,11 @@ async def test_the_card_offers_every_reachable_agents_skills(env, agents):
     card = await client.agent_card()
     assert card["name"] == "ARI"
     assert [s["id"] for s in card["skills"]] == ["oncall.code_analysis_fix", "k8s.k8s_health"]
+    oncall.card_status = k8s.card_status = 503
+    for agent in app.state.registry.agents:
+        agent.card = None
+    await app.state.refresh()
+    assert [s["id"] for s in (await client.agent_card())["skills"]] == ["route"]
 
 
 @pytest.mark.asyncio
@@ -341,3 +351,22 @@ def test_the_route_store_survives_a_restart_and_keeps_only_recent_turns(tmp_path
     assert [t["request"] for t in memory["turns"]] == ["two", "three"]
     clock[0] += 8 * 24 * 3600
     assert RouteStore(str(tmp_path), clock=lambda: clock[0]).task("t1") is None
+
+
+@pytest.mark.asyncio
+async def test_follow_up_context_is_bounded_and_can_be_turned_off(env, agents):
+    oncall, k8s = agents
+    for n in range(1, 6):
+        oncall.script(f"task-{n}", _task(f"task-{n}", "TASK_STATE_COMPLETED", text=f"answer {n}"))
+    app, client, _, _ = build(oncall, k8s, ['{"agent": "oncall", "reason": "x"}'] * 5)
+    app.state.executor.settings.coordinator_context_turns = 2
+    await app.state.refresh()
+    for n in range(1, 5):
+        task = await client.send(f"question {n}", CONFIG, context_id="conv-5")
+        await settle(client, task["id"])
+    last = oncall.sends[3]["message"]["parts"][0]["text"]
+    assert "question 1" not in last and "User: question 2" in last and "answer 3" in last
+    app.state.executor.settings.coordinator_context_turns = 0
+    task = await client.send("question 5", CONFIG, context_id="conv-5")
+    await settle(client, task["id"])
+    assert oncall.sends[4]["message"]["parts"][0]["text"] == "question 5"

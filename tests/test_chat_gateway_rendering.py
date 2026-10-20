@@ -100,6 +100,11 @@ def test_progress_names_artifacts_produced_so_far_but_not_the_proposal():
     assert rendered.state == "TASK_STATE_WORKING"
 
 
+def test_progress_does_not_list_the_coordinators_routing_note():
+    route = [{"name": "route", "parts": [{"data": {"agent": "oncall", "reason": "r"}}]}]
+    assert render_progress(_task("TASK_STATE_WORKING", route)).text == "working (task 01234567)"
+
+
 def test_pending_render_shows_the_proposal_and_offers_both_buttons():
     rendered = render_pending(_task("TASK_STATE_INPUT_REQUIRED", _pending(), text="Ready to open a PR."))
 

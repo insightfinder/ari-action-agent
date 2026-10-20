@@ -20,6 +20,11 @@ chat gateway need no changes: point `ARI_AGENT_URL` at the Coordinator instead o
 - **Sticks to the conversation's agent.** Follow-ups stay with the agent that answered before unless
   the request clearly belongs to another one. If the model call fails, the conversation's agent is
   used, then `default_agent`. With only one reachable agent, no model is asked at all.
+- **Gives follow-ups their context.** An agent only remembers within one task, so a follow-up in
+  the same conversation would start blank. The Coordinator keeps the last few requests and the
+  agents' answers, and prefixes a new request with them ("Earlier in this conversation ...",
+  `COORDINATOR_CONTEXT_TURNS`, default 3; 0 turns it off). A reply on the same task, such as an
+  approval, needs no prefix and gets none.
 - **Relays everything the agent produces**: answers, `pending_action` proposals, pull request links,
   and the final state, including `TASK_STATE_INPUT_REQUIRED`. The routing decision is published as a
   `route` artifact (`agent`, `reason`, `decided_by`).
@@ -79,11 +84,12 @@ nothing extra); list the agents under `coordinator.agents` with their in-cluster
 | `COORDINATOR_AGENT_OUTAGE_SECONDS` | How long an agent may be unreachable mid-task before the task fails. Default 600. |
 | `COORDINATOR_CARD_REFRESH_SECONDS` | How often agent cards are re-read. Default 300. |
 | `COORDINATOR_ROUTE_TURNS` | Earlier requests of the conversation shown to the routing model. Default 6. |
+| `COORDINATOR_CONTEXT_TURNS` | Earlier requests and answers passed to the agent with a follow-up. Default 3; 0 turns it off. |
 
 ## Limits
 
 - One agent per request; a request spanning two agents goes to the better match.
 - Clients still send the oncall-shaped config, and `ari` still asks for a repository even for a
   Kubernetes question. Config filtering makes this harmless.
-- An agent's own memory of a conversation is per task. When a conversation switches agents, the new
-  agent does not see the earlier turns; only the routing model does.
+- Follow-up context is the last few requests with answers cut to 2,000 characters, not the full
+  history, and it is plain text in the prompt, not structured data.

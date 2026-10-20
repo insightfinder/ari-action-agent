@@ -250,6 +250,18 @@ async def test_replies_in_the_thread_continue_the_conversation_without_a_mention
 
 
 @pytest.mark.asyncio
+async def test_a_reply_addressed_to_someone_else_is_left_to_the_people(agent):
+    agent.script("task-1", _task("task-1", "TASK_STATE_COMPLETED", text="first answer"))
+    gateway, client = make_gateway(agent), FakeSlack()
+    await gateway.handle_mention(mention("first question"), client)
+    posts = len(client.posts)
+    aside = {"type": "message", "channel": CHANNEL, "channel_type": "channel", "user": REQUESTER, "text": "<@U2|bo> looks right to me, can you try it?", "ts": "100.5", "thread_ts": "100.1"}
+    await gateway.handle_message(aside, client)
+    assert len(agent.sends) == 1
+    assert len(client.posts) == posts
+
+
+@pytest.mark.asyncio
 async def test_a_yes_in_the_thread_approves_the_waiting_proposal(agent):
     agent.script(
         "task-1",

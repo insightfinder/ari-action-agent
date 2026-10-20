@@ -40,6 +40,15 @@ logger = structlog.get_logger()
 API_KEY_SCHEME = "apiKeyAuth"
 
 
+def route_skill(settings: CoordinatorSettings) -> AgentSkill:
+    return AgentSkill(
+        id="route",
+        name="Route to an ARI agent",
+        description=settings.coordinator_description,
+        tags=["routing"],
+    )
+
+
 def build_card(settings: CoordinatorSettings) -> AgentCard:
     return AgentCard(
         name=settings.coordinator_name,
@@ -60,10 +69,11 @@ def build_card(settings: CoordinatorSettings) -> AgentCard:
         security_requirements=[SecurityRequirement(schemes={API_KEY_SCHEME: StringList(list=[])})],
         default_input_modes=["text/plain", "application/json"],
         default_output_modes=["text/plain", "application/json"],
+        skills=[route_skill(settings)],
     )
 
 
-def refresh_card_skills(card: AgentCard, registry: Registry) -> None:
+def refresh_card_skills(card: AgentCard, registry: Registry, settings: CoordinatorSettings) -> None:
     skills = []
     seen: set[str] = set()
     for agent in registry.available():
@@ -81,7 +91,7 @@ def refresh_card_skills(card: AgentCard, registry: Registry) -> None:
             seen.add(skill.id)
             skills.append(skill)
     del card.skills[:]
-    card.skills.extend(skills)
+    card.skills.extend(skills or [route_skill(settings)])
 
 
 def create_app(
@@ -119,7 +129,7 @@ def create_app(
 
     async def refresh() -> None:
         await registry.refresh()
-        refresh_card_skills(card, registry)
+        refresh_card_skills(card, registry, cs)
 
     async def refresh_forever() -> None:
         while True:
