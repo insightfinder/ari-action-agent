@@ -17,7 +17,7 @@ The chat gateway is a small separate process that lets people use the ARI agent 
 ```
 
 - **Mention the bot** in a channel it has been invited to. It answers in a thread under your message.
-- **Reply in that thread** to continue; no mention needed there. While a proposal is waiting, a reply continues that same task and the agent sees the earlier turns. Once a task has finished, a reply starts a new task in the same conversation, and that new task does not see the earlier ones.
+- **Reply in that thread** to continue; no mention needed there. A reply that mentions someone else and not the bot is taken as said to that person and left alone. While a proposal is waiting, a reply continues that same task and the agent sees the earlier turns. Once a task has finished, a reply starts a new task in the same conversation, and that new task does not see the earlier ones.
 - **Direct messages** work too, unless `SLACK_ALLOWED_CHANNELS` is set. A DM is one running conversation.
 - **Approve or Decline** a proposed pull request with the buttons, or by replying `yes` / `no` in the thread. Only the person who asked, or someone in `APPROVERS`, can decide. With `REQUESTER_CAN_APPROVE=false` the person who asked can no longer approve their own proposal; someone in `APPROVERS` has to.
 - **Approving is not code review.** It lets the agent open the pull request it prepared. The pull request then goes through the repository's normal review; the agent never merges.

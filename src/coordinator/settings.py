@@ -20,6 +20,7 @@ class CoordinatorSettings(BaseSettings):
     coordinator_follow_budget_seconds: float = 7200.0
     coordinator_agent_outage_seconds: float = 600.0
     coordinator_route_turns: int = 6
+    coordinator_context_turns: int = 3
 
 
 @lru_cache

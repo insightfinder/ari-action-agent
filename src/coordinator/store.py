@@ -12,6 +12,7 @@ logger = structlog.get_logger()
 FILE_NAME = "coordinator-routes.json"
 MAX_AGE_SECONDS = 7 * 24 * 3600
 PROMPT_CHARS = 500
+ANSWER_CHARS = 2000
 
 
 @dataclass(frozen=True)
@@ -49,15 +50,31 @@ class RouteStore:
             "turns": list(entry.get("turns") or []),
         }
 
-    def remember(self, context_id: str, agent: str, downstream_context_id: str, prompt: str, *, max_turns: int) -> None:
+    def remember(
+        self, context_id: str, agent: str, downstream_context_id: str, prompt: str, *, max_turns: int, task_id: str = ""
+    ) -> None:
         entry = self._contexts.setdefault(context_id, {"agent": "", "downstream": {}, "turns": []})
         entry["agent"] = agent
         if downstream_context_id:
             entry["downstream"][agent] = downstream_context_id
-        turns = list(entry.get("turns") or []) + [{"agent": agent, "request": prompt[:PROMPT_CHARS]}]
+        turn = {"agent": agent, "request": prompt[:PROMPT_CHARS]}
+        if task_id:
+            turn["task_id"] = task_id
+        turns = list(entry.get("turns") or []) + [turn]
         entry["turns"] = turns[-max_turns:] if max_turns > 0 else []
         entry["updated"] = self._clock()
         self.save()
+
+    def record_answer(self, context_id: str, task_id: str, answer: str) -> None:
+        entry = self._contexts.get(context_id)
+        if not entry or not task_id:
+            return
+        for turn in reversed(entry.get("turns") or []):
+            if turn.get("task_id") == task_id:
+                turn["answer"] = answer[:ANSWER_CHARS]
+                entry["updated"] = self._clock()
+                self.save()
+                return
 
     def save(self) -> None:
         self._prune()

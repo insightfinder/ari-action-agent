@@ -55,7 +55,7 @@ def _text(value: Any) -> str:
 
 
 def render_progress(task: dict[str, Any]) -> Rendered:
-    produced = [name for name in artifacts(task) if name != "pending_action"]
+    produced = [name for name in artifacts(task) if name not in ("pending_action", "route")]
     text = f"{state_label(task)} (task {short_id(_text(task.get('id')))})"
     if produced:
         text += "; produced: " + ", ".join(produced)
