@@ -4233,3 +4233,21 @@ chat gateway were wired to exactly one. `src/coordinator/` fills that gap;
 with two fake agents (route, token filtering, approve, decline, stickiness,
 single agent, no agent, agent error, card, auth, restart while paused,
 restart mid-run). Windows 561 passed; Linux 696 passed in the worker image.
+
+**First live run on test (2026-10-20).** Coordinator installed by hand
+(`helm install ari-coordinator`, chart 0.3.8 from a local checkout) in front
+of test's oncall agent and Bo's k8s agent (`ari-k8s-agent` namespace); the
+Slack gateway on the gateway EC2 talks to it through
+`test-ari-coordinator.insightfinder.com` (traefik's default certificate is a
+`*.insightfinder.com` wildcard, so a new host needs only DNS). Routing was
+right every time: a TLS question went to oncall, four Kubernetes questions to
+k8s, one of them through stickiness. The TLS answer took 17 minutes, all of
+it queueing behind another user's task stuck on the known lost child-exit bug
+in the oncall worker (a zombie `opencode` under `api.worker`, one activity at
+a time); the Coordinator itself took seconds. Two findings fixed the same day:
+a follow-up ("which ones are failing?") reached the k8s agent as a new task
+with no memory of the health check, so the Coordinator now prefixes follow-ups
+with the last turns and answers; and a thread reply addressed to a colleague
+(`@Bo ...`) was sent to the agent, so the Slack gateway now ignores replies
+that mention someone else and not the bot.
+

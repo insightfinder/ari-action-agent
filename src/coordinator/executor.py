@@ -28,6 +28,32 @@ STATES = {
     "TASK_STATE_REJECTED": TaskState.TASK_STATE_REJECTED,
 }
 
+ROUTER_ANSWER_CHARS = 300
+
+
+def with_conversation(prompt: str, turns: list[dict[str, Any]]) -> str:
+    earlier = [t for t in turns if t.get("request")]
+    if not earlier:
+        return prompt
+    lines = ["Earlier in this conversation (for context; answer only the current request):"]
+    for turn in earlier:
+        lines.append(f"User: {turn['request']}")
+        if turn.get("answer"):
+            lines.append(f"{turn.get('agent') or 'Agent'} agent answered: {turn['answer']}")
+    lines += ["", f"Current request: {prompt}"]
+    return "\n".join(lines)
+
+
+def router_turns(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    trimmed = []
+    for turn in turns:
+        item = {"agent": turn.get("agent", ""), "request": turn.get("request", "")}
+        if turn.get("answer"):
+            item["answer"] = str(turn["answer"])[:ROUTER_ANSWER_CHARS]
+        trimmed.append(item)
+    return trimmed
+
+
 DEFAULT_TEXT = {
     COMPLETED: "Done.",
     FAILED: "The agent could not finish this request.",
@@ -134,7 +160,7 @@ class CoordinatorExecutor(AgentExecutor):
                     self.registry,
                     prompt,
                     llm=config.get("llm"),
-                    turns=memory["turns"],
+                    turns=router_turns(memory["turns"]),
                     current=memory["agent"],
                     complete=self._complete,
                 )
@@ -144,8 +170,11 @@ class CoordinatorExecutor(AgentExecutor):
                     artifact_id="route",
                     name="route",
                 )
+                context_turns = memory["turns"][-self.settings.coordinator_context_turns:] if self.settings.coordinator_context_turns > 0 else []
                 task = await self.registry.client(agent).send(
-                    prompt, self.registry.forward(agent, config), context_id=memory["downstream"].get(route.agent, "")
+                    with_conversation(prompt, context_turns),
+                    self.registry.forward(agent, config),
+                    context_id=memory["downstream"].get(route.agent, ""),
                 )
                 downstream_id = str(task.get("id") or "")
                 if not downstream_id:
@@ -153,7 +182,12 @@ class CoordinatorExecutor(AgentExecutor):
                     return
                 self.store.link_task(context.task_id, TaskLink(route.agent, downstream_id, context_id_of(task)))
                 self.store.remember(
-                    context.context_id, route.agent, context_id_of(task), prompt, max_turns=self.settings.coordinator_route_turns
+                    context.context_id,
+                    route.agent,
+                    context_id_of(task),
+                    prompt,
+                    max_turns=self.settings.coordinator_route_turns,
+                    task_id=context.task_id,
                 )
                 logger.info(
                     "coordinator_routed",
@@ -177,6 +211,9 @@ class CoordinatorExecutor(AgentExecutor):
             await self._fail(updater, f"could not reach the {agent.name if agent else 'chosen'} agent: {exc}")
             return
 
+        answer = status_text(downstream)
+        if answer:
+            self.store.record_answer(context.context_id, context.task_id, answer)
         try:
             await publish(updater, downstream)
         except Exception as exc:

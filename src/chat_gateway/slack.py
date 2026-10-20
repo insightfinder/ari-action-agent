@@ -299,6 +299,8 @@ class SlackGateway:
             return
         if self.bot_user_id and f"<@{self.bot_user_id}" in text:
             return
+        if USER_MENTION.search(text):
+            return
         thread_ts = event.get("thread_ts")
         if not thread_ts:
             return
