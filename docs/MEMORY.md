@@ -4188,3 +4188,48 @@ comment in `meta.py` says MCP Service reads the first. Not verified live.
 
 **Verified:** Windows 576 passed (six POSIX-only modules cannot be imported
 there); Linux 875 passed, nothing skipped, in the worker image with every extra.
+
+## 2026-10-20 - A Coordinator for the open-source edition (II-25116)
+
+Two editions now exist. Paying customers reach the agents through UIE and
+MCP Service, whose `CoordinatorAgent` picks the agent. Free users get the
+open-source agents with neither, so nothing chose an agent: the CLI and the
+chat gateway were wired to exactly one. `src/coordinator/` fills that gap;
+`docs/COORDINATOR.md` is the guide.
+
+**Decisions (with the user and the leader).**
+
+- The Coordinator is an A2A server, so clients do not change: they point
+  `ARI_AGENT_URL` at it. It reuses the SDK server stack, `FileTaskStore`,
+  API-key auth and `chat_gateway.a2a_client.AgentClient`, and imports
+  nothing from Temporal or the worker, so it ships in the API image.
+- v1 sends one request to one agent (oncall, k8s), sticky per conversation.
+  Multi-step orchestration across agents is deferred until v1 is tested.
+- Routing uses the request's own `llm` config, like the agents: the
+  Coordinator holds no model key. Fallback order on any routing failure:
+  the conversation's agent, `default_agent`, the first reachable agent. One
+  reachable agent means no model call. Routing never fails a request.
+- `forward_config` per agent is a security boundary: clients send an
+  oncall-shaped config with the GitHub token, and the k8s agent must not
+  receive it.
+- Proposals, approvals and declines are relayed by id; the agent checks the
+  id. Artifacts are republished under the downstream `artifactId`, which the
+  SDK replaces rather than duplicates (`append_artifact_to_task`).
+- Coordinator task -> agent task links live in
+  `TASK_STORE_ROOT/coordinator-routes.json` (atomic, 0600, 7-day prune), so
+  a restart resumes following running tasks and keeps waiting proposals
+  approvable.
+- Deployment: the chat gateways never run in EKS (EKS is for the UIE
+  product); they run on a separate EC2. The Coordinator runs in EKS next to
+  the agents and reuses them and Temporal. The `oncallari` chart (0.3.8)
+  gains `orchestration: mcp | coordinator`; the `chatGateway` block from
+  0.3.7 is removed.
+
+**Found while testing:** a request with a wrong `x-api-key` is refused, but
+`common/a2a_server/auth.py` on `main` lets the SDK's error handler turn the
+401 into a 500. Not a Coordinator problem; the test accepts either.
+
+**Verified:** 15 Coordinator tests drive the real app through the A2A SDK
+with two fake agents (route, token filtering, approve, decline, stickiness,
+single agent, no agent, agent error, card, auth, restart while paused,
+restart mid-run). Windows 561 passed; Linux 696 passed in the worker image.
