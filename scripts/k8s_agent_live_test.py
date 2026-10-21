@@ -18,6 +18,11 @@ fixtures from deploy/k8s-agent-e2e/ are in place.
 Any of these can instead go in `scripts/.env` (git-ignored, `KEY=value`
 lines); a variable already set in the environment wins over the file.
 
+To also check tracing, give the agent TRACE_SERVER_URL and set TRACE_PROJECT,
+TRACE_USER and TRACE_LICENSE_KEY (TRACE_SYSTEM, TRACE_SESSION_ID optional):
+every request then carries a `trace` block (docs/DEVELOPER_GUIDE.md §5) and
+its spans land in that InsightFinder trace project.
+
     python scripts/k8s_agent_live_test.py --list
     python scripts/k8s_agent_live_test.py                 # read-only + proposals (cancelled)
     python scripts/k8s_agent_live_test.py --allow-writes  # also approves and applies changes
@@ -100,7 +105,24 @@ def _config(**options) -> dict:
     if not key:
         raise SystemExit(f"no API key for provider {provider!r}: set LLM_API_KEY")
     model = os.environ.get("LLM_MODEL") or _DEFAULT_MODELS.get(provider)
-    return {"llm": {"provider": provider, "api_key": key, "model": model}, "options": {"namespace": NAMESPACE, **options}}
+    config = {"llm": {"provider": provider, "api_key": key, "model": model}, "options": {"namespace": NAMESPACE, **options}}
+    trace = _trace()
+    if trace:
+        config["trace"] = trace
+    return config
+
+
+def _trace() -> dict | None:
+    """The request's `trace` block (docs/DEVELOPER_GUIDE.md §5), when TRACE_PROJECT,
+    TRACE_USER and TRACE_LICENSE_KEY are all set; spans then land in that
+    InsightFinder trace project, provided the agent has TRACE_SERVER_URL."""
+    names = {"trace_project": "TRACE_PROJECT", "trace_admin_user": "TRACE_USER",
+             "trace_admin_user_license": "TRACE_LICENSE_KEY", "trace_system": "TRACE_SYSTEM"}
+    block = {field: os.environ[env] for field, env in names.items() if os.environ.get(env)}
+    if not all(block.get(f) for f in ("trace_project", "trace_admin_user", "trace_admin_user_license")):
+        return None
+    block["session_id"] = os.environ.get("TRACE_SESSION_ID") or f"k8s-live-{uuid.uuid4().hex[:8]}"
+    return block
 
 
 def _send(prompt: str, config: dict, *, task_id: str = "", context_id: str = "") -> dict:

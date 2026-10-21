@@ -10,10 +10,12 @@ from dataclasses import replace
 import structlog
 from temporalio import activity
 
+from common import tracing
 from common.agent_meta import get_agent_meta
 from common.capabilities_base import StepContext
 from common.capabilities_registry import get_capability, run_capability
 from common.planner import create_plan
+from common.redaction import redact_secrets
 from common.sandbox import cleanup_workspace as _cleanup_workspace
 from common.sandbox import create_workspace
 
@@ -46,6 +48,10 @@ async def resolve_artifacts(results: dict) -> dict:
     common.agent_meta at module scope. Activities run outside the
     sandbox — same reasoning as plan_task being the one that calls
     get_capability(), not workflow.py itself."""
+    return _declared_artifacts(results)
+
+
+def _declared_artifacts(results: dict) -> dict:
     found = {}
     for name, dotted in get_agent_meta().artifacts.items():
         capability, key = dotted.split(".", 1)
@@ -90,7 +96,12 @@ async def plan_task(payload: dict) -> dict:
             "rationale": "resuming a confirmed pending action",
         }
 
-    plan = await create_plan(payload["prompt"], payload["config"], payload.get("history", []))
+    with _activity_span("plan_task", payload["config"]) as span:
+        plan = await create_plan(payload["prompt"], payload["config"], payload.get("history", []))
+        tracing.set_attributes(span, {
+            "plan.steps": ",".join(step.capability for step in plan.steps),
+            "plan.rationale": tracing.truncate(plan.rationale),
+        })
     steps = plan.steps
     default_step_policy = get_agent_meta().default_step_policy
     if default_step_policy:
@@ -224,7 +235,98 @@ async def execute_step(payload: dict) -> dict:
 
     heartbeat = asyncio.create_task(_beat(_HEARTBEAT_INTERVAL_SECONDS))
     try:
-        await _reclone_if_the_sandbox_is_gone(ctx)
-        return await run_capability(payload["capability"], ctx)
+        try:
+            with _activity_span(f"capability:{ctx.capability}", ctx.config) as span:
+                await _reclone_if_the_sandbox_is_gone(ctx)
+                result = await run_capability(payload["capability"], ctx)
+                _describe_step_result(span, result)
+        except Exception as exc:
+            # The workflow falls back to a canned reply once `respond` is out
+            # of attempts and still completes, so this is the outcome's last
+            # chance to be recorded.
+            if ctx.capability == "respond" and _is_last_attempt():
+                _record_task_result(ctx, None, respond_error=exc)
+            raise
+        if ctx.capability == "respond":
+            _record_task_result(ctx, result)
+        return result
     finally:
         heartbeat.cancel()
+
+
+def _activity_span(name: str, config: dict):
+    """This attempt's span, parented on the task span whose traceparent the
+    executor put in the request's `trace` block. A retried attempt gets a
+    span of its own, numbered."""
+    target = tracing.target_for(config)
+    if target is None:
+        return tracing.span(name)
+    info = activity.info()
+    return tracing.span(
+        name,
+        target=target,
+        traceparent=target.traceparent,
+        attributes={
+            "trace.entity": "agent-step",
+            "temporal.activity": info.activity_type,
+            "temporal.attempt": info.attempt,
+            "temporal.workflow_id": info.workflow_id,
+        },
+    )
+
+
+def _is_last_attempt() -> bool:
+    try:
+        info = activity.info()
+        policy = getattr(info, "retry_policy", None)
+        maximum = policy.maximum_attempts if policy else 0
+        return bool(maximum) and info.attempt >= maximum
+    except Exception:  # noqa: BLE001 - only decides whether to trace
+        return False
+
+
+def _record_task_result(ctx: StepContext, result, respond_error: Exception | None = None) -> None:
+    """The task's outcome, as an `a2a-task-result` span beside its steps.
+
+    Recorded here, not by the A2A executor, because `respond` is the
+    workflow's guaranteed last step on every ending (see workflow.py), while
+    the executor that started the task may be gone by then: after an API pod
+    restart the reconciler, not the executor, collects the result."""
+    target = tracing.target_for(ctx.config)
+    if target is None:
+        return
+    try:
+        status = ctx.params.get("pipeline_status") or "completed"
+        artifacts = _declared_artifacts(ctx.results)
+        attributes = {
+            "trace.entity": "agent-task-result",
+            "agent.status": status,
+            "agent.result": tracing.truncate((result or {}).get("message") if isinstance(result, dict) else ""),
+            "agent.artifacts": ",".join(artifacts),
+        }
+        if respond_error is not None:
+            # The caller got the workflow's canned reply instead of this one.
+            attributes["agent.respond_error"] = tracing.truncate(
+                redact_secrets(f"{type(respond_error).__name__}: {respond_error}"), 500)
+        # Whatever this kind declares as an artifact, its link if it has one
+        # (oncall's pull_request -> agent.artifact.pull_request.url).
+        for name, value in artifacts.items():
+            if isinstance(value, dict) and value.get("url"):
+                attributes[f"agent.artifact.{name}.url"] = value["url"]
+        with tracing.span("a2a-task-result", target=target, traceparent=target.traceparent,
+                          attributes=attributes) as span:
+            if status == "failed":
+                tracing.mark_failed(span, tracing.truncate(ctx.params.get("failure_reason") or status, 500))
+    except Exception as exc:  # noqa: BLE001 - tracing must never fail the step
+        logger.warning("task_result_trace_failed", request_id=ctx.request_id,
+                       error=f"{type(exc).__name__}: {exc}")
+
+
+def _describe_step_result(span, result) -> None:
+    if span is None or not isinstance(result, dict):
+        return
+    status = result.get("status")
+    tracing.set_attributes(span, {"step.status": status})
+    if status in ("failed", "inconclusive"):
+        detail = result.get("failure") or result.get("error") or result.get("reason") or status
+        tracing.mark_failed(span, tracing.truncate(detail, 500))

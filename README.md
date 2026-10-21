@@ -102,6 +102,13 @@ Run one API Deployment and one worker Deployment per agent kind, against a Tempo
 
 Beyond skills, a new **capability** is a module under `<kind package>/capabilities/` plus an entry in `configs/<kind>/capabilities.yaml`; the planner reads the catalog at plan time, so no engine change is needed. A new **tool** is a module under `<kind package>/tools/` plus an entry in `configs/<kind>/tools.yaml`.
 
+**Tracing.** Set `TRACE_SERVER_URL` (the InsightFinder trace server's
+OTLP/gRPC address, the same variable mcp-service uses) on both the API and
+the worker to send OpenTelemetry spans. A request is traced only when its
+config carries a `trace` block naming the caller's trace project; see
+[`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §5 for the block and the
+spans.
+
 ## Testing
 
 Two layers, and they catch different things.

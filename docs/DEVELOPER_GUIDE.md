@@ -245,9 +245,67 @@ agent's own contract for what it expects inside one `DataPart`.
   "options": {
     "skip_tests": true          // free-form — the planner reads whatever you put here
   },
-  "system_prompt": null         // optional override of the planner/executor's default system prompt
+  "system_prompt": null,        // optional override of the planner/executor's default system prompt
+  "trace": {                    // optional — see "Tracing" below
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "trace_project": "acme-MCP-Anthropic-claude-x-claude-x-LLM",
+    "trace_system": "acme-MCP-Anthropic-claude-x-claude-x",
+    "trace_admin_user": "acme-admin",
+    "trace_admin_user_license": "...",
+    "session_id": "...",        // optional
+    "username": "alice"         // optional — the end user
+  }
 }
 ```
+
+**Tracing.** With a `trace` block, this agent sends OpenTelemetry spans for
+the run into *your* InsightFinder trace project, as children of the span
+named by `traceparent` (W3C format). It sends them to the trace server set by
+its own `TRACE_SERVER_URL`. The field names are mcp-service's handshake
+(`ChatDto`) ones. `trace_project`, `trace_admin_user` and
+`trace_admin_user_license` are required; with any of them missing, or with no
+`TRACE_SERVER_URL` on the deployment, the request runs untraced. Tracing
+never fails a request. The license is masked in Temporal history like
+`api_key`.
+
+The spans, all carrying the `x-username` / `x-trace-project` /
+`x-licensekey` attributes the trace server routes on:
+
+```text
+<your span from traceparent>
+  └ a2a-task:<agent kind>         this task; ended at once, so a pod restart cannot orphan the rest
+      ├ plan_task                 plan.steps
+      │   └ llm:<provider>/<model>       gen_ai.* + chat.*_tokens
+      ├ capability:<name>         one per attempt (temporal.attempt), failed steps marked ERROR
+      │   └ opencode:<agent>      one per opencode call, timed by opencode's own events
+      │       └ llm:<provider>/<model>   one per model turn, tokens from step_finish
+      │           └ tool:<name>          tool.args (locations only), tool.result_size, status
+      └ a2a-task-result           agent.status, agent.result, agent.artifact.<name>.url,
+                                  agent.respond_error (respond out of attempts)
+                                  (recorded by the worker's last step, so it survives an API restart)
+```
+
+Prompts and completions are cut to 4000 characters. A tool's output is
+never recorded, only its size, and of its arguments only the ones that name
+a location (`filePath`, `path`, `pattern`, ...) are kept; the rest (a
+`write`'s content, a `bash` command) appear as their length. All of those are
+your repository's contents or may hold a credential. No span sets `chat.id`,
+`chat.prompt` or `chat.response`: the trace server rewrites the span id of a
+span carrying `chat.id`, and treats a span with a prompt/response pair as a
+user conversation turn. Error text on a span has keys, tokens and URL
+credentials masked (long hex strings such as commit SHAs included), and a
+failed tool keeps only the first line of its error.
+
+`TRACE_SERVER_URL` with `https://` is exported over TLS; `http://` or no
+scheme, in plaintext.
+
+**What the caller (mcp-service) has to send.** Inside its `agent:<name>`
+span for the call, copy `chat_input`'s `trace_project`, `trace_system`,
+`trace_admin_user`, `trace_admin_user_license`, `session_id` and `username`
+into `data["trace"]`, and set `traceparent` to the current span's (its
+`app/trace/Propagation.py:traceparent_of(trace.get_current_span())`). Every
+`request_data_factory` runs inside that span already, so one shared helper
+called by each factory is enough.
 
 **Prompts are read dynamically, including branch names.** "Check the repo
 in the `dev` branch, fix the memory leak, and raise a PR against `staging`"
@@ -358,7 +416,10 @@ a request never carries cluster credentials.
 }
 ```
 
-`src/k8s_agent/schemas.py` documents the same shape.
+`src/k8s_agent/schemas.py` documents the same shape. The optional `trace`
+block of §5 works the same way here. This kind has no opencode, so its spans
+are `a2a-task:k8s`, `plan_task`, one `capability:<name>` per step (`check_health`,
+`propose_change`, ...) and the `llm:` calls inside them.
 
 ### The approval round trip
 
