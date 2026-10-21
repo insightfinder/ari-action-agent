@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     # OOMKilled restarts. This default is deliberately conservative for
     # that container size; raise it only alongside more CPU/memory.
     max_concurrent_activities: int = 3
+    interactive_max_concurrent_activities: int = 1
+    temporal_interactive_task_queue: str = ""
 
     # Shared, persistent HOME for `verify`'s build/test subprocesses only
     # (mvn/go/npm, invoked via opencode's bash tool) — separate from
@@ -114,6 +116,17 @@ class Settings(BaseSettings):
     github_mcp_server_url: str = "https://api.githubcopilot.com/mcp/"
 
     log_level: str = "info"
+
+    def task_queue_for(self, config: dict | None) -> str:
+        lane = ((config or {}).get("options") or {}).get("lane")
+        if lane == "interactive" and self.interactive_task_queue():
+            return self.interactive_task_queue()
+        return self.temporal_task_queue
+
+    def interactive_task_queue(self) -> str:
+        if self.interactive_max_concurrent_activities <= 0:
+            return ""
+        return self.temporal_interactive_task_queue or f"{self.temporal_task_queue}-interactive"
 
     @property
     def api_key_set(self) -> set[str]:

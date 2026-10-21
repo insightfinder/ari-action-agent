@@ -197,7 +197,7 @@ class AriAgentExecutor(AgentExecutor):
                 AriAgentWorkflow.run,
                 workflow_input,
                 id=context.task_id,
-                task_queue=settings.temporal_task_queue,
+                task_queue=settings.task_queue_for(config),
             )
             result = await handle.result()
         except Exception as exc:
