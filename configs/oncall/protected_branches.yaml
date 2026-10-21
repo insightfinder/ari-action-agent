@@ -35,7 +35,5 @@ default_protected_branches:
 # also covers the GitHub MCP server's own file-write tools, which this
 # config has no visibility into at all.
 protected_branches:
-  https://github.com/insightfinder/InfrastructureCore:
-    - dev
-    - staging
-    - test
+  https://github.com/example-org/example-repo:
+    - release

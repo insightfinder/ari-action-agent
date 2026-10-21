@@ -67,6 +67,7 @@ class AgentMeta:
     # None for an agent kind with no such default-step policy (e.g.
     # jenkins).
     default_step_policy: Optional[Callable[[Plan, dict], list[Step]]] = None
+    direct_capabilities: tuple[str, ...] = ()
 
 
 def _agent_package(agent_kind: str) -> str:

@@ -22,6 +22,9 @@ import asyncio
 import os
 from urllib.parse import urlsplit, urlunsplit
 
+from common import subprocess_watch
+from common.settings import get_settings
+
 
 # Every git call here is a short, bounded operation — the slowest, `clone`
 # of a large monorepo, is seconds to a couple of minutes. None of them has
@@ -89,7 +92,7 @@ async def _communicate(proc, what: str, timeout: float | None = None):
     """`proc.communicate()` with a deadline; kills the child and raises on expiry."""
     try:
         return await asyncio.wait_for(
-            proc.communicate(), timeout=timeout or _DEFAULT_TIMEOUT_SECONDS
+            subprocess_watch.communicate(proc), timeout=timeout or _DEFAULT_TIMEOUT_SECONDS
         )
     except asyncio.TimeoutError:
         # Don't leave the child behind holding the sandbox: attempts of one
@@ -177,7 +180,7 @@ async def branch_exists(cache_dir: str, branch: str) -> bool:
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    await proc.wait()
+    await subprocess_watch.wait(proc)
     return proc.returncode == 0
 
 
@@ -237,8 +240,9 @@ async def commit(workdir: str, title: str, body: str = "") -> None:
     """A fixed, generic author identity — this commit is ARI's, not any
     individual's, same reasoning as opencode's own agents never being
     asked to impersonate a person."""
+    settings = get_settings()
     args = [
-        "git", "-c", "user.email=support@insightfinder.com", "-c", "user.name=ARI Agent",
+        "git", "-c", f"user.email={settings.commit_author_email}", "-c", f"user.name={settings.commit_author_name}",
         "commit", "-m", title,
     ]
     if body:

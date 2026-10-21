@@ -19,14 +19,17 @@ collapse onto this one `execute()`, with no branching in it at all:
   automatically whenever a status update is published for a task with a
   registered config; this module never POSTs a callback itself.
 
-Deliberately out of scope for this pass (documented, not an oversight):
-- No fine-grained per-capability progress (e.g. "now running verify") as
-  separate status updates — Temporal's own workflow history already has
-  that detail; this executor reports SUBMITTED → WORKING → one terminal
-  state, not a blow-by-blow.
-- No `TASK_STATE_INPUT_REQUIRED` (a genuine multi-turn "the agent is
-  paused awaiting your reply" resume flow) — `capabilities/respond.py`
-  always gives a definitive answer instead of leaving a task open.
+A run that stops at an approval gate (a step returning
+`status: "needs_approval"`, e.g. oncall's `propose_pr`) ends in
+`TASK_STATE_INPUT_REQUIRED` with the proposal as a `pending_action`
+artifact. The caller resumes it on the same task id with a
+`confirm_pending_action` DataPart, or cancels it with `tasks/{id}:cancel`;
+see `_find_pending_action` and docs/DEVELOPER_GUIDE.md.
+
+Deliberately out of scope (documented, not an oversight): no fine-grained
+per-capability progress (e.g. "now running verify") as separate status
+updates — Temporal's own workflow history already has that detail; this
+executor reports SUBMITTED → WORKING → one terminal state.
 """
 
 from google.protobuf import json_format
@@ -46,8 +49,7 @@ _TERMINAL_STATE_BY_STATUS = {
     "completed": TaskState.TASK_STATE_COMPLETED,
     "no_action": TaskState.TASK_STATE_COMPLETED,
     "failed": TaskState.TASK_STATE_FAILED,
-    # Reserved for a real policy/approval gate, not produced today — see
-    # docs/design.md §5.4-equivalent notes on `needs_approval`.
+    # Produced when a step pauses for a person, e.g. propose_pr.
     "needs_approval": TaskState.TASK_STATE_INPUT_REQUIRED,
 }
 
@@ -195,7 +197,7 @@ class AriAgentExecutor(AgentExecutor):
                 AriAgentWorkflow.run,
                 workflow_input,
                 id=context.task_id,
-                task_queue=settings.temporal_task_queue,
+                task_queue=settings.task_queue_for(config),
             )
             result = await handle.result()
         except Exception as exc:

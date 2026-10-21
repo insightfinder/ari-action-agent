@@ -22,7 +22,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from common.opencode_runtime import merge_traces, run_opencode as _run_opencode  # noqa: F401  (re-exported)
+from common import skills
+from common.opencode_runtime import merge_traces, opencode_config_home, run_opencode as _run_opencode  # noqa: F401  (re-exported)
 from common.settings import get_settings
 from ..protected_branches import protected_branches
 from .build_cache import reserve_build_cache_home
@@ -34,7 +35,20 @@ CAPABILITY_AGENTS = {
     "generate_change": "ari-change",
     "verify": "ari-verify",
     "publish_pr": "ari-publish",
+    "run_skill": "ari-skill",
 }
+
+SKILL_RUN_DIR = "skill-run"
+SKILL_CONFIG_FILE = "ari-skill.json"
+SERVICE_SECRET_ENV = (
+    "AGENT_API_KEYS",
+    "TEMPORAL_API_KEY",
+    "TEMPORAL_PAYLOAD_ENCRYPTION_KEY",
+    "GITHUB_PAT",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+)
+SKILL_AGENTS_FOR_REPO_SKILLS = ("ari-change", "ari-verify")
 
 # Read-only git inspection only — `ari-change` has no business committing
 # or pushing anything (that's publish_pr.py's job — deterministically via
@@ -88,6 +102,7 @@ _AGENT_DEFS = {
             "edit": "allow",
             "bash": _READ_ONLY_GIT_BASH,
             "webfetch": "deny",
+            "skill": "deny",
         },
         "tools": _no_delegation_tools(),
     },
@@ -107,6 +122,7 @@ _AGENT_DEFS = {
             "edit": "deny",
             "bash": {"git push*": "deny", "*": "allow"},
             "webfetch": "deny",
+            "skill": "deny",
         },
         "tools": _no_delegation_tools(),
     },
@@ -127,8 +143,24 @@ _AGENT_DEFS = {
             "edit": "deny",
             "bash": {"git *": "allow", "*": "deny"},
             "webfetch": "deny",
+            "skill": "deny",
         },
         "tools": {**_no_delegation_tools(), "github_*": True},
+    },
+    "ari-skill": {
+        "description": "Runs one installed Agent Skill without a repository, using only that skill's own scripts and the commands its allowed-tools grants.",
+        "mode": "primary",
+        "permission": {
+            "edit": "deny",
+            "bash": "deny",
+            "webfetch": "deny",
+            "websearch": "deny",
+            "glob": "deny",
+            "grep": "deny",
+            "list": "deny",
+            "skill": "deny",
+        },
+        "tools": _no_delegation_tools(),
     },
 }
 
@@ -177,6 +209,10 @@ def write_config(workdir: str, llm: dict, repo: dict) -> str:
         # convention `_READ_ONLY_GIT_BASH` above already relies on.
         publish_bash = agent_defs["ari-publish"]["permission"]["bash"]
         agent_defs["ari-publish"]["permission"]["bash"] = {**protected_denies, **publish_bash}
+
+    repo_skills = skills.repo_agent_skill_permission(workdir)
+    for name in SKILL_AGENTS_FOR_REPO_SKILLS:
+        agent_defs[name]["permission"]["skill"] = copy.deepcopy(repo_skills)
 
     config: dict[str, Any] = {
         "$schema": "https://opencode.ai/config.json",
@@ -287,3 +323,47 @@ async def run_opencode(ctx, instruction: str, *, continue_session: bool | None =
             )
 
     return await _run_opencode(ctx, instruction, agent, continue_session=continue_session)
+
+
+def skill_agent_definition(skill: skills.Skill, skill_dir: str) -> dict:
+    definition = copy.deepcopy(_AGENT_DEFS["ari-skill"])
+    inside = f"{skill_dir.rstrip('/')}/*"
+    definition["permission"].update(
+        {
+            "bash": skills.bash_rules_for(skill_dir, skill.allowed_tools),
+            "skill": skills.skill_permission([skill.name]),
+            "read": {"*": "deny", inside: "allow"},
+            "external_directory": {"*": "deny", inside: "allow"},
+        }
+    )
+    return definition
+
+
+def write_skill_config(path: str, llm: dict, skill: skills.Skill, skill_dir: str) -> str:
+    config: dict[str, Any] = {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {llm["provider"]: {"options": {"apiKey": llm["api_key"]}}},
+        "tools": {"github_*": False, "task": False},
+        "agent": {CAPABILITY_AGENTS["run_skill"]: skill_agent_definition(skill, skill_dir)},
+    }
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(config, indent=2))
+    return str(target)
+
+
+async def run_skill_agent(ctx, skill: skills.Skill, instruction: str) -> dict:
+    workdir = Path(ctx.workspace) / SKILL_RUN_DIR
+    workdir.mkdir(parents=True, exist_ok=True)
+    skill_dir = skills.materialized_dir(opencode_config_home(ctx.workspace)) / skill.name
+    config_path = Path(ctx.workspace) / ".opencode-state" / SKILL_CONFIG_FILE
+    write_skill_config(str(config_path), ctx.config["llm"], skill, skill_dir.as_posix())
+    return await _run_opencode(
+        ctx,
+        instruction,
+        CAPABILITY_AGENTS["run_skill"],
+        continue_session=False,
+        extra_env={"OPENCODE_CONFIG": str(config_path), "OPENCODE_DISABLE_PROJECT_CONFIG": "1"},
+        workdir=str(workdir),
+        drop_env=SERVICE_SECRET_ENV,
+    )

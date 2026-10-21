@@ -24,27 +24,38 @@ from .workflow import AriAgentWorkflow
 logger = structlog.get_logger()
 
 
+ACTIVITIES = [prepare_workspace, plan_task, execute_step, cleanup_workspace, resolve_artifacts]
+
+
+def build_workers(client, settings) -> list[Worker]:
+    lanes = [(settings.temporal_task_queue, settings.max_concurrent_activities)]
+    if settings.interactive_task_queue():
+        lanes.append((settings.interactive_task_queue(), settings.interactive_max_concurrent_activities))
+    return [
+        Worker(
+            client,
+            task_queue=queue,
+            workflows=[AriAgentWorkflow],
+            activities=ACTIVITIES,
+            max_concurrent_activities=limit,
+        )
+        for queue, limit in lanes
+    ]
+
+
 async def main() -> None:
     settings = get_settings()
     client = await get_temporal_client()
-
-    worker = Worker(
-        client,
-        task_queue=settings.temporal_task_queue,
-        workflows=[AriAgentWorkflow],
-        activities=[prepare_workspace, plan_task, execute_step, cleanup_workspace, resolve_artifacts],
-        # See settings.max_concurrent_activities — bounds concurrent
-        # opencode/git/build subprocesses to what this pod's own CPU/memory
-        # limits can actually sustain, instead of the SDK's default of 100.
-        max_concurrent_activities=settings.max_concurrent_activities,
-    )
+    workers = build_workers(client, settings)
     logger.info(
         "worker_starting",
         task_queue=settings.temporal_task_queue,
         namespace=settings.temporal_namespace,
         max_concurrent_activities=settings.max_concurrent_activities,
+        interactive_task_queue=settings.interactive_task_queue() or None,
+        interactive_max_concurrent_activities=settings.interactive_max_concurrent_activities,
     )
-    await worker.run()
+    await asyncio.gather(*(worker.run() for worker in workers))
 
 
 if __name__ == "__main__":
