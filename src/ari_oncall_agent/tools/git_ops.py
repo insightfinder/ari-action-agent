@@ -22,6 +22,7 @@ import asyncio
 import os
 from urllib.parse import urlsplit, urlunsplit
 
+from common import subprocess_watch
 from common.settings import get_settings
 
 
@@ -91,7 +92,7 @@ async def _communicate(proc, what: str, timeout: float | None = None):
     """`proc.communicate()` with a deadline; kills the child and raises on expiry."""
     try:
         return await asyncio.wait_for(
-            proc.communicate(), timeout=timeout or _DEFAULT_TIMEOUT_SECONDS
+            subprocess_watch.communicate(proc), timeout=timeout or _DEFAULT_TIMEOUT_SECONDS
         )
     except asyncio.TimeoutError:
         # Don't leave the child behind holding the sandbox: attempts of one
@@ -179,7 +180,7 @@ async def branch_exists(cache_dir: str, branch: str) -> bool:
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    await proc.wait()
+    await subprocess_watch.wait(proc)
     return proc.returncode == 0
 
 
