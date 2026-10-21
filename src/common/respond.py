@@ -70,7 +70,13 @@ reader acts on the difference.
 """
 
 
-def _skill_run_proposal_exists(meta, step_results: dict) -> bool:
+def _proposal_exists(meta, step_results: dict) -> bool:
+    """Whether a proposal for the confirm step was actually produced.
+
+    Read from `meta.artifacts["pending_action"]` ("<step>.<field>") so it
+    holds for any agent kind without a second place to declare the same
+    thing.
+    """
     ref = (getattr(meta, "artifacts", None) or {}).get("pending_action")
     if not ref or "." not in ref:
         return False
@@ -116,16 +122,27 @@ def execution_fact(meta, step_results: dict) -> str:
             "including whether the target system actually accepted the action."
         )
     if direct_fact:
-        proposal = "There IS a" if _skill_run_proposal_exists(meta, step_results) else "There is no"
+        proposal = "There IS a" if _proposal_exists(meta, step_results) else "There is no"
         return (
             f"{direct_fact} FACT: the `{capability}` step did not run, so no pull request was opened. "
             f"{proposal} proposal awaiting confirmation in this request."
         )
-    return (
+    nothing_ran = (
         f"FACT: NOTHING WAS EXECUTED. The `{capability}` step did not run in this request, "
-        "so no action reached any external system. Anything in the results is a proposal "
-        "awaiting confirmation, never a completed action. Do not write that an action was "
+        "so no action reached any external system. Do not write that an action was "
         "executed, triggered, run, started, stopped or applied."
+    )
+    if _proposal_exists(meta, step_results):
+        return (
+            f"{nothing_ran} There IS a proposal awaiting confirmation; say what it would do "
+            "and that it needs approval."
+        )
+    return (
+        f"{nothing_ran} FACT: NOTHING WAS PROPOSED EITHER. No proposal was produced in this "
+        "request, so there is nothing for anyone to approve and no approval request was "
+        "sent. Do not write that an action is proposed, pending, awaiting approval or "
+        "awaiting confirmation. Say plainly what the request did establish, and that no "
+        "action was proposed."
     )
 
 
