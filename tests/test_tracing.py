@@ -494,6 +494,19 @@ def test_failure_text_is_redacted_before_it_reaches_a_span(exporter):
     assert "https://[REDACTED]@github.com/a/b" in message
 
 
+def test_prompt_and_completion_text_is_redacted(exporter):
+    # A completion can quote a file the agent read, such as its own opencode.json.
+    key = "sk-ant-api03-" + "x" * 40
+    with tracing.span("llm", target=tracing.target_for(_traced_config())) as span:
+        tracing.set_attributes(span, {"gen_ai.prompt.1.content": tracing.truncate(f"use {key}"),
+                                      "gen_ai.completion.0.content": tracing.truncate("see " + key, 20)})
+
+    attributes = _by_name(exporter.get_finished_spans(), "llm").attributes
+    assert attributes["gen_ai.prompt.1.content"] == "use [REDACTED]"
+    # Redacted before the cut, so no prefix of the key survives at the limit.
+    assert "sk-a" not in attributes["gen_ai.completion.0.content"]
+
+
 def test_a_malformed_usage_never_fails_the_call(exporter):
     with tracing.span("llm", target=tracing.target_for(_traced_config())) as span:
         tracing.set_token_attributes(span, "many", object())
