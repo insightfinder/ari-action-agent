@@ -71,6 +71,8 @@ spec:
           image: docker.io/insightfinderinc/ari-k8s-agent-worker:__IMAGE_TAG__
           env:
             - {name: AGENT_KIND, value: k8s}
+            # Also the service name on this worker's trace spans (TRACE_SERVER_URL).
+            - {name: AGENT_NAME, value: ARI Kubernetes Agent}
             - {name: TEMPORAL_HOST, value: "__TEMPORAL_HOST__"}
             - {name: TEMPORAL_NAMESPACE, value: k8s-ari-agent}
             - {name: TEMPORAL_TASK_QUEUE, value: k8s-ari-queue}

@@ -24,12 +24,15 @@ ARI's own calls.
 """
 
 import os
-import re
 
 import anthropic
 import openai
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
+from opentelemetry.trace import SpanKind
+
+from common import tracing
+from common.redaction import redact_secrets
 
 # 120s x 3 attempts = 6 minutes worst case, comfortably inside the
 # activity budget with room for the rest of the step. The planner turns
@@ -37,20 +40,6 @@ from openai import AsyncOpenAI
 # still running after two minutes is stuck, not slow.
 _TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 _MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
-
-
-# A provider's error text can quote the key it was sent: OpenAI's 401 says "Incorrect API key
-# provided: sk-proj-****abcd", first and last characters intact. Masked or not, it has no business in
-# a failure reason, which reaches the `respond` step's prompt, the caller's reply and Temporal's history.
-# "api key provided: X" / "api_key=X", where X looks like a key (has a digit or a mask), not a word.
-_KEY_ECHO = re.compile(r"(?i)(api[ _-]?key\b[^:=\n]{0,30}[:=]\s*['\"]?)(?=[^\s'\",]*[0-9*])[^\s'\",]{6,}")
-_KEY_LIKE = re.compile(
-    r"\b(?:sk|pk|rk)-[A-Za-z0-9_*.\-]{4,}"  # OpenAI, Anthropic and look-alikes
-    r"|\bAIza[A-Za-z0-9_*\-]{8,}"  # Google
-    r"|\bgsk_[A-Za-z0-9_*]{8,}"  # Groq
-    r"|(?i:\bbearer\s+)[A-Za-z0-9._~+/=*\-]{8,}"
-    r"|\b[0-9a-fA-F]{32,}\b"  # Azure OpenAI and other bare hex keys
-)
 
 
 class LLMProviderError(RuntimeError):
@@ -62,24 +51,62 @@ def _provider_error(provider: str, exc: openai.APIStatusError | anthropic.APISta
     if status == 401:
         # The body of a rejected-key response is about the key, and nothing else in it helps.
         return LLMProviderError(f"{provider} rejected the API key (HTTP 401)")
-    detail = _KEY_LIKE.sub("[REDACTED]", _KEY_ECHO.sub(r"\1[REDACTED]", str(exc.message)))
+    # The error text can quote the key it was sent; it reaches the reply and Temporal history.
+    detail = redact_secrets(str(exc.message))
     return LLMProviderError(f"{provider} returned HTTP {status}: {detail[:1000]}")
 
 
 async def complete(llm: dict, system_prompt: str, user_prompt: str) -> str:
     provider = llm["provider"].lower()
+    if provider == "openai":
+        call = _openai_complete
+    elif provider == "anthropic":
+        call = _anthropic_complete
+    else:
+        raise ValueError(f"Unsupported llm.provider: {provider!r}")
+
+    if not tracing.active():
+        text, _ = await _call(provider, call, llm, system_prompt, user_prompt)
+        return text
+
+    # One model call, so the span gets the token attributes. Keys follow the
+    # traceloop spans mcp-service's own LLM calls produce. A provider error is
+    # reworded inside the span, so the span records the key-free message.
+    with tracing.span(
+        f"llm:{provider}/{llm['model']}",
+        kind=SpanKind.CLIENT,
+        attributes={
+            "gen_ai.operation.name": "chat",
+            "gen_ai.system": provider,
+            "gen_ai.request.model": llm["model"],
+            "gen_ai.prompt.0.role": "system",
+            "gen_ai.prompt.0.content": tracing.truncate(system_prompt),
+            "gen_ai.prompt.1.role": "user",
+            "gen_ai.prompt.1.content": tracing.truncate(user_prompt),
+        },
+    ) as span:
+        text, usage = await _call(provider, call, llm, system_prompt, user_prompt)
+        tracing.set_attributes(span, {
+            "gen_ai.response.model": usage.get("model"),
+            "gen_ai.completion.0.role": "assistant",
+            "gen_ai.completion.0.content": tracing.truncate(text),
+        })
+        tracing.set_token_attributes(
+            span, usage.get("input_tokens"), usage.get("output_tokens"),
+            usage.get("cache_read"), usage.get("cache_write"), llm["model"],
+        )
+        return text
+
+
+async def _call(provider: str, call, llm: dict, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
     try:
-        if provider == "openai":
-            return await _openai_complete(llm, system_prompt, user_prompt)
-        if provider == "anthropic":
-            return await _anthropic_complete(llm, system_prompt, user_prompt)
+        return await call(llm, system_prompt, user_prompt)
     except (openai.APIStatusError, anthropic.APIStatusError) as exc:
         # `from None`: the SDK exception, message and all, must not ride along as the cause.
         raise _provider_error(provider, exc) from None
-    raise ValueError(f"Unsupported llm.provider: {provider!r}")
 
 
-async def _openai_complete(llm: dict, system_prompt: str, user_prompt: str) -> str:
+async def _openai_complete(llm: dict, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
     client = AsyncOpenAI(
         api_key=llm["api_key"],
         base_url=llm.get("base_url"),
@@ -91,10 +118,10 @@ async def _openai_complete(llm: dict, system_prompt: str, user_prompt: str) -> s
         instructions=system_prompt,
         input=user_prompt,
     )
-    return response.output_text
+    return response.output_text, _openai_usage(response)
 
 
-async def _anthropic_complete(llm: dict, system_prompt: str, user_prompt: str) -> str:
+async def _anthropic_complete(llm: dict, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
     client = AsyncAnthropic(
         api_key=llm["api_key"],
         base_url=llm.get("base_url"),
@@ -107,4 +134,33 @@ async def _anthropic_complete(llm: dict, system_prompt: str, user_prompt: str) -
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     )
-    return "".join(block.text for block in response.content if block.type == "text")
+    text = "".join(block.text for block in response.content if block.type == "text")
+    return text, _anthropic_usage(response)
+
+
+def _openai_usage(response) -> dict:
+    """OpenAI's input_tokens already include cached ones."""
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "input_tokens_details", None)
+    return {
+        "model": getattr(response, "model", None),
+        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+        "cache_read": getattr(details, "cached_tokens", 0) or 0,
+        "cache_write": 0,
+    }
+
+
+def _anthropic_usage(response) -> dict:
+    """Anthropic's input_tokens exclude the cache, so the raw input total is
+    the sum of all three — the same convention mcp-service records."""
+    usage = getattr(response, "usage", None)
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    return {
+        "model": getattr(response, "model", None),
+        "input_tokens": (getattr(usage, "input_tokens", 0) or 0) + cache_read + cache_write,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+    }

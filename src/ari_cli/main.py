@@ -51,7 +51,9 @@ app.add_typer(config_app, name="config")
 app.add_typer(skills_app, name="skills")
 
 REQUESTER = "cli"
-REDACTED_KEYS = frozenset({"api_key", "pat", "ssh_key", "token", "password"})
+# trace_admin_user_license: the InsightFinder license in a request's `trace`
+# block (common/tracing.py), which `tasks get` would otherwise print from history.
+REDACTED_KEYS = frozenset({"api_key", "pat", "ssh_key", "token", "password", "trace_admin_user_license"})
 
 
 def make_client(settings: GatewaySettings) -> AgentClient:

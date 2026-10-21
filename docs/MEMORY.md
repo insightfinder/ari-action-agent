@@ -4828,6 +4828,347 @@ comment in `meta.py` says MCP Service reads the first. Not verified live.
 **Verified:** Windows 576 passed (six POSIX-only modules cannot be imported
 there); Linux 875 passed, nothing skipped, in the worker image with every extra.
 
+## 2026-10-19 - Traces into the caller's InsightFinder trace project (II-25278)
+
+ARI's own trace showed `agent:ARI On-Call Agent` as a leaf: everything this
+agent did (planner call, steps, opencode turns and tools, tokens) was
+invisible. Now `common/tracing.py` sends OpenTelemetry spans under that span.
+
+**Where the spans go is the caller's call.** mcp-service resolves a trace
+project per organization and model at handshake
+(`<company>-MCP-<type>-<ver>-<ver>-LLM`, owned by the org admin who first
+saved that model in UIE's MCP model settings). The request's optional `trace`
+block carries that identity plus a W3C `traceparent`. The trace server
+(OpenTelemetryService-Trace) routes each span by its `x-username`,
+`x-trace-project` and `x-licensekey` attributes, so every span sets them and
+one process-wide provider is enough; mcp-service's per-identity provider
+cache buys nothing here. UIE's multi-agent trace dispatch (AW-1936) does not
+split ARI traces: it needs an AW workflow named after the model, and ARI has
+none. So joining the caller's trace id is all "the correct organization
+project" takes.
+
+**Attribute rules taken from the test trace server's config:**
+- No span sets `chat.id`. `overwriteTraceAndSpanIdByUUID` rewrites the span
+  id of any span that carries it, which detaches its children.
+- No span sets `chat.prompt`/`chat.response`. Those make a span a user
+  prompt pair in `-Prompt`, where it would be evaluated. LLM spans use
+  traceloop's `gen_ai.*` keys, as mcp-service's `ChatAnthropic.chat` spans do.
+- Token keys are mcp-service's `set_span_token_attributes` set, and only on
+  per-model-call spans, so nothing is counted twice.
+
+**Durability:** the task span is ended at once (mcp-service's
+`_root_traceparent` pattern), and its traceparent replaces the caller's in
+`config.trace` before the workflow starts. Every activity re-roots on it, so
+an API pod restart mid-run cannot orphan the activity spans.
+
+**opencode:** spans come from its own `--format json` events: a
+`step_start`/`step_finish` pair per model turn, with
+`tokens {input, output, reasoning, cache{read, write}}`, and one `tool_use`
+per finished call, with `state.time`. These shapes were first read from the
+1.18.31 source (`packages/opencode/src/cli/cmd/run.ts`, `schema/v1/session.ts`),
+then confirmed by the live run below. A newer opencode rewrote the JSON path
+(`packages/cli/src/run/noninteractive.ts`) with the same event names.
+
+**Trace server memory:** on test, `traceserver-llm-labs` ran out of heap at
+512Mi on 2026-10-19 while processing one trace (now 1Gi). Its LLM spans carry
+the full 70-tool catalog each time. Prompts and completions here are
+therefore cut to 4000 characters.
+
+**Secrets and customer data:**
+- `trace_admin_user_license` is masked by the payload codec, under the same
+  name mcp-service's codec uses, and by `ari tasks get`.
+- A tool's output is never recorded, only its size.
+- Of a tool's arguments, only the ones that name a location are kept;
+  content and commands appear as their length.
+- The test trace server stores whatever it is sent, since its
+  `sensitiveDataFilterEnabled` is false.
+
+**Where the outcome is recorded:** the worker records `a2a-task-result`
+inside `execute_step` for `respond`, the step the workflow runs on every
+ending. The executor that started the task is not the place: after an API
+pod restart, `reconciler.py` collects the result and the executor is gone.
+The executor records a result only when the workflow produced none at all,
+and that path is guarded, so a tracing error can never stop the task being
+marked failed.
+
+**Live on test (2026-10-19 09:37Z).** The images were this branch layered
+on the deployed ones, with `TRACE_SERVER_URL` pointing at
+`traceserver-llm-labs:4618`. One A2A task went straight to `ari-oncall-api`:
+add a CONTRIBUTING.md to `octocat/Hello-World`, with `skip_pr` and
+`skip_tests` set. Its `trace` block named bo's organization project
+(`insightfinder-MCP-Anthropic-claude-haiku-4-5-claude-haiku-4-5-LLM`, trace
+admin bo) and carried no traceparent. The task completed in 31s.
+
+- Jaeger trace `6a7e86fc…` has 23 spans: `a2a-task:oncall` → `plan_task`
+  (llm) → `capability:clone_repo` → `capability:generate_change` → two
+  `opencode:ari-change` calls (5 and 1 model turns, 7 tools: glob, read,
+  grep, write) → `capability:respond` (llm) → `a2a-task-result`.
+- Every span carries the routing identity. None carries `chat.id`,
+  `chat.prompt`, `chat.response` or `tool.result`.
+- Token counts come from opencode's `step_finish` events, with the cache
+  reads counted. This was the first real stream through the parser.
+- The trace server sent the trace to that project for user bo 60s later. It
+  created the project and its `-Prompt` twin, and they show in bo's system
+  framework. As expected without a caller's root span, the trace server
+  logged "Empty prompt/response pairs".
+- Not exercised live: mcp-service's `trace_block`. ARI chat carries no
+  repository keys, and an on-call investigation needs a real incident on a
+  system with a GitHub agent. Its unit tests cover it.
+- Seen on the way: the test trace server runs with `enableTraceLog: true`, so
+  its "Trace Payload" log line prints the trace owner's license key in
+  plain text.
+
+**k8s kind, live on test the same day (10:01Z)**, after origin/test (with
+the k8s kind) was fast-forwarded into this branch. The images were built
+from this branch and deployed with `deploy/k8s-agent-e2e/agent.yaml`, on
+Temporal namespace `jenkins-ari-agent`, queue `k8s-ari-queue`, with
+`TRACE_SERVER_URL` set. `scripts/k8s_agent_live_test.py` now sends a `trace`
+block when `TRACE_PROJECT`, `TRACE_USER` and `TRACE_LICENSE_KEY` are set.
+- `health`, `health_missing` and `scale` passed. `scale` was a proposal,
+  cancelled without approval.
+- Three traces of 9 spans each:
+  `a2a-task:k8s` → `plan_task`/llm → `capability:find_workload` →
+  `check_health` or `propose_change` (llm) → `respond` (llm) →
+  `a2a-task-result` (`completed` / `needs_approval`).
+- Every span carried bo's routing identity, and all three traces were sent
+  to bo's project.
+- The fixtures' canary appears nowhere in them.
+- Found and fixed: the e2e manifest's worker had no `AGENT_NAME`, so its
+  spans said `service.name=ARI On-Call Agent`. The chart sets it on both pods.
+- All of it was deleted afterwards: namespaces, ClusterRole/Binding,
+  kube-system Role/Binding.
+
+**Review fixes (same day).** Eight findings from a `/code-review`, all fixed,
+each covered by a new test:
+- The outcome span is now recorded by the worker, covering tasks resumed by
+  the reconciler.
+- `ari tasks get` masks `trace_admin_user_license`.
+- An `https://` trace server is exported over TLS.
+- A timed-out opencode call still leaves a failed `opencode:` span.
+- `tool.args` keeps only arguments that name a location.
+- The executor's error-path span cannot raise.
+- Every step span is ended even if parsing fails part-way.
+- The LLM client skips all span work when the request is untraced.
+
+These fixes landed after both live runs and were not re-run live. Verified:
+913 passed, 1 skipped, with every extra.
+
+**Scope.** This repo is the base implementation, `common/` tracing for
+every kind here. Repos that vendor or reuse it, such as `ari-agent-demo`
+(the ARI Action Agent on test), sync it themselves.
+
+The caller's side is documented in DEVELOPER_GUIDE §5. mcp-service's branch
+`II-25278-sub-agent-tracing` has a `trace_block` helper wired into its
+request factories. The charts and test-fluxcd branches
+`II-25278-trace-server-url` add `traceServerUrl`; test-fluxcd's change needs
+the chart to be published first.
+
+**Chart, 2026-10-20.** Charts PR #98 (`II-25173-k8s-agent-chart`) is
+dropped; its two commits were rebased onto `origin/main` (after
+`chatGateway`, 0.3.7) on the charts branch `II-25278-trace-server-url`, so
+the k8s agent chart ships with this task. The only conflict was the
+`Chart.yaml` version; the branch is 0.3.8. `ariK8sAgent.traceServerUrl`
+now goes into the k8s agent's Secret too, so both its pods get
+`TRACE_SERVER_URL`. test-fluxcd's `ari-oncall` pin is 0.3.8. Verified with
+`helm lint` and `helm template` (both kinds render the key).
+
+**Second review, 2026-10-20** (two parallel reviews: this repo's diff, and
+the charts branch against `origin/main`). Fixed:
+- Agent:
+  - `common/redaction.py` now holds the key patterns that were in
+    `llm/client.py`, plus GitHub tokens and URL credentials. The LLM
+    client, `tracing.mark_failed` and the new `agent.respond_error` all use
+    it. Long hex strings (commit SHAs) in span error text are masked too.
+  - A `respond` step out of attempts now still records `a2a-task-result`,
+    with `agent.respond_error`. Before, the workflow's canned reply left
+    the trace without an outcome. The last attempt is read from
+    `activity.info().retry_policy`, which the SDK fills from the task.
+  - The worker turns SIGTERM/SIGINT into `worker.shutdown()`. Before,
+    Python's default SIGTERM ended the process before the `finally` that
+    flushes queued spans.
+  - A failed tool keeps only the first line of its error.
+  - An opencode event without a timestamp keeps its predecessor's time,
+    inside the call.
+  - `set_token_attributes` cannot raise into the LLM call.
+  - Tests for each: 922 passed, 1 skipped.
+- Chart:
+  - The k8s API pod gets 256Mi/512Mi, like every other API pod. It was
+    128Mi/256Mi.
+  - The ClusterRole, the ClusterRoleBinding and the kube-system Role are
+    named `<namespace>-<fullname>-k8s`. Two same-named releases in
+    different namespaces no longer claim the same objects. With this, the
+    k8s templates differ from #98's.
+  - `existingSecret` documents that it must carry `AGENT_API_KEYS`.
+    Without it the API falls back to the public development key.
+  - `sharedIngress` with no kind to route now fails rendering instead of
+    producing an Ingress with no paths. The k8s path still needs its own
+    ingress enabled, on purpose.
+  - Dropped again 2026-10-21 (the user's call, to keep the trace PR to
+    tracing): charts main merged #98 as it was (`0bce170`, chart 0.3.8), so
+    none of the four chart items above shipped. The RBAC objects are still
+    `<fullname>-k8s`; `deploy/k8s-agent-e2e/README.md` keeps that name.
+- Left as is: a second `a2a-task-result` is possible when `respond`
+  finishes but its completion is lost and it retries, or when the API's
+  `handle.result()` fails transiently while the worker completes.
+
+Not verified live: the respond-out-of-attempts path and the SIGTERM flush.
+The `ariActionAgent` and `ariJenkinsAgent` sections get no `traceServerUrl`:
+the first runs `ari-agent-demo`, the second is deprecated.
+
+**Live on test, 2026-10-20 (after the second review).** Images were tagged
+`ii-25278-trace`:
+- `ari-agent-api` was built from `Dockerfile.api`.
+- `ari-k8s-agent-worker` was built from `Dockerfile.k8s`.
+- The oncall worker was this branch layered on `2610191001-test`.
+  `Dockerfile.oncall`'s apt layers were too slow to rebuild here.
+
+Both kinds were deployed from the local 0.3.8 chart:
+- `ari-oncall` (Flux suspended): `helm upgrade --reset-then-reuse-values`,
+  revision 62, previously 61 on 0.3.7.
+- k8s: a new release `ari-k8s` in `ari-k8s-agent`, with
+  `fullnameOverride: ari` and Temporal namespace `jenkins-ari-agent`.
+- Both pods of each kind logged `tracing_enabled`.
+
+Results:
+- `scripts/k8s_agent_live_test.py --allow-writes` passed 36/36, including
+  `rbac` and `pods` against the renamed RBAC, `worker_restart` and
+  `resume_after_restart`.
+- In Jaeger, the 20 k8s traces sampled all carry the identity. None carries
+  a forbidden key or the fixtures' canary.
+
+**Where traces land: the org's trace admin, not the requester.** UIE
+(`MCPModelSettingServlet`, `getByOrgModel`) keeps one MCP model setting
+per org + model type + version. Its owner is the admin who first saved it,
+and handshake hands mcp-service that owner's name and license as the trace
+identity. On test, the insightfinder org's haiku model belongs to
+`aiuser`:
+- The AW system is `eafa2ff885bc0a15ebbb213ef76bd7ee679a7769`, with
+  `isAW=true`, shared with the org.
+- Sending `bo` as `trace_admin_user`, as the 10-19 runs and this morning's
+  runs did, made the trace server create a separate same-named system
+  under bo (`b5f10ac9…`, `isAW=false`).
+- That bo system's data shows only in UIE log analysis (459 rows that
+  day), never in AW Traces.
+
+Further trace server behaviour seen in this run:
+- A trace whose root's parent is absent from Jaeger, such as a synthetic
+  traceparent with no caller span, is never sent to IF.
+  `TraceDataBody` keeps only parentless spans as roots, so the trace has
+  no roots and is skipped.
+- With mcp-service's real `chat-prompt-response` / `agent:<name>` spans
+  in the trace, it is sent.
+
+Final check, playing mcp-service: the script recorded those two spans on
+the trace server with aiuser's identity (`chat.username` bo), then called
+each agent with the child's traceparent. Both traces were sent with their
+prompt pairs to aiuser's `…-LLM` / `…-LLM-Prompt`, and the user saw them
+in that system:
+- k8s health check: trace `3a6ca452…`, 9 agent spans under the caller's.
+- oncall: trace `21009462…`, 31 spans.
+
+**Seen on the way, not this task's: oncall steps hang on an unreaped
+opencode child.** In `21009462…`, the second (continued) opencode call of
+`generate_change` exited, but the worker never reaped it:
+- The child stayed a zombie. Its pidfd was open but not registered in the
+  loop's epoll, so asyncio's `PidfdChildWatcher` never fired.
+- `_communicate`'s deadline killed it after 1155s, and the retry failed on
+  the already-edited sandbox.
+
+The same hang reproduced in a loop of oncall tasks on this branch's image,
+traced (hung on task 5) and untraced (task 2). It also reproduced on the
+pre-change `2610191001-test` worker, which has no tracing and no SIGTERM
+handler (task 2). So it predates II-25278.
+
+The suspected cause is a stale selector key on a reused fd number; no code
+path has been found for it. A likely workaround is `ThreadedChildWatcher`.
+Left for a separate ticket, at the user's call.
+
+Test was restored after the run:
+- `ari-oncall` HelmRelease was resumed and reconciled back to chart 0.3.7
+  (revision 63, with Flux's current images and no `TRACE_SERVER_URL`).
+- `ari-k8s` was uninstalled, which also removed its ClusterRole/Binding and
+  kube-system Role/Binding.
+- The `ari-k8s-agent` and `ari-k8s-e2e` namespaces were deleted, and no
+  workflows were left running.
+- Still to do by hand: delete the `ii-25278-trace` tags on Docker Hub.
+
+Future live runs use `https://github.com/bdulive/Hello-World` (the user's own
+fork) instead of `octocat/Hello-World`.
+
+**Merged origin/test 2026-10-21** (fast-forward to `c454175`: Coordinator,
+interactive lane, child reaping). The worker now runs one Temporal worker per
+lane, so the SIGTERM handler stops all of them before the span flush
+(`test_sigterm_stops_the_worker_and_flushes_queued_spans` builds two).
+`TRACE_SERVER_URL` sits beside the new lane settings; `opencode_runtime`
+imports both `subprocess_watch` and `tracing`. The Coordinator sends no
+`trace` block, so its requests stay untraced, as CLI/Slack/Teams were.
+`c454175` reaps children asyncio missed, which looks like the fix for the
+oncall hang noted above; not verified live. Verified: 956 passed, 3 skipped
+(pexpect missing; two need /proc). The local `.venv` had lost its packages
+and was reinstalled with `poetry install --all-extras`.
+
+**Chart state 2026-10-21.** Branch `II-25278-trace-server-url` is one commit
+on charts main (`fff3f9c`, chart 0.3.9): only `traceServerUrl` ->
+`TRACE_SERVER_URL` for `ariOncallAgent` and `ariK8sAgent`. PR #99 was closed
+unmerged. The origin/test merge needs nothing more from the chart: the
+interactive lane runs in the same worker pod and reads the same Secret, and
+the Coordinator ships only in docker-compose. test-fluxcd main pins
+`ari-oncall` and `ari-k8s` to 0.3.8; turning tracing on means 0.3.9 plus
+`traceServerUrl` in both, once 0.3.9 is published.
+
+**Live on test after the merge, 2026-10-21.** Images `ii-25278-trace` were
+built from this branch on `c454175`: api and k8s worker from their
+Dockerfiles, and the oncall worker layered on `2610210832-test`. Flux's
+`ari-oncall` and `ari-k8s` (both in `insightfinder`, chart 0.3.8) were
+suspended and upgraded from the local 0.3.9 chart with `traceServerUrl`:
+- `ari-oncall` went to revision 68.
+- `ari-k8s` revision 3 failed: helm 4's server-side apply conflicted with
+  `helm-controller`'s fields. Revision 4 used `--force-conflicts`.
+- All four pods logged `tracing_enabled`. The oncall worker polled both
+  `oncall-ari-queue` and `oncall-ari-queue-interactive`.
+
+Three tasks played mcp-service with aiuser's identity (`chat.username` bo):
+- oncall, default lane: trace `b01aa371…`, 29 spans, completed.
+- oncall, `lane: interactive`: trace `17df70ae…`, 31 spans. It ran on
+  `oncall-ari-queue-interactive`. The task failed because a read-only
+  prompt left `generate_change` nothing to edit (the agent's own rule);
+  the trace shows both attempts with `error`, and `a2a-task-result` shows
+  `agent.status=failed`.
+- k8s health check of namespace `traceserver`: trace `b622eec3…`, 11
+  spans, completed.
+
+Checks:
+- In Jaeger, the agent spans hang under `agent:<name>`. Every span carries
+  the identity. Only the caller's root carries `chat.prompt`/`chat.response`.
+  No span value matches an API-key pattern.
+- The trace server sent all three to `…-LLM` and their prompt pairs to
+  `…-LLM-Prompt`.
+- `GET /api/v1/traceview/id` (systemId `eafa2ff8…`, `customerName=aiuser`)
+  returns all three, with the same span counts as Jaeger. The window must
+  be wide: UIE shifts times by the login user's and the owner's timezones,
+  so a plain UTC window around "now" misses them. `/api/v1/traceview` and
+  `/traceview-merged` still returned 0 records.
+- The trace-level `totalTokens` is 0. The trace server adds only root
+  spans' `total_tokens` to the trace (`TraceDataBody.addSpan`, on purpose:
+  see if-ok `modules/opentelemetry-service-trace.md`). The script's root
+  carries no tokens. In real use mcp-service stamps its own LLM usage on
+  the root (`MCPAgentService.py` `set_span_token_attributes(pr_span, …)`)
+  and on `oncall-task-result` (`app/tasks/activities.py`). The agent's
+  usage stays on its own `llm:` spans and never reaches the trace total,
+  because the A2A result returns no usage and mcp-service adds none. That
+  is the caller's and the trace server's design; nothing to change on this
+  side (the user's call, 2026-10-21). (The one
+  real mcp-service trace left in Jaeger, `6f6697db…`, has no tokens on its
+  root either; why was not checked.)
+
+Restored: both HelmReleases were resumed and reconciled back to chart 0.3.8
+(`ari-oncall` revision 69, `ari-k8s` revision 5) on Flux's
+`2610210832-test` images. Server-side apply left `TRACE_SERVER_URL` in
+`ari-k8s-secret`, owned by the `helm` field manager, so it was removed by
+hand. No agent pod has the variable now. The `helm` manager entries remain
+on `ari-k8s`'s objects. Port-forwards and local images are gone. Still to
+do by hand: delete the `ii-25278-trace` tags on Docker Hub.
+
 ## 2026-10-20 - A Coordinator for the open-source edition (II-25116)
 
 Two editions now exist. Paying customers reach the agents through UIE and

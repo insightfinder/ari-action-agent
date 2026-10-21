@@ -6,10 +6,12 @@ deployable entrypoint is `api/worker.py` (`python -m api.worker`), which
 just calls `main()` below."""
 
 import asyncio
+import signal
 
 import structlog
 from temporalio.worker import Worker
 
+from common import tracing
 from common.settings import get_settings
 from .activities import (
     cleanup_workspace,
@@ -55,7 +57,24 @@ async def main() -> None:
         interactive_task_queue=settings.interactive_task_queue() or None,
         interactive_max_concurrent_activities=settings.interactive_max_concurrent_activities,
     )
-    await asyncio.gather(*(worker.run() for worker in workers))
+    tracing.init_tracing(settings.agent_name, settings.trace_server_url)
+    # Python's default SIGTERM kills the process on the spot, so the `finally`
+    # below never flushed the spans still queued for export on a rollout.
+    loop = asyncio.get_running_loop()
+
+    def stop_workers() -> None:
+        for worker in workers:
+            asyncio.ensure_future(worker.shutdown())
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(signum, stop_workers)
+        except (NotImplementedError, RuntimeError):
+            pass
+    try:
+        await asyncio.gather(*(worker.run() for worker in workers))
+    finally:
+        tracing.shutdown_tracing()
 
 
 if __name__ == "__main__":
