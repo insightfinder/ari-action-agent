@@ -52,7 +52,7 @@ import time
 
 import structlog
 
-from . import skills
+from . import skills, subprocess_watch
 from .settings import get_settings
 
 logger = structlog.get_logger()
@@ -114,7 +114,7 @@ async def _communicate(proc, agent: str, timeout: float):
     expiry. Mirrors git_ops._communicate, deliberately — same failure, same
     shape of guard, so neither one reads as the odd case."""
     try:
-        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return await asyncio.wait_for(subprocess_watch.communicate(proc), timeout=timeout)
     except asyncio.TimeoutError:
         # Don't leave the child holding the sandbox: every attempt of one
         # request shares a workspace keyed by request_id alone, so a

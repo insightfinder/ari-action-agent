@@ -77,8 +77,9 @@ def test_repo_for_prefers_the_full_thread_key_over_the_channel():
 
 
 def test_options_json_must_be_an_object():
-    assert GatewaySettings().options() == {}
-    assert GatewaySettings(options_json='{"skip_tests": true}').options() == {"skip_tests": True}
+    assert GatewaySettings().options() == {"lane": "interactive"}
+    assert GatewaySettings(options_json='{"skip_tests": true}').options() == {"lane": "interactive", "skip_tests": True}
+    assert GatewaySettings(options_json='{"lane": "batch"}').options() == {"lane": "batch"}
     with pytest.raises(ConfigError, match="valid JSON"):
         GatewaySettings(options_json="{nope").options()
     with pytest.raises(ConfigError, match="JSON object"):

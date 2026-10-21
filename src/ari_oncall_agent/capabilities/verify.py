@@ -1,4 +1,8 @@
+import re
+
 from common.capabilities_base import StepContext
+
+_VERDICT = re.compile(r"RESULT\s*:\s*\**\s*(PASS|FAIL)\b", re.IGNORECASE)
 
 
 async def run(ctx: StepContext) -> dict:
@@ -27,6 +31,9 @@ async def run(ctx: StepContext) -> dict:
     )
     result = await opencode(ctx, instruction)
     text = result["text"]
-    if "RESULT: PASS" in text:
+    verdicts = _VERDICT.findall(text)
+    if not verdicts:
+        return {"status": "inconclusive", "failure": text, "trace": result["trace"]}
+    if verdicts[-1].upper() == "PASS":
         return {"status": "passed", "trace": result["trace"]}
     return {"status": "failed", "failure": text, "trace": result["trace"]}

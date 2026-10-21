@@ -4251,3 +4251,36 @@ with the last turns and answers; and a thread reply addressed to a colleague
 (`@Bo ...`) was sent to the agent, so the Slack gateway now ignores replies
 that mention someone else and not the bot.
 
+
+## 2026-10-21 — three agent bugs found while testing the Coordinator on test and stg
+
+**Lost child exits (zombie `opencode`).** Seen on test four times and on stg
+on 2026-10-21: the child had exited and sat as a zombie under `api.worker`,
+asyncio never noticed, and the step waited for the full deadline (555 s for a
+skill run, ~19 min for `generate_change`) while holding one of the worker's
+few activity slots. `common/subprocess_watch.py` now wraps every
+`communicate()` and `wait()`: every 5 s (`SUBPROCESS_REAP_CHECK_SECONDS`) it
+checks `/proc/<pid>/stat`, and a child seen as a zombie on two checks in a row
+is reaped with `waitpid(WNOHANG)` and its exit code handed to asyncio's
+transport, so the step finishes as if the notification had arrived. Healthy
+children are reaped by asyncio in milliseconds and never reach the check. The
+deadline in `_communicate` stays as the last guard. Tested with a real child
+whose exit asyncio never sees.
+
+**Chat requests queued behind UIE's repair runs.** With one or two activity
+slots, a Slack or Teams "hi" waited behind every `generate_change`/`verify`
+that MCP Service had started (stg, 2026-10-20 and 21: five repair runs an
+hour, minutes each). The chat gateway and the CLI now send
+`options.lane: "interactive"`; the API starts those workflows on
+`<TEMPORAL_TASK_QUEUE>-interactive` (or `TEMPORAL_INTERACTIVE_TASK_QUEUE`),
+and the worker polls that queue as a second Temporal worker with its own
+`INTERACTIVE_MAX_CONCURRENT_ACTIVITIES` (default 1). Setting it to 0 turns
+the lane off. MCP Service sends no lane, so its runs stay on the main queue.
+One more concurrent activity per worker pod is the memory cost.
+
+**`verify` read its verdict with a substring.** `"RESULT: PASS" in text`
+passed a run whose answer quoted the instruction before reporting a failure,
+failed `RESULT:PASS` and `**RESULT: PASS**`, and turned an answer with no
+verdict at all into a failure. It now takes the last `RESULT: PASS|FAIL`
+(spacing, case and bold tolerated) and reports `inconclusive` when there is
+none, which the workflow and `propose_pr` already handle.

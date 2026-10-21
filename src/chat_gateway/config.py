@@ -7,6 +7,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_MODELS = {"openai": "gpt-4o-mini", "anthropic": "claude-haiku-4-5"}
 
+INTERACTIVE_LANE = "interactive"
+
 SECRET_FIELDS = frozenset({"ari_api_key", "llm_api_key", "github_pat"})
 
 
@@ -110,7 +112,7 @@ class GatewaySettings(BaseSettings):
             raise ConfigError(f"OPTIONS_JSON is not valid JSON: {exc}") from exc
         if not isinstance(parsed, dict):
             raise ConfigError("OPTIONS_JSON must be a JSON object")
-        return parsed
+        return {"lane": INTERACTIVE_LANE, **parsed}
 
     def approver_set(self) -> set[str]:
         return {a.strip() for a in self.approvers.split(",") if a.strip()}

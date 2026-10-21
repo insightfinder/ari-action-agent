@@ -148,7 +148,7 @@ async def test_start_sends_the_configured_repo_llm_and_options(bridge):
     assert sent["config"] == {
         "repo": {"url": "https://github.com/org/default", "pat": "ghp_test"},
         "llm": {"provider": "openai", "api_key": "sk-test", "model": "gpt-4o-mini"},
-        "options": {},
+        "options": {"lane": "interactive"},
     }
     assert sent["context_id"] == "" and sent["task_id"] == ""
     assert rendered.text == "done"
