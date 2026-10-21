@@ -5199,6 +5199,30 @@ already pins. Charts PR #100 published oncallari 0.3.9. test-fluxcd's
 published 0.3.9 chart with each release's values puts `TRACE_SERVER_URL`
 in both Secrets. The all-text redaction above is not in `test` yet.
 
+**Deployed by Flux, 2026-10-21 18:00.** `d55a2db` reached `test` as PR #18
+(`226ea9a`, images `2610210948-test`), and the user deployed test-fluxcd:
+`ari-oncall` revision 73 and `ari-k8s` revision 8 on chart 0.3.9, all four
+pods logging `tracing_enabled`. Re-run as before (aiuser identity): oncall
+trace `50800f70…` (25 spans) and k8s trace `536e019b…` (11 spans) both
+completed, carry the identity on every span, hold nothing secret-like,
+were sent to `…-LLM` and `…-LLM-Prompt`, and `/api/v1/traceview/id`
+returns both with the same span counts as Jaeger (about two minutes after
+sending).
+
+**`scripts/trace_e2e.py`, 2026-10-21.** The scratchpad script used for the
+live runs above, made a repo script: it plays mcp-service (records
+`chat-prompt-response` and `agent:<name>` on the trace server), sends one
+task with that span's traceparent in the `trace` block, and with
+`JAEGER_URL` checks the whole trace (agent spans under the caller's agent
+span, identity on every span, no `chat.id`, `chat.prompt`/`chat.response`
+on the root only, no credential-shaped value). Verified on test against the
+Flux deployment: oncall `b4861ef5…` (24 spans) and k8s `4387248b…` (11
+spans), both "no problems", exit 0. The checker was also fed a synthetic
+trace with each fault and reported all five. Checking that the trace
+reached InsightFinder stays manual (trace server log `Sent trace`, or
+`/api/v1/traceview/id` with a window of a day or more either side; UIE
+shifts times by the viewer's and the owner's timezones).
+
 ## 2026-10-20 - A Coordinator for the open-source edition (II-25116)
 
 Two editions now exist. Paying customers reach the agents through UIE and

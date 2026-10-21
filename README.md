@@ -159,6 +159,8 @@ It is deliberately not in `tests/`: each scenario costs real tokens and build ti
 
 The `k8s` kind has its own equivalent, `scripts/k8s_agent_live_test.py`, run against the fixtures in [`deploy/k8s-agent-e2e/`](deploy/k8s-agent-e2e/README.md). Without `--allow-writes` it only reads and cancels its proposals.
 
+`scripts/trace_e2e.py` checks tracing end to end against a deployed agent that has `TRACE_SERVER_URL`. It plays mcp-service: it records the caller's `chat-prompt-response` and `agent:<name>` spans on the trace server, sends one task (`--kind oncall` or `--kind k8s`, `--lane interactive` optional) carrying the child span in its `trace` block, and, with `JAEGER_URL` set, reads the trace back and fails on a missing identity, a stray `chat.id`/`chat.prompt`, an agent span outside the caller's, or a credential-shaped value. Its docstring lists the environment it needs.
+
 Neither layer sees what only shows up inside a long-running worker (leaked child processes, growing caches); that is found by looking at the process, not at a response.
 
 ## Contributing

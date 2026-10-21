@@ -301,6 +301,14 @@ of its error.
 `TRACE_SERVER_URL` with `https://` is exported over TLS; `http://` or no
 scheme, in plaintext.
 
+To check a deployment end to end, `scripts/trace_e2e.py` plays the caller:
+it records `chat-prompt-response` and `agent:<name>` on the trace server
+the way mcp-service does, sends one task with that span in its `trace`
+block, and checks the trace in Jaeger. A made-up traceparent alone is not
+enough: the trace server forwards only a trace whose root has no parent,
+so without the caller's spans the trace stays in Jaeger and never reaches
+InsightFinder.
+
 **What the caller (mcp-service) has to send.** Inside its `agent:<name>`
 span for the call, copy `chat_input`'s `trace_project`, `trace_system`,
 `trace_admin_user`, `trace_admin_user_license`, `session_id` and `username`
