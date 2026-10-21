@@ -3489,3 +3489,45 @@ connection drops. It stopped polling `86a04bdd` at 23:31 and never came back
 once the new pod was serving 56 seconds later, reporting "lost connection
 before opening a pull request" as a final answer. Until that retries, this
 reconciler restores the task but nothing asks for the approval.
+
+## A planned `execute_action` was a step that could only refuse
+
+The confirm capability is reachable only through `plan_task`'s
+`confirmed_action` bypass, which carries the approved proposal's own
+parameters verbatim. The planner prompt says never to schedule it in a planned
+run, and on 2026-10-18 the model did it anyway, twice, on prod:
+
+```
+d2ccb37e-5b8c-4c05-a0ee-f313d0f7d5f7
+84896fd0-32af-4287-befe-233a211a9aa4
+  execute_action: no confirmed pending_action in this request's params
+  (missing ['instance_name'])
+```
+
+Both reported "the execution step is missing the required instance name
+parameter" and asked the operator to retry. Nothing was executed -- the
+capability's own gate held -- but the action never ran either, and the run
+before them (`f5b161cb`) was the II-25200 shape: a plan holding only
+`resolve_target`, with `respond` claiming an approval was pending. The three
+sit in that order, so the invented `execute_action` is most likely the model
+improvising a confirmation for a proposal that never existed.
+
+II-25200 does not cover this. `_ensure_propose_action_by_default` only
+*appends* `propose_action`; a plan of `[resolve_target, execute_action]` keeps
+the doomed step ahead of it and still fails.
+
+`plan_task` now drops the confirm capability from any planner-produced plan
+(`_without_confirm_capability`), so the prompt's rule is enforced in code
+rather than requested of a model. The bypass branch is untouched and keeps
+scheduling it with `confirmed: True`.
+
+Frequency, from prod Temporal: a healthy cycle appears as **two** workflow
+executions (propose, then confirm). Over seven days there were ~13 healthy
+cycles and 3 single-execution anomalies, all three on 2026-10-18; the runs
+17 hours and 2 hours before the check were healthy. Intermittent, not
+systematic.
+
+**Verified:** `tests/test_activities.py` 17 passed, and 293 passed across the
+suite minus the four modules that import `fcntl` and cannot be collected on
+Windows. Two new cases: a planned `publish_pr` is dropped from the step list,
+and the `confirmed_action` bypass still returns it with `confirmed: True`.
