@@ -292,9 +292,11 @@ a location (`filePath`, `path`, `pattern`, ...) are kept; the rest (a
 your repository's contents or may hold a credential. No span sets `chat.id`,
 `chat.prompt` or `chat.response`: the trace server rewrites the span id of a
 span carrying `chat.id`, and treats a span with a prompt/response pair as a
-user conversation turn. Error text on a span has keys, tokens and URL
-credentials masked (long hex strings such as commit SHAs included), and a
-failed tool keeps only the first line of its error.
+user conversation turn. All span text (prompts, completions, results,
+errors) has keys, tokens and URL credentials masked, long hex strings such
+as commit SHAs included: a completion can quote a file the agent read, and
+`opencode.json` holds the LLM key. A failed tool keeps only the first line
+of its error.
 
 `TRACE_SERVER_URL` with `https://` is exported over TLS; `http://` or no
 scheme, in plaintext.

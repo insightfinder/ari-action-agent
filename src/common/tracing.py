@@ -217,7 +217,11 @@ def remote_context(traceparent: Optional[str]):
 
 
 def truncate(text: Any, limit: int = MAX_TEXT) -> str:
-    text = "" if text is None else str(text)
+    # Every free-text attribute passes through here, and the trace server
+    # stores what it is sent: a prompt can carry a step's output, and a
+    # completion can quote a file the agent read (opencode.json holds the LLM
+    # key). Redacted before the cut, so a key split at the limit still matches.
+    text = redact_secrets("" if text is None else str(text))
     return text if len(text) <= limit else text[:limit] + f"... [{len(text) - limit} more chars]"
 
 
@@ -314,9 +318,8 @@ def mark_failed(span, exc: BaseException | str) -> None:
         return
     message = exc if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"
     try:
-        # A provider's or a command's error text can quote a key or an
-        # authenticated URL, and the trace server stores what it is sent.
-        message = redact_secrets(message)
+        # truncate() redacts: a provider's or a command's error text can
+        # quote a key or an authenticated URL.
         span.set_status(Status(StatusCode.ERROR, truncate(message, 500)))
         # The trace server's `error` mapping reads this tag.
         span.set_attribute("error", True)

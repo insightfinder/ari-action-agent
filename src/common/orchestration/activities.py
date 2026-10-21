@@ -15,7 +15,6 @@ from common.agent_meta import get_agent_meta
 from common.capabilities_base import StepContext
 from common.capabilities_registry import get_capability, run_capability
 from common.planner import create_plan
-from common.redaction import redact_secrets
 from common.sandbox import cleanup_workspace as _cleanup_workspace
 from common.sandbox import create_workspace
 
@@ -307,12 +306,12 @@ def _record_task_result(ctx: StepContext, result, respond_error: Exception | Non
         if respond_error is not None:
             # The caller got the workflow's canned reply instead of this one.
             attributes["agent.respond_error"] = tracing.truncate(
-                redact_secrets(f"{type(respond_error).__name__}: {respond_error}"), 500)
+                f"{type(respond_error).__name__}: {respond_error}", 500)
         # Whatever this kind declares as an artifact, its link if it has one
         # (oncall's pull_request -> agent.artifact.pull_request.url).
         for name, value in artifacts.items():
             if isinstance(value, dict) and value.get("url"):
-                attributes[f"agent.artifact.{name}.url"] = value["url"]
+                attributes[f"agent.artifact.{name}.url"] = tracing.truncate(value["url"], 500)
         with tracing.span("a2a-task-result", target=target, traceparent=target.traceparent,
                           attributes=attributes) as span:
             if status == "failed":

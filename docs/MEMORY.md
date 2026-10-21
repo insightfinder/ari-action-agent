@@ -5169,6 +5169,36 @@ hand. No agent pod has the variable now. The `helm` manager entries remain
 on `ari-k8s`'s objects. Port-forwards and local images are gone. Still to
 do by hand: delete the `ii-25278-trace` tags on Docker Hub.
 
+**After commit `3b3c67d`, 2026-10-21: all span text is redacted.** A
+security review flagged that LLM prompts and completions reached spans
+unredacted (only error text was). In the live run the interactive-lane
+agent read the workspace's `opencode.json`, which holds the LLM key, so a
+completion quoting it is possible. `tracing.truncate`, which every
+free-text attribute goes through, now runs `redact_secrets` before the
+cut, so a key split at the limit still matches; `mark_failed` relies on
+it. New test `test_prompt_and_completion_text_is_redacted`; 957 passed,
+3 skipped. Not redeployed to test.
+
+Review of what else reaches a span (same day): the `agent.artifact.*.url`
+attributes now pass through `truncate` too, and `agent.respond_error` no
+longer redacts twice. Every other span value is an id, a name, a number or
+already goes through `truncate`; `x-licensekey` is the routing identity the
+trace server requires. k8s data is scrubbed earlier by
+`k8s_agent/tools/redact.py` (every capability result via `stepkit.finish`;
+the LLM prompts carry only whitelisted fields). Left as is, the user's call:
+span text gets only common `redact_secrets` (key-shaped tokens, URL
+credentials, long hex), not the k8s module's wider rules (`password=x`,
+PEM, JWT, AWS/Slack tokens, URL token params), so oncall text such as a
+repo file a completion quotes is covered only for key-shaped values.
+
+**Merged and pinned, 2026-10-21.** `3b3c67d` reached `test` as PR #17
+(`1f46ecd`); CI built `2610210931/32-test`, which Flux's image automation
+already pins. Charts PR #100 published oncallari 0.3.9. test-fluxcd's
+`ari-oncall` and `ari-k8s` releases were edited to 0.3.9 with
+`traceServerUrl` (left uncommitted for the user to push); rendering the
+published 0.3.9 chart with each release's values puts `TRACE_SERVER_URL`
+in both Secrets. The all-text redaction above is not in `test` yet.
+
 ## 2026-10-20 - A Coordinator for the open-source edition (II-25116)
 
 Two editions now exist. Paying customers reach the agents through UIE and
