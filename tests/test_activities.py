@@ -81,6 +81,38 @@ async def test_plan_task_normal_branch_marks_every_planner_step_unconfirmed(onca
 
 
 @pytest.mark.asyncio
+async def test_plan_task_drops_a_planned_confirm_capability(oncall_agent_kind, monkeypatch):
+    create_plan = AsyncMock(
+        return_value=Plan(
+            steps=[
+                Step(capability="clone_repo", params={}),
+                Step(capability="publish_pr", params={"branch": "ari/invented"}),
+            ],
+            rationale="r",
+        )
+    )
+    monkeypatch.setattr(activities, "create_plan", create_plan)
+
+    result = await activities.plan_task({"prompt": "yes, go ahead", "config": {}, "history": []})
+
+    assert [step["capability"] for step in result["steps"]] == ["clone_repo"]
+
+
+@pytest.mark.asyncio
+async def test_plan_task_keeps_the_confirm_capability_on_the_bypass(oncall_agent_kind, monkeypatch):
+    create_plan = AsyncMock()
+    monkeypatch.setattr(activities, "create_plan", create_plan)
+
+    result = await activities.plan_task(
+        {"prompt": "approved", "config": {}, "history": [], "confirmed_action": {"id": "b2c1"}}
+    )
+
+    create_plan.assert_not_awaited()
+    assert [step["capability"] for step in result["steps"]] == ["publish_pr"]
+    assert result["steps"][0]["confirmed"] is True
+
+
+@pytest.mark.asyncio
 async def test_plan_task_applies_oncalls_default_step_policy(monkeypatch):
     # oncall's own default_step_policy (ari_oncall_agent/meta.py) appends
     # propose_pr whenever generate_change ran and the planner's own step

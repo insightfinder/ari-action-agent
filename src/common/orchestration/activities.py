@@ -60,6 +60,13 @@ def _declared_artifacts(results: dict) -> dict:
     return found
 
 
+def _without_confirm_capability(steps: list) -> list:
+    confirm = get_agent_meta().confirm_capability
+    if not confirm:
+        return steps
+    return [step for step in steps if step.capability != confirm]
+
+
 @activity.defn(name="plan_task")
 async def plan_task(payload: dict) -> dict:
     """Produces the step plan and enriches each step with its capability's
@@ -105,6 +112,7 @@ async def plan_task(payload: dict) -> dict:
     default_step_policy = get_agent_meta().default_step_policy
     if default_step_policy:
         steps = default_step_policy(plan, payload["config"].get("options", {}))
+    steps = _without_confirm_capability(steps)
 
     enriched_steps = []
     for step in steps:
