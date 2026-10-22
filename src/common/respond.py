@@ -102,8 +102,17 @@ def execution_fact(meta, step_results: dict) -> str:
     has no single step that means "something outside was changed".
     """
     capability = meta.confirm_capability
+    direct = [name for name in getattr(meta, "direct_capabilities", ()) if step_results.get(name)]
+    direct_fact = ""
+    if direct:
+        names = ", ".join(f"`{name}`" for name in direct)
+        direct_fact = (
+            f"FACT: the {names} step ran in this request, and the commands it ran may have read from "
+            "or changed external systems. Report what its output says was checked or changed, exactly "
+            "as the output shows it, and nothing beyond that."
+        )
     if not capability:
-        return ""
+        return direct_fact
 
     result = step_results.get(capability)
     ran = bool(result) and not (isinstance(result, dict) and result.get("status") == "failed")
@@ -111,6 +120,12 @@ def execution_fact(meta, step_results: dict) -> str:
         return (
             f"FACT: the `{capability}` step ran in this request. Report what it returned, "
             "including whether the target system actually accepted the action."
+        )
+    if direct_fact:
+        proposal = "There IS a" if _proposal_exists(meta, step_results) else "There is no"
+        return (
+            f"{direct_fact} FACT: the `{capability}` step did not run, so no pull request was opened. "
+            f"{proposal} proposal awaiting confirmation in this request."
         )
     nothing_ran = (
         f"FACT: NOTHING WAS EXECUTED. The `{capability}` step did not run in this request, "

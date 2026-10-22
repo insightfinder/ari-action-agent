@@ -351,6 +351,30 @@ async def test_verify_raises_clearly_when_clone_repo_never_ran():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, status",
+    [
+        ("All 42 tests passed.\nRESULT: PASS", "passed"),
+        ("ok\nRESULT:PASS", "passed"),
+        ("ok\n**RESULT: PASS**", "passed"),
+        ("ok\nresult: pass", "passed"),
+        ("Asked to end with RESULT: PASS if green.\n2 tests failed.\nRESULT: FAIL\nAssertionError", "failed"),
+        ("mvn test exited 1\nRESULT: FAIL", "failed"),
+        ("I ran the build but it timed out before finishing.", "inconclusive"),
+    ],
+)
+async def test_verify_reads_only_the_final_verdict(text, status):
+    opencode = AsyncMock(return_value={"text": text, "trace": _STUB_TRACE})
+    ctx = _ctx(results={}, tools={"opencode": opencode}, capability="verify")
+
+    result = await verify.run(ctx)
+
+    assert result["status"] == status
+    if status != "passed":
+        assert result["failure"] == text
+
+
+@pytest.mark.asyncio
 async def test_propose_pr_raises_clearly_when_clone_repo_never_ran():
     # The repo guard moved here with the push itself. publish_pr has the
     # opposite requirement now -- see

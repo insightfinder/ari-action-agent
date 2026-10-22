@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     agent_api_keys: str = "change-me-dev-key"
 
     agent_name: str = "ARI On-Call Agent"
+
+    commit_author_name: str = "ARI Agent"
+    commit_author_email: str = "support@insightfinder.com"
     agent_public_url: str = "http://localhost:8000"
 
     sandbox_root: str = "/tmp/ari-agent-sandbox"
@@ -68,6 +71,8 @@ class Settings(BaseSettings):
     # OOMKilled restarts. This default is deliberately conservative for
     # that container size; raise it only alongside more CPU/memory.
     max_concurrent_activities: int = 3
+    interactive_max_concurrent_activities: int = 1
+    temporal_interactive_task_queue: str = ""
 
     # Shared, persistent HOME for `verify`'s build/test subprocesses only
     # (mvn/go/npm, invoked via opencode's bash tool) — separate from
@@ -98,6 +103,11 @@ class Settings(BaseSettings):
 
     opencode_bin: str = "opencode"
 
+    skills_enabled: bool = True
+    skills_dir: str = "/var/lib/ari-agent/skills"
+    bundled_skills_dir: str = ""
+    trust_repo_skills: bool = False
+
     # publish_pr's primary path is deterministic (git + a direct GitHub
     # REST API call, see capabilities/publish_pr.py) — this MCP server is
     # kept only as its fallback, still routed through a dedicated opencode
@@ -106,6 +116,17 @@ class Settings(BaseSettings):
     github_mcp_server_url: str = "https://api.githubcopilot.com/mcp/"
 
     log_level: str = "info"
+
+    def task_queue_for(self, config: dict | None) -> str:
+        lane = ((config or {}).get("options") or {}).get("lane")
+        if lane == "interactive" and self.interactive_task_queue():
+            return self.interactive_task_queue()
+        return self.temporal_task_queue
+
+    def interactive_task_queue(self) -> str:
+        if self.interactive_max_concurrent_activities <= 0:
+            return ""
+        return self.temporal_interactive_task_queue or f"{self.temporal_task_queue}-interactive"
 
     @property
     def api_key_set(self) -> set[str]:

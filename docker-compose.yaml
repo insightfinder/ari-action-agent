@@ -3,24 +3,58 @@
 # if you're running a local Temporal dev server for testing).
 services:
   api:
-    build: .
-    command: ["uvicorn", "ari_agent.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/src"]
     ports:
       - "8000:8000"
     env_file: .env
+    environment:
+      PYTHONPATH: /app/src
+      PYTHONDONTWRITEBYTECODE: "1"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./src:/app/src
       - ./configs:/app/configs
-      - sandbox:/var/lib/ari-agent/sandbox
-      - repo-cache:/var/lib/ari-agent/repo-cache
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: ["uvicorn", "coordinator.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/src"]
+    profiles: ["coordinator"]
+    ports:
+      - "8100:8000"
+    env_file: .env
+    environment:
+      PYTHONPATH: /app/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      ONCALL_AGENT_URL: http://api:8000
+      ONCALL_AGENT_API_KEY: ${ONCALL_AGENT_API_KEY:-change-me-dev-key}
+      COORDINATOR_PUBLIC_URL: http://localhost:8100
+      TASK_STORE_ROOT: ""
+    volumes:
+      - ./src:/app/src
+      - ./configs:/app/configs
 
   worker:
-    build: .
-    command: ["python", "-m", "ari_agent.orchestration.worker"]
+    build:
+      context: .
+      dockerfile: Dockerfile.oncall
     env_file: .env
+    environment:
+      PYTHONPATH: /app/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      SANDBOX_ROOT: /var/lib/ari-agent/sandbox
+      REPO_CACHE_ROOT: /var/lib/ari-agent/repo-cache
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./src:/app/src
       - ./configs:/app/configs
+      - ./skills:/app/skills
       - sandbox:/var/lib/ari-agent/sandbox
       - repo-cache:/var/lib/ari-agent/repo-cache
 

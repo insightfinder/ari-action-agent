@@ -6,7 +6,9 @@ metadata:
     app: ari-oncall-agent
     component: api
 spec:
-  replicas: 2
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ari-oncall-agent
@@ -17,10 +19,16 @@ spec:
         app: ari-oncall-agent
         component: api
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: api
-          image: ari-oncall-agent:latest
-          command: ["uvicorn", "ari_agent.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          image: docker.io/insightfinderinc/ari-agent-api:main
+          command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          env:
+            - name: AGENT_KIND
+              value: oncall
+            - name: TASK_STORE_ROOT
+              value: /var/lib/ari-agent/tasks
           ports:
             - containerPort: 8000
           envFrom:
@@ -32,6 +40,16 @@ spec:
           livenessProbe:
             httpGet: { path: /healthz, port: 8000 }
             initialDelaySeconds: 15
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { cpu: 1000m, memory: 512Mi }
+          volumeMounts:
+            - name: task-store
+              mountPath: /var/lib/ari-agent/tasks
+      volumes:
+        - name: task-store
+          persistentVolumeClaim:
+            claimName: ari-oncall-agent-task-store
 ---
 apiVersion: v1
 kind: Service
