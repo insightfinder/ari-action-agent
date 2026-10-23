@@ -197,9 +197,9 @@ looks at it — see `docs/design.md` §5b).
   confirm mechanism itself) — same "propose it again" recovery.
 - **Sending a plain "yes" instead of the structured field does
   nothing** — there is no code path that turns free text into a
-  `trigger_build` confirmation. This is deliberate (`docs/design.md`
-  §5b's layer 3) — if your integration only sends text, `trigger_build`
-  will simply never execute, and the task will just stay at
+  confirmation of either action. This is deliberate (`docs/design.md`
+  §5b's layer 3) — if your integration only sends text, the proposed
+  action will simply never execute, and the task will just stay at
   `INPUT_REQUIRED`.
 
 ## 6. Declining
