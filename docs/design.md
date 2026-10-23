@@ -16,17 +16,12 @@ A2A-protocol agent kinds can sit on top of. Today there are two:
 | `oncall` | Clones a repo, diagnoses a bug/feature request, fixes it, opens a PR | `ari_oncall_agent/` |
 | `jenkins` | Reads/diagnoses a Jenkins job or build, proposes and (once confirmed) executes a change | `jenkins_agent/` |
 
-> **Where the Jenkins kind lives.** `jenkins_agent/` is *not* on `main`,
-> `test` or `staging` — it is developed and released from its own
-> `jenkins-agent` branch, which builds `ari-jenkins-agent-worker` from its
-> own copy of `.github/workflows/docker-build-push.yml`. The two kinds
-> ship on independent cadences and the on-call agent's pull requests stay
-> reviewable without an unrelated agent's diff in them. Everything §0
-> describes about the framework still holds: the split is in release
-> management, not in the design, and nothing in `common/` knows about it.
-> The rest of this document (§3's tables, §5b, §7) describes both kinds as
-> one codebase, which is what you see once the `jenkins-agent` branch is
-> checked out.
+> **Where the Jenkins kind lives.** `jenkins_agent/` is on `main` like
+> every other kind, and `.github/workflows/docker-build-push.yml` builds
+> `ari-jenkins-agent-worker` alongside the rest. It was developed on a
+> separate `jenkins-agent` branch while it was incomplete and merged in
+> once it was finished and verified against a real Jenkins; see
+> `docs/MEMORY.md`, 2026-10-23.
 
 **Package layout** (`src/`):
 
@@ -437,15 +432,12 @@ independently, for every action — and a third time, specifically for
 2. **Structurally, in `execute_action.py`'s own code.** It refuses to run
    at all unless `ctx.params` already carries a concrete, non-stale
    (< 30 minutes old) confirmed `action`/`job`/`parameters` — never
-   inferred from a bare "yes". For `stop_build`, carrying a prior
-   `propose_action`'s exact `pending_action` fields into a later
-   confirmation turn's params is the planner's job (its domain guidance
-   says so explicitly) — a conversational "yes, go ahead" is enough, same
-   as it always was; if there's nothing concrete to confirm,
-   `execute_action` should never have been scheduled, and it fails loudly
-   rather than guessing.
-3. **For `trigger_build` only — a hard, protocol-level gate, not an LLM's
-   inference.** `propose_action` flags a `trigger_build` proposal with
+   inferred from a bare "yes" — and `ctx.confirmed` is set, which only
+   the structured resume below does. If there's nothing concrete to
+   confirm, `execute_action` should never have been scheduled, and it
+   fails loudly rather than guessing.
+3. **A hard, protocol-level gate for every action, not an LLM's
+   inference.** `propose_action` flags every proposal with
    `requires_approval: true`; `orchestration/workflow.py`'s step loop
    turns that into `status: "needs_approval"`, which
    `a2a_server/executor.py` maps onto the real A2A `TASK_STATE_
