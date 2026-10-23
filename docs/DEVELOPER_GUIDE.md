@@ -11,9 +11,9 @@ Foundation project), serving both the **JSON-RPC** and **REST/HTTP+JSON**
 transports the spec defines (gRPC is a deliberate, separate follow-up —
 see `docs/design.md` §2), and everything about §1–§8 (discovery, auth,
 `message/send`, the three response patterns, cancellation, errors)
-applies identically to the Kubernetes agent — only the Agent Card content
-and the config `DataPart` shape differ, which §10 covers. A third kind,
-the Jenkins agent, is deprecated (§9).
+applies identically to the Jenkins agent (§9) and the Kubernetes agent
+(§10) — only the Agent Card content and the config `DataPart` shape
+differ.
 
 Everything below for the on-call agent is verified against a real running
 instance, not just read off the spec — exact request/response bodies are
@@ -373,10 +373,120 @@ The Kubernetes agent has its own sibling example,
 [`docs/examples/k8s_sample_client.py`](examples/k8s_sample_client.py)
 — see §10.
 
-## 9. The Jenkins agent (deprecated)
+## 9. The Jenkins agent
 
-The Jenkins agent kind is deprecated and is not on this branch; its code
-and its documentation live on the `jenkins-agent` branch.
+A separate deployment, own base URL, own Agent Card (`skills[0].id ==
+"jenkins_read_diagnose_act"`) — but the same `message/send` operation and
+the same three response patterns as §3. Only the config `DataPart` shape
+differs.
+
+### Config `DataPart` shape
+
+```jsonc
+{
+  "jenkins": {
+    "base_url": "https://jenkins.example.com",
+    "auth": {
+      "type": "api_token",        // or "bearer", "basic"
+      "user": "svc-ari-jenkins",  // required for api_token/basic
+      "token": "..."
+    },
+    "verify_tls": true,
+    "ca_bundle": null,             // optional — PEM content (not a path), for a private/internal CA
+    "allow_mutations": true        // design intent only today — not yet enforced in code, see docs/design.md §8
+  },
+  "llm": {
+    "provider": "anthropic",
+    "api_key": "sk-ant-...",
+    "model": "claude-sonnet-5"
+  }
+}
+```
+
+Jenkins connection details are per-request, exactly like the on-call
+agent's `repo` block — never deployment-level config. This is deliberate:
+this agent stores no credentials between requests.
+
+### Reading vs. diagnosing vs. changing something
+
+A plain status/history question ("how's the checkout-service deploy
+job doing?") runs `resolve_target` → `inspect` and answers directly — no
+confirmation needed, nothing mutates. A failure question ("why has the
+nightly build been red since Tuesday?") runs `resolve_target` →
+`diagnose` instead, and the final message includes the diagnosed cause
+with evidence (failing step, first real error line), not just a
+pass/fail restatement.
+
+A requested **change** ("deploy checkout-service to staging", "stop that
+build") never executes on the first turn. It runs `resolve_target` →
+`propose_action`, which resolves the job and every parameter but calls
+nothing mutating (`propose_action`'s opencode agent has every mutating
+Jenkins tool denied outright — see `docs/design.md` §5c), and the Task
+carries a `pending_action` artifact:
+
+```json
+{
+  "artifacts": [
+    {
+      "name": "pending_action",
+      "parts": [{ "data": {
+        "id": "b2c1...",
+        "action": "trigger_build",
+        "job": "deploy/checkout-service",
+        "parameters": { "ENV": "staging" },
+        "reasoning": "ENV defaults to \"production\"; user asked for staging explicitly",
+        "jenkins_url": "https://jenkins.example.com",
+        "created_at": "2026-09-18T22:00:00+00:00"
+      }}]
+    }
+  ]
+}
+```
+
+**Confirming is the same for both actions** — `trigger_build` and
+`stop_build` alike (see `docs/design.md` §5b for the gate itself and
+§5c for the opencode scoping underneath it):
+
+- **A hard gate, not a chat reply.** The Task's status is genuinely
+  `TASK_STATE_INPUT_REQUIRED` (not `COMPLETED`). See
+  [`docs/INPUT_REQUIRED_INTEGRATION.md`](INPUT_REQUIRED_INTEGRATION.md)
+  for the full integration contract (detecting it across all three
+  response patterns, edge cases, a runnable snippet); summary: send a
+  follow-up `message/send` on the **same `task_id`** whose config
+  `DataPart` carries a structured field instead of free text:
+  ```json
+  { "confirm_pending_action": { "id": "b2c1..." } }
+  ```
+  This id must match a `pending_action` artifact already on that exact
+  task — the server resolves it deterministically from the task's own
+  history, never from an LLM's reading of a "yes." A wrong/stale/unknown
+  id fails clearly rather than silently doing nothing. There is no
+  free-text way to confirm either action — a plain "yes, go ahead" on its
+  own does not execute anything.
+- **Staleness applies either way.** A confirmation more than 30 minutes
+  after the proposal is rejected; ask for the action again and confirm
+  the fresh proposal.
+
+Once genuinely confirmed, `execute_action` runs and the Task's status
+returns to a normal terminal state, carrying an `action_result` artifact
+instead. Stopping a build goes through a direct REST call under the hood,
+not opencode — see `docs/design.md` §5c for why (no stop/cancel tool
+exists in the real plugin, confirmed live).
+
+### Sample client
+
+[`docs/examples/jenkins_sample_client.py`](examples/jenkins_sample_client.py)
+demonstrates the read/diagnose/propose flow (agent-card, a status
+question, a failure diagnosis, and a change proposal) — deliberately does
+**not** include a mode that confirms and executes an action, consistent
+with this codebase's general posture of never wiring an automatic
+confirm-and-mutate path in example/test code.
+
+```bash
+pip install httpx
+JENKINS_BASE_URL=https://jenkins.example.com JENKINS_USER=... JENKINS_TOKEN=... \
+  ANTHROPIC_API_KEY=sk-ant-... python docs/examples/jenkins_sample_client.py propose
+```
 
 ## 10. The Kubernetes agent (`k8s` kind)
 

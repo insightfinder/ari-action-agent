@@ -5439,3 +5439,38 @@ PR #14 updated the same four when it added k8s. Also untouched: the
 `oncallari` chart, which needs a Jenkins API and worker release, and whose
 hardcoded `command:` defeats the new ENTRYPOINT exactly as it does for
 oncall.
+
+## 2026-10-23 - The Jenkins docs reversed the 2026-10-19 deprecation
+
+The port above landed on `test` by cherry-pick, where five statements in
+four docs said the Jenkins kind was deprecated and lived only on the
+`jenkins-agent` branch: `README.md`'s kind table footnote,
+`docs/ARCHITECTURE.md`'s intro and repo map, `docs/DEVELOPER_GUIDE.md`
+§9, and `docs/design.md` §0. All five are now written as a third ordinary
+kind alongside `oncall` and `k8s`. The deprecation was never about the
+design - it recorded that the code was unfinished and released from its
+own branch, which stopped being true once it was verified against a real
+Jenkins.
+
+`docs/design.md` differs between branches, so the port's own doc commit
+could not be cherry-picked: on `main` and `staging` §5b is still the
+Jenkins-specific gate and §5c the on-call one, while `test` has already
+generalised §5b into one kind-agnostic gate section. On `test` the
+Jenkins MCP wiring is therefore a new §5c, and §5b gains a
+`jenkins | propose_action | execute_action` row rather than a section of
+its own.
+
+Two claims carried over from the old Jenkins §5b were false by the time
+they reached `test` and were rewritten rather than copied: that the read
+agent denies tools by a `jenkins_*` wildcard (it denies the four
+destructive tools by exact name - the wildcard matched the read tools too
+and left the agent unable to call anything, 2026-10-14), and that the
+confirm gate had never been exercised live (it has: a build triggered to
+SUCCESS, a running build aborted, and the same against a job in a nested
+folder, each only after a structured `confirm_pending_action`).
+
+`docs/INPUT_REQUIRED_INTEGRATION.md` said neither confirm capability
+checks a proposal's age. `execute_action` does, at 30 minutes
+(`_MAX_PROPOSAL_AGE_SECONDS`), which is shorter than the 10800s approval
+window UIE now uses; the doc now states the exception, and the mismatch
+is still open.

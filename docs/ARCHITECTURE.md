@@ -1,11 +1,11 @@
 # Repo structure, and how to add a new agent kind
 
 This repo hosts a small shared framework plus any number of independent
-"agent kinds" built on top of it — today the on-call agent
-(`ari_oncall_agent/`) and the Kubernetes agent (`k8s_agent/`); the Jenkins
-agent (`jenkins_agent/`, on its own `jenkins-agent` branch) is deprecated
-and kept only as a reference. This doc maps the repo and gives the
-concrete, step-by-step checklist for adding another. `docs/design.md` §0 covers the same split conceptually; this
+"agent kinds" built on top of it — today three: the on-call agent
+(`ari_oncall_agent/`), the Kubernetes agent (`k8s_agent/`) and the Jenkins
+agent (`jenkins_agent/`). This doc maps the repo and gives the
+concrete, step-by-step checklist for adding a fourth. `docs/design.md`
+§0 covers the same split conceptually; this
 doc is the practical "what files do I actually touch" companion,
 written against the real second agent kind that was actually built this
 way — every step below points at a real file, not a hypothetical one.
@@ -39,7 +39,11 @@ src/
     schemas.py
     meta.py
 
-  jenkins_agent/       DEPRECATED, only on the `jenkins-agent` branch
+  jenkins_agent/       a third agent kind's own code — same shape
+    capabilities/      resolve_target, inspect, diagnose, propose_action, execute_action
+    tools/             opencode_cli.py (Jenkins MCP wiring), jenkins_rest.py
+    schemas.py
+    meta.py
 
   api/                 thin deployable entrypoints only, zero agent-specific logic
     main.py             `uvicorn api.main:app` — the A2A/FastAPI process
@@ -48,10 +52,12 @@ src/
 configs/
   oncall/capabilities.yaml, tools.yaml     declarative registries for that kind
   k8s/capabilities.yaml, tools.yaml        same, for the Kubernetes kind
+  jenkins/capabilities.yaml, tools.yaml    same, for the Jenkins kind
 
 Dockerfile.api          shared API image — used by every agent kind's API deployment
 Dockerfile.oncall       the on-call agent's worker image (git + go/java/maven + opencode)
 Dockerfile.k8s          the Kubernetes agent's worker image (no shell tooling, non-root)
+Dockerfile.jenkins      the Jenkins agent's worker image (opencode only, no git/build tools)
 
 docs/
   design.md                        current-state architecture reference
@@ -72,8 +78,9 @@ tests/                  one flat directory, no per-agent-kind subfolders;
 
 **The Helm chart lives in a separate repo** —
 `insightfinder/charts`, `charts/oncallari/` — not here. It has its own
-per-agent-kind structure mirroring this one: `templates/ari-oncall-agent/`
-and `templates/ari-k8s-agent/`, each a self-contained set of
+per-agent-kind structure mirroring this one: `templates/ari-oncall-agent/`,
+`templates/ari-k8s-agent/` and `templates/ari-jenkins-agent/`, each a
+self-contained set of
 api-deployment/worker-deployment/secret/service/ingress manifests (plus
 the kind's own PVCs, and RBAC for the k8s kind), plus one shared
 `_helpers.tpl` and `values.yaml`.
@@ -183,7 +190,8 @@ Add `"src/slack_agent"` to `[tool.hatch.build.targets.wheel]`'s
 
 Only if this kind needs a different toolchain than the two that already
 exist (`Dockerfile.oncall`'s full git/go/java/maven/opencode stack,
-`Dockerfile.k8s`'s Python-only one with no shell tooling). No new API
+`Dockerfile.k8s`'s Python-only one with no shell tooling,
+`Dockerfile.jenkins`'s opencode-only one with no git or build tools). No new API
 Dockerfile — `Dockerfile.api` is already agent-kind-agnostic and shared
 by every kind's API deployment.
 
@@ -221,7 +229,8 @@ capabilities.py` covering each capability's `run()` against a `StepContext`
 built by hand (see `test_k8s_capabilities.py`'s `_ctx()` helper), and
 adding `"slack"` to `tests/test_agent_meta.py`'s
 `test_fallback_steps_only_name_capabilities_that_kind_actually_has` —
-its loop is a hardcoded tuple (`for kind in ("oncall", "k8s"):`), not
+its loop is a hardcoded tuple (`for kind in ("oncall", "jenkins", "k8s"):`),
+not
 auto-discovered from `_AGENT_PACKAGES`, so a new kind needs adding there
 by hand or its fallback-steps-vs-registry check silently never runs for
 it.
@@ -232,7 +241,7 @@ it.
 - `docs/DEVELOPER_GUIDE.md` gets a new numbered section for this kind's
   own config `DataPart` shape, same pattern as §10's Kubernetes section.
 - A new `docs/examples/slack_sample_client.py`, mirroring the existing
-  `sample_client.py` and `k8s_sample_client.py`.
+  `sample_client.py`, `jenkins_sample_client.py` and `k8s_sample_client.py`.
 
 ## 4. What you should almost never need to touch
 
@@ -245,9 +254,9 @@ should only ever need a new package, a new `configs/<kind>/`, and one
 line in `_AGENT_PACKAGES`. The one narrow exception so far: the
 confirm-gate mechanism (`requires_approval`/`confirmed_action`/
 `StepContext.confirmed`) touches `common/` because it's genuinely a
-reusable *mechanism* (oncall's `publish_pr` and k8s's
-`apply_approved_change` both opt into it via
-`AgentMeta.confirm_capability`, and any future kind's own mutating
+reusable *mechanism* (oncall's `publish_pr`, k8s's
+`apply_approved_change` and jenkins's `execute_action` all opt into it
+via `AgentMeta.confirm_capability`, and any future kind's own mutating
 action can too), not because one kind gets special-cased. Part of the same mechanism: when the
 confirmed step raises past its retries, `workflow.py` records it as
 `{"status": "interrupted"}` and `respond.execution_fact` reports the

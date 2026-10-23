@@ -32,8 +32,9 @@ The same engine hosts several independently deployed *agent kinds* (`AGENT_KIND`
 |---|---|---|
 | `oncall` | Code analysis and fixes, pull request after approval, Agent Skills | `ari-oncall-agent-worker` (`Dockerfile.oncall`) |
 | `k8s` | Pod-level health of the cluster it runs in; Deployment scaling and CPU/memory changes, each proposed first and applied only after a person approves (see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §10) | `ari-k8s-agent-worker` (`Dockerfile.k8s`) |
+| `jenkins` | Job and build state on a Jenkins server, failure diagnosis, and triggering or stopping a build — each change proposed first and run only after a person approves (see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §9) | `ari-jenkins-agent-worker` (`Dockerfile.jenkins`) |
 
-The API image (`Dockerfile.api`) is shared by every kind. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how a new kind is added. The Jenkins kind is deprecated and lives on its own branch.
+The API image (`Dockerfile.api`) is shared by every kind. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how a new kind is added.
 
 ## Run it locally
 

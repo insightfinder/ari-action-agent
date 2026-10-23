@@ -8,26 +8,31 @@ integration contract — what you will see on the wire, and exactly what
 to send back.
 
 **Scope today: every on-call run that is about to open a pull request,
-and every change the Kubernetes agent proposes.** On-call pauses at
-`propose_pr`, after the change is made and its branch is pushed, and
-`publish_pr` opens the pull request only once you confirm. The `k8s`
-kind pauses at `propose_change`, and `apply_approved_change` changes the
-cluster only once you confirm. Everything else (an on-call request that
-asked for no PR, an on-call `run_skill` run, a k8s health check or
-refusal, a plain question) completes without ever producing
+every change the Kubernetes agent proposes, and every build the Jenkins
+agent is asked to start or stop.** On-call pauses at `propose_pr`, after
+the change is made and its branch is pushed, and `publish_pr` opens the
+pull request only once you confirm. The `k8s` kind pauses at
+`propose_change`, and `apply_approved_change` changes the cluster only
+once you confirm. The `jenkins` kind pauses at `propose_action`, and
+`execute_action` triggers or stops the build only once you confirm.
+Everything else (an on-call request that asked for no PR, an on-call
+`run_skill` run, a k8s health check or refusal, a Jenkins status
+question or failure diagnosis, a plain question) completes without ever
+producing
 `TASK_STATE_INPUT_REQUIRED` — see the
 [comparison table](#what-pauses-and-what-does-not) at the end.
 
-The wire contract below is identical for both kinds: same task state,
-same `pending_action` artifact, same structured confirmation. Only the
-contents of the artifact differ, and you do not need to understand them
+The wire contract below is identical for all three kinds: same task
+state, same `pending_action` artifact, same structured confirmation. Only
+the contents of the artifact differ, and you do not need to understand them
 — you echo the `id` back. Read `docs/DEVELOPER_GUIDE.md` first if
 you haven't already — this doc assumes you know `message/send`, the
 three response patterns, and how multi-turn `context_id`/`task_id`
-continuation works. The k8s kind's own summary of the same round trip is
-`docs/DEVELOPER_GUIDE.md` §10. A working caller of this contract is the
-chat gateway's client (`src/chat_gateway/a2a_client.py`, `confirm()` and
-`cancel()`), which the `ari` CLI and the Slack/Teams front ends use.
+continuation works. Each kind's own summary of the same round trip is
+`docs/DEVELOPER_GUIDE.md` §9 (Jenkins) and §10 (Kubernetes). A working
+caller of this contract is the chat gateway's client
+(`src/chat_gateway/a2a_client.py`, `confirm()` and `cancel()`), which the
+`ari` CLI and the Slack/Teams front ends use.
 
 ## 1. The sequence, end to end
 
@@ -49,7 +54,7 @@ chat gateway's client (`src/chat_gateway/a2a_client.py`, `confirm()` and
         ▼                                                            ▼
 5. Task status becomes a normal terminal state again          Task status becomes
    (COMPLETED or FAILED), carrying the result artifact:       TASK_STATE_CANCELED
-   "pull_request" (on-call) or "action_result" (k8s)
+   "pull_request" (on-call) or "action_result" (k8s, jenkins)
 ```
 
 Nothing about steps 1–2 or 4–5 depends on which of the three response
@@ -182,7 +187,9 @@ API surface — with:
   agent) — the confirm field is additive, not a replacement for the rest
   of the config shape. For on-call that means `repo` (with a `pat`:
   `publish_pr` opens the pull request through the GitHub REST API with
-  it) and `llm`; for k8s, `llm`.
+  it) and `llm`; for k8s, `llm`; for jenkins, the `jenkins` block (with
+  its credentials: `execute_action` calls the server with them) and
+  `llm`.
 
 ```python
 import uuid
@@ -227,10 +234,11 @@ looks at it — see `docs/design.md` §5b).
 
 - **Resolves correctly** → the kind's confirm capability runs as the
   only step of a new run (`publish_pr` for on-call,
-  `apply_approved_change` for k8s), and the Task goes back to
-  `TASK_STATE_COMPLETED`/`TASK_STATE_FAILED`, whichever that step
-  actually resulted in. On-call adds a `pull_request` artifact
-  (`{"url": ..., "branch": ...}`); k8s adds an `action_result` artifact.
+  `apply_approved_change` for k8s, `execute_action` for jenkins), and the
+  Task goes back to `TASK_STATE_COMPLETED`/`TASK_STATE_FAILED`, whichever
+  that step actually resulted in. On-call adds a `pull_request` artifact
+  (`{"url": ..., "branch": ...}`); k8s and jenkins add an `action_result`
+  artifact.
   The proposal's own artifacts stay on the task.
 - **The id doesn't resolve** (typo, wrong task_id, already handled) →
   the Task goes straight to `TASK_STATE_FAILED` with a message
@@ -244,14 +252,18 @@ looks at it — see `docs/design.md` §5b).
   proposal or lacks `branch`, `base_ref`, `title` or `repo`.
   `apply_approved_change` re-reads the target and refuses if anything
   the change depends on moved since the proposal's `snapshot` (unless
-  the target already holds the approved values). Neither checks the
-  proposal's age; the approval window is the caller's to enforce.
+  the target already holds the approved values). Neither of those two
+  checks the proposal's age; the approval window is the caller's to
+  enforce. `execute_action` is the exception — it refuses a proposal more
+  than 30 minutes old, so a Jenkins confirmation that arrives after a
+  longer approval window has to be proposed again.
 - **Sending a plain "yes" instead of the structured field does
   nothing** — there is no code path that turns free text into a
   confirmation. This is deliberate (`docs/design.md` §5b's layer 3):
-  the planner is told never to schedule `publish_pr` or
-  `apply_approved_change`, the k8s kind drops them from any plan, and
-  both refuse to run unless the step came from the confirmation bypass.
+  the planner is told never to schedule `publish_pr`,
+  `apply_approved_change` or `execute_action`, the k8s kind drops them
+  from any plan, and all three refuse to run unless the step came from
+  the confirmation bypass.
   A free-text reply on the paused task just runs an ordinary new turn
   (§7).
 
@@ -328,7 +340,7 @@ a real paused task, so this shouldn't come up in normal use.
 
 ## What pauses, and what does not
 
-| | `propose_pr` (on-call) and `propose_change` (k8s) | Anything with nothing to approve |
+| | `propose_pr` (on-call), `propose_change` (k8s) and `propose_action` (jenkins) | Anything with nothing to approve |
 |---|---|---|
 | Pause mechanism | Hard: real `TASK_STATE_INPUT_REQUIRED` | None: the task completes normally |
 | How you confirm | Structured `confirm_pending_action: {"id": ...}` field, same `task_id` | Nothing to confirm |
@@ -347,6 +359,7 @@ committing afterwards would be gone. The proposal carries a
 `key_hunks` field is only an excerpt sized for an email. Declining
 (§6) leaves that branch behind; nothing deletes it.
 
-The k8s kind has no such side effect: `propose_change` changes nothing
-in the cluster (it runs only a server-side dry run), so declining leaves
-nothing behind.
+The other two kinds have no such side effect: `propose_change` changes
+nothing in the cluster (it runs only a server-side dry run) and
+`propose_action` calls nothing mutating on Jenkins at all, so declining
+leaves nothing behind.
