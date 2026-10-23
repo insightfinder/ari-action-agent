@@ -5359,3 +5359,83 @@ systematic.
 suite minus the four modules that import `fcntl` and cannot be collected on
 Windows. Two new cases: a planned `publish_pr` is dropped from the step list,
 and the `confirmed_action` bypass still returns it with `confirmed: True`.
+
+## 2026-10-23 - The Jenkins kind ported onto main, as an ordinary agent kind (II-24873)
+
+The Jenkins kind had lived only on the `jenkins-agent` branch since the
+on-call-only split. The 2026-10-19 open-source entry recorded that
+arrangement and the reason `common/` still names Jenkins capabilities: so
+that branch keeps merging `common/` from `test`. Two things about that
+turned out not to hold.
+
+**The branch never merged, and could not.** Its history is
+`41f496b` "Bring the on-call agent up to date on main, excluding the
+Jenkins agent" then `ca51c3c` "Add the Jenkins agent back on top of the
+on-call-only split" - the engine was rebuilt twice, not merged forward.
+Measured before starting: merging `test` into `jenkins-agent` today
+reports 48 conflicts, 17 of them in `src/common/`, because both lines
+created the same engine files independently from `120cd1f` and git sees
+them as add/add. Porting the kind onto `main` instead conflicts in two
+files, both documentation.
+
+**The exclusion was about unfinished code, not about open source.** The
+Jenkins kind is an agent kind like oncall and k8s and needs no separate
+treatment; it was kept out while it was incomplete. It is complete now,
+and verified against a real Jenkins (2026-09-30 and 2026-10-08 entries on
+that branch): read, diagnose, `trigger_build` and `stop_build` both behind
+the gate, root-level and folder-nested jobs, and a free-text "yes"
+executing nothing.
+
+**Shaped after the k8s kind (II-25173, PR #14), not after the old branch.**
+That PR is the current repository's own worked example of adding a kind,
+and it supersedes two items the port was going to carry:
+
+- `AgentMeta.planner_skills` did not exist when the Jenkins kind was
+  written. `planner.py` offered `available_skills` to every kind, so a
+  kind with no `run_skill` capability could be handed a skill list and plan
+  a step it does not have. k8s added the field; Jenkins now sets
+  `planner_skills=False` the same way. The alternative the port had
+  planned - `SKILLS_ENABLED=false` in `Dockerfile.jenkins` plus
+  `"skill": "deny"` in the opencode agent definitions - is dropped: as
+  PR #14's own note puts it, the guarantee should not hang on the image
+  remembering an environment variable.
+- `workflow.py`'s `_may_have_run` and `respond.py`'s `interrupted` fact,
+  both from that PR, already cover the risk flagged for this port: a
+  confirmed mutating step cut off by a lost worker or a timeout must be
+  reported as unknown rather than as "nothing was executed". A timed-out
+  `trigger_build` is exactly that case.
+
+**Shared files touched, all of it the k8s shape:** `_AGENT_PACKAGES` gains
+`"jenkins"`, `AgentMeta` gains `planner_skills`, `planner.py` honours it,
+`pyproject.toml`'s wheel packages gain `src/jenkins_agent` (missing it
+builds a green image whose container fails at import, and `conftest.py`
+puts `src/` on `sys.path` so the suite passes anyway), the CI matrix gains
+`Dockerfile.jenkins`, and `Dockerfile.jenkins` gains `tini` as pid 1 to
+match `Dockerfile.oncall` - the Jenkins worker shells out through the same
+`run_opencode` and orphans the same children. No Jenkins dependency group
+is needed; the kind imports nothing outside the existing set.
+
+**Comments.** The explanatory comment blocks added to the Jenkins sources
+in September and October were removed on the way in, per the repository's
+no-comments rule; the reasoning they carried is in this file, on the
+`jenkins-agent` branch's own entries. One exception is recorded here
+because it is a correction rather than a deletion:
+`execute_action.py`'s module docstring described `stop_build` as confirmed
+conversationally through planner history. That path was removed on
+2026-09-30 after it was shown to be unreachable, so the sentence was
+false; it now states the gate as it is, in one sentence.
+
+**Verified:** 681 passed, 9 skipped, run inside the deployed
+`ari-oncall-agent-worker` image (the local Windows checkout cannot collect
+the 17 modules that import `a2a` or `fcntl`). Two of the new tests are
+k8s's own guards reused: that `jenkins` resolves to its own metadata and
+that its fallback steps name capabilities it really has, and that a kind
+without `run_skill` is offered no skills even when skills are installed.
+
+**Not done in this step:** `README.md`, `docs/ARCHITECTURE.md`,
+`docs/DEVELOPER_GUIDE.md` and `docs/design.md` still describe a repository
+with no Jenkins kind - the 2026-10-19 cleanup removed it from all four.
+PR #14 updated the same four when it added k8s. Also untouched: the
+`oncallari` chart, which needs a Jenkins API and worker release, and whose
+hardcoded `command:` defeats the new ENTRYPOINT exactly as it does for
+oncall.

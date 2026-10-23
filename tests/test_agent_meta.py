@@ -12,6 +12,14 @@ def test_oncall_resolves_to_real_metadata():
     assert oncall.skill.id == "code_analysis_fix"
 
 
+def test_jenkins_resolves_to_its_own_metadata():
+    jenkins = get_agent_meta("jenkins")
+
+    assert jenkins.skill.id == "jenkins_read_diagnose_act"
+    assert jenkins.confirm_capability == "execute_action"
+    assert jenkins.planner_skills is False
+
+
 def test_k8s_resolves_to_its_own_metadata():
     k8s = get_agent_meta("k8s")
 
@@ -32,7 +40,7 @@ def test_fallback_steps_only_name_capabilities_that_kind_actually_has():
     import common.capabilities_registry as capabilities_registry
     from common.settings import get_settings
 
-    for kind in ("oncall", "k8s"):
+    for kind in ("oncall", "jenkins", "k8s"):
         os.environ["AGENT_KIND"] = kind
         get_settings.cache_clear()
         capabilities_registry._load_specs.cache_clear()

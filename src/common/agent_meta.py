@@ -26,6 +26,7 @@ from .settings import get_settings
 # cost as registering a new capability or tool.
 _AGENT_PACKAGES = {
     "oncall": "ari_oncall_agent",
+    "jenkins": "jenkins_agent",
     "k8s": "k8s_agent",
 }
 
@@ -74,6 +75,7 @@ class AgentMeta:
     # guarantee should not hang on the image remembering SKILLS_ENABLED=false.
     planner_skills: bool = True
     direct_capabilities: tuple[str, ...] = ()
+    planner_skills: bool = True
 
 
 def _agent_package(agent_kind: str) -> str:
