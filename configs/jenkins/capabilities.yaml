@@ -1,0 +1,93 @@
+# Declarative capability registry for the Jenkins agent kind — see
+# configs/oncall/capabilities.yaml for the sibling registry this mirrors.
+#
+# resolve_target/inspect/diagnose/propose_action are all backed by opencode
+# through the read-only "ari-jenkins-read" opencode agent; execute_action is
+# the only one backed by "ari-jenkins-act" (see tools/opencode_cli.py) —
+# the only agent allowed to call a mutating Jenkins MCP tool. This is the
+# structural half of the confirm-before-execute gate; execute_action's own
+# code (the other half) additionally refuses to run at all without a
+# confirmed pending_action in its params.
+
+capabilities:
+  resolve_target:
+    module: jenkins_agent.capabilities.resolve_target
+    description: >
+      Turns the user's words into a concrete Jenkins job (and, if named or
+      implied, a specific build) using the Jenkins MCP tools — walks
+      folders/multibranch projects, matches fuzzily, prefers a recent or
+      running build when the user said "the last one". Read-only. Almost
+      always the first step whenever a specific job/build is named or
+      implied; skip only for a bare question needing no Jenkins lookup at
+      all.
+    tools: [opencode_config, opencode]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5
+
+  inspect:
+    module: jenkins_agent.capabilities.inspect
+    description: >
+      Gathers whatever the question needs about the resolved target using
+      the Jenkins MCP tools — status, parameters, build history, queue
+      position, which node it ran on. LLM-driven tool use, not a fixed
+      fetch list.
+    tools: [opencode_config, opencode]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5
+
+  diagnose:
+    module: jenkins_agent.capabilities.diagnose
+    description: >
+      Only for a failure. Reads the console log from the tail backwards
+      (ranged — a full log can be hundreds of megabytes) plus the test
+      report when one exists, and produces a cause with evidence: the
+      failing step, the first real error line, the stack or assertion.
+    tools: [opencode_config, opencode]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5
+
+  propose_action:
+    module: jenkins_agent.capabilities.propose_action
+    description: >
+      For any change (trigger or stop a build). Resolves the job and
+      every parameter, and stops — never calls a mutating tool (enforced
+      by the opencode agent's own tool permissions, not just this
+      capability's own logic). Emits a pending_action for the user to
+      confirm in a new turn before execute_action ever runs.
+    tools: [opencode_config, opencode]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5
+
+  execute_action:
+    module: jenkins_agent.capabilities.execute_action
+    description: >
+      The only capability allowed to call a mutating Jenkins operation.
+      Refuses to run at all without a confirmed pending_action (exact
+      action/job/parameters) carried into its own params from conversation
+      history — a bare "yes" with nothing concrete behind it does nothing.
+      Re-validates before acting (job still exists, parameters still
+      valid, no identical build already queued) and never auto-retries a
+      mutation (a timed-out trigger may have already succeeded).
+    tools: [opencode_config, opencode, jenkins_stop_build]
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+
+  # `internal: true` — never chosen by the planner. See common/respond.py
+  # (shared with every agent kind; only agent_meta.respond_domain_note
+  # varies).
+  respond:
+    module: common.respond
+    description: >
+      Write the final human-facing response — a direct answer when no
+      Jenkins lookup was needed, or a synthesis of what was found/
+      diagnosed/proposed/executed when it was.
+    tools: [llm_complete]
+    internal: true
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5
