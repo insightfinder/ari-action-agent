@@ -29,6 +29,19 @@ request is fully self-contained (its own LLM key/model, its own repo
 credentials) and it is meant to be built, deployed, and scaled independently
 (EC2, a Kubernetes Job/Deployment, etc.).
 
+## Agent kinds
+
+The same framework hosts several independently deployed *agent kinds*
+(`AGENT_KIND`), each with its own Agent Card, registries under
+`configs/<kind>/` and worker image:
+
+| Kind | What it does | Worker image |
+|---|---|---|
+| `oncall` | Everything described above: code analysis, fix, PR after approval | `ari-oncall-agent-worker` (`Dockerfile.oncall`) |
+| `jenkins` | Reads and diagnoses a Jenkins job or build; triggers or stops a build, each proposed first and run only after a person approves — see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §9 | `ari-jenkins-agent-worker` (`Dockerfile.jenkins`) |
+
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how kinds are added.
+
 ## Why it looks the way it does
 
 - **Temporal-only execution.** There is no "inline" fallback engine. Every

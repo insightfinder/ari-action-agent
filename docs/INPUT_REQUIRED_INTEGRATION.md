@@ -7,12 +7,12 @@ explains *why* this exists and how it's built; this doc is the
 integration contract — what you will see on the wire, and exactly what
 to send back.
 
-**Scope today: the Jenkins agent's `trigger_build` action, and every
-on-call run that is about to open a pull request.** On-call pauses at
-`propose_pr`, after the change is made and its branch is pushed, and
-opens the pull request only once you confirm. Everything else
-(`stop_build`, an on-call request that asked for no PR, a plain
-question) completes without ever producing
+**Scope today: every action the Jenkins agent proposes — `trigger_build`
+and `stop_build` alike — and every on-call run that is about to open a
+pull request.** On-call pauses at `propose_pr`, after the change is made
+and its branch is pushed, and opens the pull request only once you
+confirm. Everything else (an on-call request that asked for no PR, a
+plain question) completes without ever producing
 `TASK_STATE_INPUT_REQUIRED` — see the
 [comparison table](#what-pauses-and-what-does-not) at the end if you're
 integrating against both agents.
@@ -119,9 +119,9 @@ free text (see §5 for why that does nothing).
   `TASK_STATE_WORKING`, same as always — but **stop polling and treat
   `TASK_STATE_INPUT_REQUIRED` as a real poll-terminal state**, not a
   transient one. The task will sit at `INPUT_REQUIRED` indefinitely
-  (until you confirm or it's evicted with the rest of the in-memory task
-  store on a process restart) — polling further will just keep returning
-  the same state.
+  (until you confirm, or it is lost with the task store — persistent when
+  `TASK_STORE_ROOT` is set, in memory and lost on a process restart when
+  it is not) — polling further will just keep returning the same state.
 - **Webhook** (`task_push_notification_config`): one of the delivered
   `statusUpdate` payloads will carry `status.state ==
   "TASK_STATE_INPUT_REQUIRED"`. Treat this delivery as "stop and get a
@@ -186,7 +186,7 @@ looks at it — see `docs/design.md` §5b).
 - **Resolves correctly** → `execute_action` runs, and the completed Task
   (now back to `TASK_STATE_COMPLETED`/`TASK_STATE_FAILED`, whichever the
   trigger actually resulted in) carries an `action_result` artifact.
-- **The id doesn't resolve** (typo, wrong task_id, already handled, the
+- **The id doesn't resolve** (typo, wrong task_id, already handled, or an
   in-memory task store lost it across a process restart) → the Task goes
   straight to `TASK_STATE_FAILED` with a message explaining why, rather
   than silently falling through to normal planning. Don't retry the same
@@ -269,12 +269,12 @@ a real paused task, so this shouldn't come up in normal use.
 
 ## What pauses, and what does not
 
-| | `trigger_build` (jenkins) and `propose_pr` (on-call) | `stop_build`, and anything with nothing to approve |
+| | `trigger_build` and `stop_build` (jenkins), `propose_pr` (on-call) | Anything with nothing to approve |
 |---|---|---|
-| Pause mechanism | Hard: real `TASK_STATE_INPUT_REQUIRED` | Soft: task completes normally, message asks for confirmation in plain language |
-| How you confirm | Structured `confirm_pending_action: {"id": ...}` field, same `task_id` | Plain "yes, go ahead" text, same `context_id` |
-| Who decides it's a confirmation | Deterministic server-side artifact lookup, no LLM | The planner's LLM, reading conversation history |
-| Free-text "yes" alone | Does nothing | Works, as it always has |
+| Pause mechanism | Hard: real `TASK_STATE_INPUT_REQUIRED` | None: the task completes |
+| How you confirm | Structured `confirm_pending_action: {"id": ...}` field, same `task_id` | Nothing to confirm |
+| Who decides it's a confirmation | Deterministic server-side artifact lookup, no LLM | — |
+| Free-text "yes" alone | Does nothing | — |
 
 See `docs/design.md` §5b for the design behind the hard gate.
 

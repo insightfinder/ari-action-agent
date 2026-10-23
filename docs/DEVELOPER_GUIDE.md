@@ -16,11 +16,11 @@ and the config `DataPart` shape differ, which §9 covers.
 
 Everything below for the on-call agent is verified against a real running
 instance, not just read off the spec — exact request/response bodies are
-copied from real captured traffic, not hand-written. The Jenkins agent's
-own MCP integration has been verified at the protocol level against a
-real production Jenkins (see `docs/MEMORY.md`, 2026-09-18) but **not yet
-through an actual end-to-end A2A call** — §9's examples are illustrative
-of the intended shape, not captured live traffic.
+copied from real captured traffic, not hand-written. The Jenkins agent is
+verified end to end against a real production Jenkins as well (see
+`docs/MEMORY.md`, 2026-09-30 and 2026-10-08): reading, diagnosing a failed
+build, and both `trigger_build` and `stop_build` through the confirmation
+gate, on a root-level and on a folder-nested job.
 
 If you already have an A2A client library, you can likely skip straight to
 [§5 Config `DataPart` shape](#5-this-agents-config-datapart-shape) — that's
@@ -373,13 +373,12 @@ carries a `pending_action` artifact:
 }
 ```
 
-**How you confirm it differs by action** (see `docs/design.md` §5b for
-the full three-layer gate):
+**Confirming is the same for both actions** — `trigger_build` and
+`stop_build` alike (see `docs/design.md` §5b for the full three-layer
+gate):
 
-- **`trigger_build`** — a hard gate, not a chat reply. The Task's status
-  is genuinely `TASK_STATE_INPUT_REQUIRED` (not `COMPLETED`) — this agent
-  *does* implement that state for this one action, unlike the on-call
-  agent (§3). See
+- **A hard gate, not a chat reply.** The Task's status is genuinely
+  `TASK_STATE_INPUT_REQUIRED` (not `COMPLETED`). See
   [`docs/INPUT_REQUIRED_INTEGRATION.md`](INPUT_REQUIRED_INTEGRATION.md)
   for the full integration contract (detecting it across all three
   response patterns, edge cases, a runnable snippet); summary: send a
@@ -392,15 +391,11 @@ the full three-layer gate):
   task — the server resolves it deterministically from the task's own
   history, never from an LLM's reading of a "yes." A wrong/stale/unknown
   id fails clearly rather than silently doing nothing. There is no
-  free-text way to confirm a `trigger_build` — a plain "yes, go ahead" on
-  its own does not execute it.
-- **`stop_build`** — unchanged, conversational. Send a follow-up
-  `message/send` in the same `context_id` with a plain "yes, go ahead"
-  reply; the planner reads history and, recognizing a confirmation of a
-  specific prior proposal, schedules `execute_action` with those exact
-  fields itself. A bare "yes" with no matching proposal in history does
-  nothing, and a confirmation more than 30 minutes after the proposal is
-  rejected as stale either way.
+  free-text way to confirm either action — a plain "yes, go ahead" on its
+  own does not execute anything.
+- **Staleness applies either way.** A confirmation more than 30 minutes
+  after the proposal is rejected; ask for the action again and confirm
+  the fresh proposal.
 
 Once genuinely confirmed, `execute_action` runs and the Task's status
 returns to a normal terminal state, carrying an `action_result` artifact

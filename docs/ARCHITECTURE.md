@@ -63,7 +63,8 @@ tests/                  one flat directory, no per-agent-kind subfolders;
                         don't have a kind in the name
 
 .github/workflows/docker-build-push.yml
-                        builds + pushes all three images on push to main/staging/test
+                        builds + pushes the shared API image, the chat gateway and
+                        each kind's worker image on push to main/staging/test
 ```
 
 **The Helm chart lives in a separate repo** —
