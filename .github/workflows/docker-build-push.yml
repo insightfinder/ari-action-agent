@@ -16,8 +16,7 @@ jobs:
       # branch carries. These names must match the Helm chart's own
       # ariOncallAgent.api.image / .worker.image repository values
       # exactly (charts/oncallari/values.yaml) — update both together if
-      # either changes. The Jenkins agent kind lives on its own
-      # `jenkins-agent` branch and builds its worker image from there.
+      # either changes.
       matrix:
         include:
           - dockerfile: Dockerfile.api
@@ -26,6 +25,8 @@ jobs:
             image: docker.io/insightfinderinc/ari-oncall-agent-worker
           - dockerfile: Dockerfile.chat-gateway
             image: docker.io/insightfinderinc/ari-chat-gateway
+          - dockerfile: Dockerfile.jenkins
+            image: docker.io/insightfinderinc/ari-jenkins-agent-worker
       fail-fast: false
     env:
       IMAGE_NAME: ${{ matrix.image }}

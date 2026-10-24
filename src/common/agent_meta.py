@@ -26,6 +26,7 @@ from .settings import get_settings
 # cost as registering a new capability or tool.
 _AGENT_PACKAGES = {
     "oncall": "ari_oncall_agent",
+    "jenkins": "jenkins_agent",
 }
 
 
@@ -68,6 +69,7 @@ class AgentMeta:
     # jenkins).
     default_step_policy: Optional[Callable[[Plan, dict], list[Step]]] = None
     direct_capabilities: tuple[str, ...] = ()
+    planner_skills: bool = True
 
 
 def _agent_package(agent_kind: str) -> str:

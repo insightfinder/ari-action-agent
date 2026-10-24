@@ -16,17 +16,12 @@ A2A-protocol agent kinds can sit on top of. Today there are two:
 | `oncall` | Clones a repo, diagnoses a bug/feature request, fixes it, opens a PR | `ari_oncall_agent/` |
 | `jenkins` | Reads/diagnoses a Jenkins job or build, proposes and (once confirmed) executes a change | `jenkins_agent/` |
 
-> **Where the Jenkins kind lives.** `jenkins_agent/` is *not* on `main`,
-> `test` or `staging` — it is developed and released from its own
-> `jenkins-agent` branch, which builds `ari-jenkins-agent-worker` from its
-> own copy of `.github/workflows/docker-build-push.yml`. The two kinds
-> ship on independent cadences and the on-call agent's pull requests stay
-> reviewable without an unrelated agent's diff in them. Everything §0
-> describes about the framework still holds: the split is in release
-> management, not in the design, and nothing in `common/` knows about it.
-> The rest of this document (§3's tables, §5b, §7) describes both kinds as
-> one codebase, which is what you see once the `jenkins-agent` branch is
-> checked out.
+> **Where the Jenkins kind lives.** `jenkins_agent/` is on `main` like
+> every other kind, and `.github/workflows/docker-build-push.yml` builds
+> `ari-jenkins-agent-worker` alongside the rest. It was developed on a
+> separate `jenkins-agent` branch while it was incomplete and merged in
+> once it was finished and verified against a real Jenkins; see
+> `docs/MEMORY.md`, 2026-10-23.
 
 **Package layout** (`src/`):
 
@@ -186,7 +181,7 @@ separate status updates (Temporal's own workflow history already has that
 detail — this reports `SUBMITTED → WORKING → one terminal state`).
 `TASK_STATE_INPUT_REQUIRED` (a genuine paused "waiting on your reply"
 flow) *is* implemented, but only for one specific case today — the
-Jenkins agent's `trigger_build` confirmation gate (§5b) — not as a
+Jenkins agent's confirmation gate (§5b) — not as a
 general mechanism `respond` (§4) can invoke; every other case still
 always gets a definitive answer instead of a pause.
 
@@ -424,28 +419,28 @@ the on-call agent's `generate_change`) → `propose_action` (resolves a
 requested change into a `pending_action`, never executes) → `execute_action`
 (the only capability allowed to actually trigger or stop a build).
 
-**The confirm-before-execute gate is enforced at least twice,
-independently, for every action — and a third time, specifically for
-`trigger_build`:**
+**The confirm-before-execute gate is enforced three times,
+independently, for every action:**
 
 1. **Structurally, in opencode's own permission scoping.** Every
    capability except `execute_action` runs as the `ari-jenkins-read`
-   opencode agent, which has every `jenkins_*` MCP tool denied outright —
+   opencode agent, which denies all four of the plugin's destructive
+   tools (`triggerBuild`, `updateBuild`, `rebuildBuild`, `replayBuild`) —
    a mutating call is refused by opencode itself regardless of what the
-   model attempts. Only `execute_action` runs as `ari-jenkins-act`, the
-   one agent with `jenkins_*` allowed.
+   model attempts. Only `execute_action` runs as `ari-jenkins-act`, which
+   allows exactly `triggerBuild` and still denies the other three. The
+   denies are exact tool names, not a `jenkins_*` wildcard: a wildcard
+   matches the read tools too and left the read agent unable to call
+   anything at all (`docs/MEMORY.md`, 2026-10-14).
 2. **Structurally, in `execute_action.py`'s own code.** It refuses to run
    at all unless `ctx.params` already carries a concrete, non-stale
    (< 30 minutes old) confirmed `action`/`job`/`parameters` — never
-   inferred from a bare "yes". For `stop_build`, carrying a prior
-   `propose_action`'s exact `pending_action` fields into a later
-   confirmation turn's params is the planner's job (its domain guidance
-   says so explicitly) — a conversational "yes, go ahead" is enough, same
-   as it always was; if there's nothing concrete to confirm,
-   `execute_action` should never have been scheduled, and it fails loudly
-   rather than guessing.
-3. **For `trigger_build` only — a hard, protocol-level gate, not an LLM's
-   inference.** `propose_action` flags a `trigger_build` proposal with
+   inferred from a bare "yes" — and `ctx.confirmed` is set, which only
+   the structured resume below does. If there's nothing concrete to
+   confirm, `execute_action` should never have been scheduled, and it
+   fails loudly rather than guessing.
+3. **A hard, protocol-level gate for every action, not an LLM's
+   inference.** `propose_action` flags every proposal with
    `requires_approval: true`; `orchestration/workflow.py`'s step loop
    turns that into `status: "needs_approval"`, which
    `a2a_server/executor.py` maps onto the real A2A `TASK_STATE_
@@ -455,13 +450,13 @@ independently, for every action — and a third time, specifically for
    structured `confirm_pending_action: {"id": "..."}` field — not a plain
    "yes". `executor.py` resolves that id deterministically against this
    task's own previously published `pending_action` artifact (real,
-   persisted across turns in `a2a-sdk`'s `InMemoryTaskStore` — verified
-   directly against the installed SDK, not assumed from the spec — so no
-   LLM ever reconstructs the action/job/parameters from chat text for
-   this one action). This resolved `confirmed_action` bypasses the LLM
+   kept across turns by the API's task store — in memory, or on disk when
+   `task_store_root` is set — so no
+   LLM ever reconstructs the action/job/parameters from chat text). This
+   resolved `confirmed_action` bypasses the LLM
    planner entirely (`orchestration/activities.py`'s `plan_task` builds a
    one-step plan directly) and sets a `StepContext.confirmed` flag that
-   `execute_action.py` checks for `trigger_build` specifically — a flag
+   `execute_action.py` checks for every action — a flag
    the planner's own JSON output structurally cannot set, since it only
    ever populates a step's `params` (a plain `dict`), never a sibling
    field on the step itself (`common/models/plan.py`'s `Step` schema has
@@ -500,31 +495,16 @@ plugin's own `readOnlyHint`/`destructiveHint` annotations: 15 read-only
 there is genuinely no stop/cancel tool. Separately, opencode's own docs
 were checked directly and confirm its MCP tool-naming rule verbatim:
 *"MCP server tools are registered with server name as prefix... use
-`mymcpservername_*`"* — so this codebase's `"jenkins_*": false` deny
-pattern for `ari-jenkins-read` matches real behavior, not just an analogy
-to GitHub's `github_*` (the previous state of this doc's caveat).
+`mymcpservername_*`"* — which is why the deny list names each tool
+exactly rather than relying on a prefix match.
 
-**Not yet verified live**, because it requires an actual `opencode run`
-against a real Jenkins with real credentials, which the same session
-could not complete (Claude Code's own safety classifier blocks writing
-real secrets into `opencode.json`, and running it manually was deferred
-by the operator): that the `jenkins_*` deny pattern is actually *applied*
-at runtime by this specific opencode version against this specific MCP
-server (docs confirm the rule; never observed in a live log), and
-correctness of any capability's actual output (`resolve_target`/
-`inspect`/`diagnose`/`propose_action`) against a real job. `execute_action`
-has had zero real runs of any kind. See `scripts/jenkins_agent_local_test.py`
-for the harness built to close this gap — it deliberately only wires the
-four read-only capabilities.
-
-Also not yet verified live: the `trigger_build` confirm gate's actual
-pause → follow-up `message/send` → resume round-trip through a real
-deployed API process and Temporal worker. Every piece of it was verified
-directly against source (the installed `a2a-sdk`'s artifact-continuation
-behavior, `Step`'s pydantic schema dropping unknown fields) rather than
-assumed, and the full unit-test suite covers every new code path in
-isolation — but no real HTTP round-trip against a live instance has
-exercised it end to end yet.
+The gate was then exercised end to end through a deployed API process
+and Temporal worker: `trigger_build` ran a build to SUCCESS and
+`stop_build` aborted a running build, each only after a structured
+`confirm_pending_action`, including against a job inside a nested
+folder; a free-text "yes, go ahead" executed nothing in any run. See
+`scripts/jenkins_agent_local_test.py` for the local harness, which
+deliberately only wires the four read-only capabilities.
 
 ## 5c. The same gate, for the on-call agent's pull requests
 
@@ -772,10 +752,11 @@ tracing below, not a guess).
 
 **Still open, Jenkins agent** (see §5b for what *is* verified):
 
-- **No jenkins_agent capability has completed a real end-to-end run** —
-  everything verified so far is at the raw MCP-protocol/plugin level, not
-  through an actual `opencode run`. `execute_action` in particular has
-  never run at all, against anything.
+- **The 30-minute proposal window** (`_MAX_PROPOSAL_AGE_SECONDS` in
+  `jenkins_agent/capabilities/execute_action.py`) is shorter than the
+  10800s approval window UIE now uses, so a confirmation that arrives
+  inside UIE's window can still be refused as stale. Which of the two
+  moves is not decided.
 - **`JenkinsConfig.allow_mutations`** (`jenkins_agent/schemas.py`) is
   design intent only — nothing in code enforces it today. The only real
   enforcement is the two-layer gate in §5b (opencode's own tool
