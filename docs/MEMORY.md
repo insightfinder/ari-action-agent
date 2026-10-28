@@ -5496,9 +5496,18 @@ There is no wildcard DNS: each host needs its own Cloudflare record.
 Requests to the ELB IP with the host pinned (`curl --resolve`): agent card
 200, trusted Let's Encrypt `insightfinder.com` certificate (Traefik default),
 JSON-RPC without a key 401, with the key 200.
-**Not verified:** the DNS record. Cloudflare's authoritative servers still had
-no record for the host at that time, so normal name lookup fails.
-`agentPublicUrl` still advertises the in-cluster Service.
+DNS: the user added a DNS-only CNAME `test-ari-k8s-agent` -> the Traefik ELB
+in Cloudflare. Cloudflare and Google DNS-over-HTTPS return it, and an HTTPS
+request to the IP that DoH returned gives agent card 200. Plain `dig`, even
+`@simon.ns.cloudflare.com`, returned nothing from the developer's network:
+port-53 queries there are intercepted and answered by a local resolver that
+had cached the earlier NXDOMAIN (the zone's negative TTL is 1800s). Use DoH,
+not `dig`, to check a new record from that network.
+Through the URL (DoH-resolved, 10:40 CST): agent card 200, no key 401, with
+key 200, plain HTTP 200 (no redirect to HTTPS), and a real `message:send`
+read-only health check of namespace `insightfinder` COMPLETED in 19s with a
+namespace-scoped `health_report`.
+**Not verified:** `agentPublicUrl` still advertises the in-cluster Service.
 
 **Known gap, found while merging test (not fixed, not ours):** an automated
 security review flagged the Jenkins kind's
