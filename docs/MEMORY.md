@@ -5474,3 +5474,40 @@ checks a proposal's age. `execute_action` does, at 30 minutes
 (`_MAX_PROPOSAL_AGE_SECONDS`), which is shorter than the 10800s approval
 window UIE now uses; the doc now states the exception, and the mismatch
 is still open.
+
+## 2026-10-28 - Public ingress for the k8s agent on test
+
+`test-fluxcd/apps/insightfinder/ari-k8s/release.yaml` now sets
+`ariK8sAgent.api.ingress` to enabled with host
+`test-ari-k8s-agent.insightfinder.com` and TLS on (no secretName, Traefik's
+default certificate), the same shape as ari-oncall's
+`test-ari-oncall-agent.insightfinder.com`. Asked for so the k8s agent is
+reachable like the other agents. This reverses the earlier "in-cluster only,
+use port-forward" choice: the worker still holds cluster-wide patch rights, so
+the public API is guarded only by `agentApiKeys` (the test key committed in
+the release) plus propose -> confirm -> apply.
+
+**Verified:** pinned chart 0.3.9 (charts `f564832`) rendered with the new
+values gives Ingress `ari-k8s-api-ingress` -> Service `ari-k8s-api:80`.
+There is no wildcard DNS: each host needs its own Cloudflare record.
+
+**Live**, 2026-10-28, after test-fluxcd `410a4d9`: HelmRelease `ari-k8s` Ready
+(release v12, chart 0.3.9), Ingress on the Traefik ELB with ports 80/443.
+Requests to the ELB IP with the host pinned (`curl --resolve`): agent card
+200, trusted Let's Encrypt `insightfinder.com` certificate (Traefik default),
+JSON-RPC without a key 401, with the key 200.
+**Not verified:** the DNS record. Cloudflare's authoritative servers still had
+no record for the host at that time, so normal name lookup fails.
+`agentPublicUrl` still advertises the in-cluster Service.
+
+**Known gap, found while merging test (not fixed, not ours):** an automated
+security review flagged the Jenkins kind's
+`src/jenkins_agent/capabilities/execute_action.py` (from `3c2d245`). The
+confirmed action is read from the step's `ctx.params`, not looked up from the
+stored pending_action by its confirmed id, so the gate is not bound to what
+the human approved. A `params["instruction"]` override replaces the
+built-in "trigger exactly this build" prompt, and the staleness check is
+skipped when `created_at` is missing. Suggested fix: pass the server-side
+pending_action into the step, reject any mismatch with the planner's params,
+drop the instruction override, and make `created_at` required. Read from the
+code only; not reproduced.
