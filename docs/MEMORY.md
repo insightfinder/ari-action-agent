@@ -5474,3 +5474,112 @@ checks a proposal's age. `execute_action` does, at 30 minutes
 (`_MAX_PROPOSAL_AGE_SECONDS`), which is shorter than the 10800s approval
 window UIE now uses; the doc now states the exception, and the mismatch
 is still open.
+
+## 2026-10-29 - Live check of mcp-service PR #73 (II-25426): sub-agent spans join the caller's trace
+
+mcp-service PR #73 (`1f6e095e`, still open against `main`) makes
+`A2AAgent` add the `trace` block (DEVELOPER_GUIDE §5) to a remote agent's
+config DataPart. It is on mcp-service `test` (merge `78a6ddf1`) and
+deployed there: both `insightfinder-mcp-service` pods run
+`mcp-service:2610290130-test`, and the four changed source files match
+`origin/test` byte for byte (md5 checked inside the pods). Unlike
+`scripts/trace_e2e.py`, which plays mcp-service, this run drove the
+deployed mcp-service itself.
+
+**How it was driven.** UIE chat (logged in as bo) offers only
+insightfinder/downdetector/weather, so ARI agents cannot be reached from
+it. bo's UIE handshake (Redis) was cloned into a throwaway session, in the
+pod, keeping its trace identity (project
+`insightfinder-MCP-Azure-Foundry-gpt-5-gpt-5-LLM`, trace admin
+`wei_test`) and swapping in only the LLM (demoUser's Anthropic handshake
+LLM, with the user's approval) and the agent's `integration_keys`. Both
+sessions were deleted afterwards.
+
+- oncall, chat path (`/api/v1/stream`, `enabled_agents=[arioncall]`, repo
+  `bdulive/Hello-World`): trace `f51edc2a…`, 60 spans.
+  `chat-prompt-response` -> `agent:Coordinator Agent` ->
+  `agent:ARI On-Call Agent` -> `a2a-task:oncall` (parent = that agent span)
+  -> plan/clone/generate_change/opencode/respond -> `a2a-task-result`.
+  The trace server sent the trace to the project and its `-Prompt` twin.
+- k8s, on-call task path (`POST /api/v1/tasks` from inside the pod,
+  capability `kubernetes_operations`, agent at
+  `test-ari-k8s-agent.insightfinder.com`, callback to a 404 sink so UIE got
+  nothing): trace `5f6cffcf…`, 12 spans, `chat-prompt-response` ->
+  `agent:ARI Kubernetes Agent` -> `a2a-task:k8s` -> ... ->
+  `a2a-task-result` (completed), plus `oncall-task-result`. Sent to the
+  project.
+- Every ARI span carried the handshake's identity (`x-trace-project`,
+  `x-username`, license). No ARI span set `chat.id`, `chat.prompt` or
+  `chat.response`; no credential-shaped value.
+
+**Seen, not ours (mcp-service / trace server, not caused by PR #73):**
+- `resolve_llm` (`app/oncall/ari_oncall_agent.py`) accepts only
+  openai/anthropic, but UIE sends `azure` for Azure orgs (bo's org is
+  Azure gpt-5), so no ARI agent can be called for such an org. Mapping
+  `azure` to `openai` (base_url is already passed) would fix it.
+- mcp-service logs bo's license key in plain text in two lines:
+  `Tracing: handshake server config unavailable (... license_key=...)` and
+  `Saved handshake config: handshake:bo:<license>:...`.
+- On the task path the prompt is on `chat-prompt-response` and the
+  response on `oncall-task-result`, so the trace server finds no prompt
+  pair ("Empty prompt / response pairs"); on the chat path it does.
+- The trace server queues a trace 60 s (`traceDelayInMillis`) after its
+  first span. ARI spans arrive while the run is still going, so for the
+  85 s oncall run the first pass had no root yet ("Empty pairs"); spans
+  arriving later queued it again and the second pass sent trace and prompt.
+- The oncall agent reported its analysis-only RCA as `failed`
+  (`generate_change`: working tree unmodified); the RCA text still reached
+  the user.
+
+**Not verified:** the ARI Action Agent (`ari-action`, ari-agent-demo image)
+has no `TRACE_SERVER_URL`, so it was not run. The trace was not opened in
+the UIE trace view.
+
+**Same day, end to end from the UI (no handshake clone, no direct
+`/tasks` call):** bo switched the insightfinder org's current LLM to
+Anthropic claude-haiku-4-5 (Global System Settings → LLM Model
+Management), which also gave the org handshake bo's own trace identity
+(project `insightfinder-MCP-Anthropic-claude-haiku-4-5-claude-haiku-4-5-LLM`,
+admin `bo`). On system TST: the Kubernetes card, Detected incidents on
+(this also sets `generalSupportEnabled`), and an `incidentlist` label
+`OOMKilled` on log project `test-log`. A Deployment
+`ari-k8s-e2e/e2e-oom-10290517` (48Mi limit, allocates 96MB) went into
+CrashLoopBackOff; one synthetic log line for it was posted at 05:18:15Z.
+- IC created the incident at once, held it (no alert verdict at 600 s,
+  then RCA wait) and dispatched at 06:01 (`POST /api/v1/tasks` 202).
+- The coordinator called `arik8s` three times plus the IT Infrastructure
+  Agent: health check; proposal "Set limits.memory 256Mi on
+  ari-k8s-e2e/e2e-oom-10290517 (app)" (`needs_approval` delivered to IC
+  06:03); after approval (via mcp-service `/tasks/{id}/approve`, with the
+  user's go-ahead, since test cannot send the approval mail) the change
+  applied, the new pod ran without restarts, and `completed` was
+  delivered 06:18.
+- One trace, `3b40a201c912db11de364a645801d9c6` (112 spans, one root
+  `chat-prompt-response`, no orphans). mcp-service made two
+  `agent:ARI Kubernetes Agent` spans (06:01:51 health, 06:02:46 proposal);
+  each has its `a2a-task:k8s` child. The post-approval resume
+  (06:17:09: `apply_approved_change` 55 s, `respond`, `a2a-task-result`
+  completed: "rolled out cleanly ... stable for 45 seconds") is a third
+  `a2a-task:k8s` under the proposal's agent span, which had ended at
+  06:03; mcp-service opens no span of its own for the resume. Then
+  `oncall-task-result`. All ARI spans carry the project above and
+  `x-username` bo. The trace server sent the trace to that project at
+  06:03:46, 06:18:11 and 06:19:21 (re-queued as late spans arrived), so
+  the final send includes the approval half. IC logged `SUCCESS recorded`
+  and DMed the report to bo on Slack at 06:18. The IC incident list then
+  showed Investigation and Action both "Success" (checked by the user),
+  so approving through mcp-service instead of the mail link leaves IC
+  consistent.
+- Seen, not ours: the IT Infrastructure Agent's tool spans
+  (`agent.task`, `*.tool`, `mcp_tool_*`) carry no trace identity; the
+  "Empty prompt / response pairs" warning again; and the trace server
+  (`traceserver-llm-labs`) logs the whole IC payload at INFO, license key
+  included.
+- Test email: InfrastructureCore `EmailNative.isQualifiedEnv` accepts only
+  PROD/STAGING/onPrem, so with `deploymentVersion: "TEST"` every mail
+  (approval links included) is refused, whatever the SMTP settings. Read
+  from code and values only; the log line was not found live this time.
+- Cleaned up: namespace `ari-k8s-e2e` deleted, the `OOMKilled` label
+  removed from `test-log` (list empty again, as before). Left for the
+  user: TST's Detected/Predicted incidents switches, and the org LLM
+  (now Anthropic; was Azure gpt-5 owned by wei_test).
