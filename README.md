@@ -26,8 +26,8 @@ wire-compatible — see `docs/MEMORY.md` for why that changed.)
 It is **not** part of the `multi-agent-ai` service mesh. It has no shared
 database, no shared config service, and no dependency on `shared/`. Every
 request is fully self-contained (its own LLM key/model, its own repo
-credentials) and it is meant to be built, deployed, and scaled independently
-(EC2, a Kubernetes Job/Deployment, etc.).
+credentials) and it is meant to be built, deployed, and scaled independently.
+All agents are deployed only on Kubernetes.
 
 ## Agent kinds
 
@@ -39,6 +39,7 @@ The same framework hosts several independently deployed *agent kinds*
 |---|---|---|
 | `oncall` | Everything described above: code analysis, fix, PR after approval | `ari-oncall-agent-worker` (`Dockerfile.oncall`) |
 | `jenkins` | Reads and diagnoses a Jenkins job or build; triggers or stops a build, each proposed first and run only after a person approves — see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §9 | `ari-jenkins-agent-worker` (`Dockerfile.jenkins`) |
+| `k8s` | Pod-level health of the cluster it runs in; Deployment scaling and CPU/memory changes, each proposed first and applied only after a person approves — see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §10 | `ari-k8s-agent-worker` (`Dockerfile.k8s`) |
 
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how kinds are added.
 
@@ -87,23 +88,25 @@ real repos, real API keys, and the real A2A SDK, vs. what's still unverified).
 ## Layout
 
 ```
-on-call-ari-agent/
-├── configs/                # declarative capability/tool registries (extend here, not in code)
+ari-action-agent/
+├── configs/<kind>/          # declarative capability/tool registries per agent kind (extend here, not in code)
 ├── deploy/k8s/              # Kubernetes manifests (api + worker deployments)
+├── deploy/k8s-agent-e2e/    # temporary test-cluster deployment + fixtures for the k8s kind
 ├── docs/
-│   ├── DEVELOPER_GUIDE.md   # how to call this agent (A2A), with a sample client
-│   ├── design.md            # full design doc
+│   ├── ARCHITECTURE.md      # repo map, and how to add an agent kind
+│   ├── DEVELOPER_GUIDE.md   # how to call the agents (A2A), with sample clients
+│   ├── design.md            # design reference
 │   └── MEMORY.md            # decision/verification history
-├── scripts/                 # local run helpers
-├── src/ari_agent/
-│   ├── a2a_server/           # AgentExecutor bridging A2A's Task lifecycle to our Temporal workflow, Agent Card, auth
-│   ├── api/                  # internal config models (validated out of a request's DataPart)
-│   ├── orchestration/        # Temporal client, worker, workflow, activities
-│   ├── planning/              # LLM-driven dynamic step planner
-│   ├── capabilities/          # one module per pipeline step (clone, analyze, change, verify, publish, respond)
-│   ├── tools/                 # concrete actions capabilities call (git, repo cache, opencode, sandbox)
-│   ├── llm/                   # per-request LLM client factory (never a global/shared key)
-│   └── models/                 # Plan/Step schema shared by planner + executor
+├── scripts/                 # live scenario scripts and local helpers
+├── src/
+│   ├── common/              # agent-kind-agnostic engine: A2A server, Temporal workflow/activities, planner, respond
+│   ├── ari_oncall_agent/    # the oncall kind's capabilities, tools and metadata
+│   ├── jenkins_agent/       # the jenkins kind's capabilities, tools and metadata
+│   ├── k8s_agent/           # the k8s kind's capabilities, tools and metadata
+│   ├── chat_gateway/        # Slack/Teams/CLI chat front end
+│   ├── coordinator/         # routes chat requests to the agents
+│   ├── ari_cli/             # the `ari` CLI
+│   └── api/                 # thin entrypoints: api.main (A2A server), api.worker (Temporal worker)
 └── tests/
 ```
 
@@ -114,12 +117,12 @@ on-call-ari-agent/
   `skills/`, or mount it as a subfolder of `SKILLS_DIR`. The planner can run it on its
   own, and the change agent can use it during a code change. See
   [`docs/SKILLS.md`](docs/SKILLS.md) and `ari skills validate`.
-- **New capability**: add a module under `capabilities/`, add an entry to
-  `configs/capabilities.yaml` (module path, description, tools, retry/on_failure
+- **New capability**: add a module under `<kind package>/capabilities/`, add an entry to
+  `configs/<kind>/capabilities.yaml` (module path, description, tools, retry/on_failure
   policy). The planner picks it up automatically because it reads the catalog
   at plan time — no engine code changes.
-- **New tool**: add a module under `tools/`, add an entry to
-  `configs/tools.yaml`, reference it from whichever capability's `tools:` list
+- **New tool**: add a module under `<kind package>/tools/`, add an entry to
+  `configs/<kind>/tools.yaml`, reference it from whichever capability's `tools:` list
   needs it.
 - **New pipeline family** (e.g. a non-code-fix trigger later): the planner
   and executor are already generic over the capability catalog — a new class
@@ -139,7 +142,7 @@ cd deploy/temporal-dev && docker compose up -d && cd ../..
 # 2. This agent
 cp .env.example .env   # set TEMPORAL_HOST=localhost:7233, TEMPORAL_NAMESPACE=default,
                         # AGENT_API_KEYS, OPENCODE_BIN (path to an installed opencode binary)
-pip install -e .
+pip install -e .        # the k8s kind's worker: pip install -e ".[k8s]"
 scripts/run_worker.sh  # Temporal worker (executes capabilities)
 scripts/run_api.sh     # FastAPI app (accepts /v1/chat and /v1/tasks)
 ```
@@ -162,8 +165,12 @@ preference here — 11 modules need `a2a`/`fcntl` and cannot even be *collected*
 on Windows, so run them in the worker image:
 
 ```bash
-docker run --rm -v "$PWD:/work" -w /work insightfinderinc/ari-oncall-agent-worker:test   sh -lc 'pip install -q pytest pytest-asyncio; PYTHONPATH=/work/src python -m pytest tests/ -q'
+docker run --rm -v "$PWD:/work" -w /work insightfinderinc/ari-oncall-agent-worker:test   sh -lc 'pip install -q pytest pytest-asyncio "kubernetes>=37,<38"; PYTHONPATH=/work/src python -m pytest tests/ -q'
 ```
+
+Without the `kubernetes` package the k8s kind's tests (`tests/test_k8s_*.py`)
+are skipped, not failed, so check the summary's skip count; `pip install -e ".[dev]"`
+includes it.
 
 **A green suite is not enough on its own.** Mocks always return something, so
 they cannot produce the three conditions that have actually broken this agent
@@ -225,6 +232,15 @@ Two things it assumes, both learned the hard way (`docs/MEMORY.md`): assert on
 that text is an LLM writing for a human and is paraphrased differently every
 run. And each confirm scenario pauses its own task, because a confirm (valid
 or bogus) moves a task to a terminal state that A2A cannot return from.
+
+The `k8s` kind has its own equivalent, `scripts/k8s_agent_live_test.py`,
+run against the fixtures in `deploy/k8s-agent-e2e/` on a test cluster
+(see that directory's README). Without `--allow-writes` it only reads and
+cancels its proposals; with it, it approves changes to the fixture
+Deployments. Its settings (`LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`,
+`ARI_BASE_URL`, `ARI_API_KEY`) come from the environment or from a
+git-ignored `scripts/.env`. Its unit and workflow tests (`tests/test_k8s_*.py`) run
+against a fake API server and need no cluster.
 
 Neither layer sees everything. Both are per-request: they assert on what one
 call returns. Anything that only shows up by accumulating inside a

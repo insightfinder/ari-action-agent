@@ -23,6 +23,8 @@ jobs:
             image: docker.io/insightfinderinc/ari-agent-api
           - dockerfile: Dockerfile.oncall
             image: docker.io/insightfinderinc/ari-oncall-agent-worker
+          - dockerfile: Dockerfile.k8s
+            image: docker.io/insightfinderinc/ari-k8s-agent-worker
           - dockerfile: Dockerfile.chat-gateway
             image: docker.io/insightfinderinc/ari-chat-gateway
           - dockerfile: Dockerfile.jenkins
