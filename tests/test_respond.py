@@ -165,6 +165,14 @@ class TestExecutionFact:
         assert "NOTHING WAS EXECUTED" not in fact
         assert "ran in this request" in fact
 
+    def test_an_interrupted_step_is_neither_executed_nor_not(self):
+        # The workflow records this when the approved step raised past its retries: an attempt may
+        # have written before the worker was lost.
+        results = {"execute_action": {"status": "interrupted", "failure": "activity timed out"}}
+        fact = respond.execution_fact(_meta("execute_action"), results)
+        assert "NOTHING WAS EXECUTED" not in fact
+        assert "may already have changed" in fact and "activity timed out" in fact
+
     def test_a_failed_step_is_not_an_execution(self):
         results = {"execute_action": {"status": "failed", "failure": "refused"}}
         assert "NOTHING WAS EXECUTED" in respond.execution_fact(_meta("execute_action"), results)
