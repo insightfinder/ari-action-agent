@@ -38,21 +38,8 @@ The same framework hosts several independently deployed *agent kinds*
 | Kind | What it does | Worker image |
 |---|---|---|
 | `oncall` | Everything described above: code analysis, fix, PR after approval | `ari-oncall-agent-worker` (`Dockerfile.oncall`) |
-| `k8s` | Pod-level health of the cluster it runs in; Deployment scaling and CPU/memory changes, each proposed first and applied only after a person approves — see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §10 | `ari-k8s-agent-worker` (`Dockerfile.k8s`) |
-
-The Jenkins kind is deprecated. `docs/ARCHITECTURE.md` explains how kinds
-are added.
-
-## Agent kinds
-
-The same framework hosts several independently deployed *agent kinds*
-(`AGENT_KIND`), each with its own Agent Card, registries under
-`configs/<kind>/` and worker image:
-
-| Kind | What it does | Worker image |
-|---|---|---|
-| `oncall` | Everything described above: code analysis, fix, PR after approval | `ari-oncall-agent-worker` (`Dockerfile.oncall`) |
 | `jenkins` | Reads and diagnoses a Jenkins job or build; triggers or stops a build, each proposed first and run only after a person approves — see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §9 | `ari-jenkins-agent-worker` (`Dockerfile.jenkins`) |
+| `k8s` | Pod-level health of the cluster it runs in; Deployment scaling and CPU/memory changes, each proposed first and applied only after a person approves — see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §10 | `ari-k8s-agent-worker` (`Dockerfile.k8s`) |
 
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how kinds are added.
 
@@ -103,6 +90,7 @@ real repos, real API keys, and the real A2A SDK, vs. what's still unverified).
 ```
 ari-action-agent/
 ├── configs/<kind>/          # declarative capability/tool registries per agent kind (extend here, not in code)
+├── deploy/k8s/              # Kubernetes manifests (api + worker deployments)
 ├── deploy/k8s-agent-e2e/    # temporary test-cluster deployment + fixtures for the k8s kind
 ├── docs/
 │   ├── ARCHITECTURE.md      # repo map, and how to add an agent kind
@@ -113,7 +101,11 @@ ari-action-agent/
 ├── src/
 │   ├── common/              # agent-kind-agnostic engine: A2A server, Temporal workflow/activities, planner, respond
 │   ├── ari_oncall_agent/    # the oncall kind's capabilities, tools and metadata
+│   ├── jenkins_agent/       # the jenkins kind's capabilities, tools and metadata
 │   ├── k8s_agent/           # the k8s kind's capabilities, tools and metadata
+│   ├── chat_gateway/        # Slack/Teams/CLI chat front end
+│   ├── coordinator/         # routes chat requests to the agents
+│   ├── ari_cli/             # the `ari` CLI
 │   └── api/                 # thin entrypoints: api.main (A2A server), api.worker (Temporal worker)
 └── tests/
 ```
