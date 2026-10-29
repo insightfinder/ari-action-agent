@@ -5583,3 +5583,75 @@ CrashLoopBackOff; one synthetic log line for it was posted at 05:18:15Z.
   removed from `test-log` (list empty again, as before). Left for the
   user: TST's Detected/Predicted incidents switches, and the org LLM
   (now Anthropic; was Azure gpt-5 owned by wei_test).
+
+**Watched on stg the same afternoon (read-only; stg system watching test
+pods):** an OOMKilled `insightfinder-globalviewawworker` incident (project
+`test-events-new`, org insightfinder, user mustafa, model
+claude-sonnet-4-6) was held for RCA from 08:42 to the 1800 s bound and
+dispatched 09:21:16 (stg mcp-service `2610282100-staging`, which has
+PR #73). The coordinator called `arik8s` at
+`test-ari-k8s-agent.insightfinder.com` twice: health (completed, 21 s)
+and a proposal "limits.memory 3500Mi -> 6Gi on
+insightfinder/insightfinder-globalviewawworker", `needs_approval`
+delivered 09:24. The user then authorized one approval on stg (stg cannot
+email): sent 09:29 to stg mcp-service `/tasks/{id}/approve`. The agent
+applied it (`apply_approved_change` 146 s, rollout stable 45 s,
+`succeeded`), `completed` delivered 09:32; the resume's `a2a-task:k8s`
+(test Jaeger) hangs under the 09:23:22 stg agent span, and
+`oncall-task-result` under the stg root. The Deployment is owned by the
+`insightfinder` HelmRelease (no drift detection), so the 6Gi limit lasts
+only until the next Helm upgrade; the agent's report says so. Persisting
+it in test-fluxcd was not done.
+- Trace `4061ec9056fb3a20ec7738a09e9413ba` is split across clusters:
+  51 mcp-service spans in stg Jaeger (`traceserver/jaeger-query`), 17
+  ARI k8s spans in test Jaeger (`monitoring/jaeger-query`). Joined by
+  span id, it has one root `chat-prompt-response`; both
+  `a2a-task:k8s` spans have the stg `agent:ARI Kubernetes Agent` span as
+  parent, and every ARI span carries
+  `insightfinder-MCP-Anthropic-claude-sonnet-4-6-claude-sonnet-4-6-LLM` /
+  `x-username` mustafa. So PR #73 propagation works across clusters.
+- Where it ends up: stg's trace server sent its half to that project on
+  stg. Test's trace server tried to send the ARI half to test's IC with
+  the stg identity and got 403, so the ARI spans are only in test
+  Jaeger, not in stg's UIE trace view.
+- Not ours: stg traces have orphan spans (mcp-service LangGraph
+  `agent.task` / `tools.task` / `*.tool` under parents never exported;
+  also in the 06:41 and 07:21 stg traces, not in test's `3b40a201…`), and
+  stg's trace server logs "InsightFinder settings are missing" for
+  mcp-service spans without identity. ari-oncall and ari-action on stg
+  have no tracing at all: ari-action-agent `staging` has no
+  `src/common/tracing.py` and their secrets set no `TRACE_SERVER_URL`.
+
+**Follow-ups for the k8s kind, recorded at the user's request (not
+started; tracing comes first):**
+1. Diagnosis: for an OOMKilled pod, compare against the limits of the
+   pod's own ReplicaSet, not the Deployment's current template. On stg's
+   09:21 run the OOM was in ReplicaSet `fdcb87b96` (rev 858, 500Mi,
+   08:09-08:35); Helm had already restored 3500Mi at 08:35, yet the agent
+   proposed 3500Mi -> 6Gi as if 3500Mi were too small. Inferred from
+   ReplicaSet specs and managedFields; who set 500Mi was not checked.
+2. Audit logging: the worker logs only `execute_step
+   capability=apply_approved_change request_id=...`. A cluster change
+   should log one structured line with approver, task/approval id,
+   object (kind/namespace/name/container), field, before -> after,
+   outcome (succeeded / new_pods_failing / reverted ...) and duration.
+   Today that detail is only in the A2A result text and the Jaeger span.
+
+**Cross-environment tracing: open decision (2026-10-29).** The user wants
+an agent's spans to reach the caller's UIE whichever cluster the agent
+runs in. Neither stg nor test exposes trace-server OTLP ingest publicly
+(only the Jaeger query UIs have ingresses). Two designs were written up
+in English for the mcp-service engineers to choose from:
+1. The caller names its environment's public trace-server address in the
+   `trace` block (`trace_endpoint`). The agent keeps one exporter per
+   destination behind a host allowlist. Needs a public TLS gRPC ingress
+   per calling environment; mcp-service change is small.
+2. The agent returns its spans as an A2A result artifact (a serialized
+   OTLP `ExportTraceServiceRequest`), and mcp-service forwards them to
+   its own trace server. No infrastructure. mcp-service must keep the
+   artifact out of `render_task` / `interrupt_payload` /
+   `task_actions`, forward in `A2AAgent._conclude` and in the task
+   path's A2A resume (about 100-150 lines). Recommended.
+Either way, same-environment tracing on stg comes first: ari-action-agent
+`staging` has no tracing code, and stg's ari-oncall / ari-action secrets
+set no `TRACE_SERVER_URL`. Nothing implemented yet.
