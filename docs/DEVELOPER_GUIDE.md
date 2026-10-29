@@ -4,16 +4,18 @@ Each agent kind on this codebase is its own A2A server deployment with
 its own base URL and Agent Card: the **on-call agent** (§1–§8 below —
 clones a repo, fixes it, opens a PR), the **Kubernetes agent** (§10 —
 checks Pod health, and proposes and, once approved, applies scaling and
-CPU/memory changes), and the **Jenkins agent** (§9 — deprecated: no longer
-maintained or deployed, kept for reference). All are genuine
+CPU/memory changes), and the **Jenkins agent** (§9 — reads/diagnoses a
+Jenkins job or build, proposes and, once confirmed, executes a change).
+All are genuine
 [A2A (Agent2Agent) protocol](https://a2a-protocol.org) servers, built on
 the official [`a2a-sdk`](https://pypi.org/project/a2a-sdk/) (a Linux
 Foundation project), serving both the **JSON-RPC** and **REST/HTTP+JSON**
 transports the spec defines (gRPC is a deliberate, separate follow-up —
 see `docs/design.md` §2), and everything about §1–§8 (discovery, auth,
 `message/send`, the three response patterns, cancellation, errors)
-applies identically to the Jenkins agent — only the Agent Card content
-and the config `DataPart` shape differ, which §9 covers.
+applies identically to the Jenkins and Kubernetes agents — only the
+Agent Card content and the config `DataPart` shape differ, which §9 and
+§10 cover.
 
 Everything below for the on-call agent is verified against a real running
 instance, not just read off the spec — exact request/response bodies are
