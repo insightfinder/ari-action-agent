@@ -1,0 +1,73 @@
+# Tool registry for the `k8s` agent kind. Every read returns whitelisted
+# views (src/k8s_agent/tools/views.py), never raw objects.
+
+tools:
+  llm_complete:
+    module: common.llm.client
+    function: complete
+
+  # ---- reads
+  list_deployments:
+    module: k8s_agent.tools.read
+    function: list_deployments
+
+  list_deployment_views:
+    module: k8s_agent.tools.read
+    function: list_deployment_views
+
+  get_deployment:
+    module: k8s_agent.tools.read
+    function: get_deployment
+
+  list_pods:
+    module: k8s_agent.tools.read
+    function: list_pods
+
+  list_events:
+    module: k8s_agent.tools.read
+    function: list_events
+
+  get_pod_log:
+    module: k8s_agent.tools.read
+    function: get_pod_log
+
+  get_pod_metrics:
+    module: k8s_agent.tools.read
+    function: get_pod_metrics
+
+  find_autoscaler:
+    module: k8s_agent.tools.read
+    function: find_autoscaler
+
+  list_nodes:
+    module: k8s_agent.tools.read
+    function: list_nodes
+
+  get_ca_status:
+    module: k8s_agent.tools.read
+    function: get_ca_status
+
+  list_pdbs:
+    module: k8s_agent.tools.read
+    function: list_pdbs
+
+  get_pvcs:
+    module: k8s_agent.tools.read
+    function: get_pvcs
+
+  get_flux_chain:
+    module: k8s_agent.tools.read
+    function: get_flux_chain
+
+  wait_rollout:
+    module: k8s_agent.tools.rollout
+    function: wait_rollout
+
+  # ---- writes
+  dry_run_patch:        # always dryRun=All — cannot change the cluster
+    module: k8s_agent.tools.write
+    function: dry_run_patch
+
+  patch_workload:       # the real write; listed only on apply_approved_change
+    module: k8s_agent.tools.write
+    function: patch_workload
