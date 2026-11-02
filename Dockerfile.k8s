@@ -1,0 +1,39 @@
+# Worker image for the `k8s` agent kind (Kubernetes health & scaling).
+#
+# Deliberately minimal: no git, no build toolchain, no Node and no
+# opencode. Every cluster operation is a typed API call through the
+# official `kubernetes` Python client with the pod's own ServiceAccount
+# (see src/k8s_agent/tools/client.py), so
+# nothing in this image needs a shell at runtime — which is also why the
+# cluster token must never share a pod with the oncall worker, whose
+# opencode `ari-verify` agent runs arbitrary build commands.
+#
+# Runs as a non-root user; the only writable path it needs is
+# SANDBOX_ROOT (an emptyDir in the deployment manifests).
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY src ./src
+COPY configs ./configs
+
+RUN pip install --no-cache-dir ".[k8s]" \
+    && useradd --uid 10001 --create-home --shell /usr/sbin/nologin agent
+
+ENV PYTHONUNBUFFERED=1
+ENV AGENT_KIND=k8s
+ENV SANDBOX_ROOT=/tmp/ari-agent-sandbox
+# Agent Skills run scripts through the oncall kind's run_skill; this kind has
+# no such step and its worker holds cluster-wide patch rights. Its planner is
+# not offered any (k8s_agent/meta.py: planner_skills=False); this keeps the
+# skill loader itself off as well.
+ENV SKILLS_ENABLED=false
+
+USER 10001
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "-m", "api.worker"]

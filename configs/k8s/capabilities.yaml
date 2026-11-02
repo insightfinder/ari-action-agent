@@ -1,0 +1,94 @@
+# Declarative capability registry for the `k8s` agent kind.
+#
+# The `tools` list on each entry is the structural half of the
+# approve-before-change gate: `patch_workload` (the only real write)
+# appears on exactly one capability, so no other can reach it whatever its
+# prompt says. `propose_change` gets `dry_run_patch`, which is always a
+# server-side dry run. `apply_approved_change`'s own code is the other half:
+# it refuses to run without a confirmed proposal (ctx.confirmed).
+
+capabilities:
+  find_workload:
+    module: k8s_agent.capabilities.find_workload
+    description: >
+      Resolves which Deployment the request is about (or that it is about a
+      whole namespace or the whole cluster). The answer must exist in the
+      live cluster; ambiguous matches come back as candidates instead of a
+      guess. Read-only. Almost always the first step. Optional param:
+      `namespace`.
+    tools: [list_deployments, llm_complete]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5
+    timeout_seconds: 180
+
+  check_health:
+    module: k8s_agent.capabilities.check_health
+    description: >
+      Pod-level health for the resolved Deployment, namespace or cluster:
+      pending/unschedulable pods, crash loops with the previous container's
+      termination reason (OOMKilled vs probe failure), image pull failures,
+      restarts, warning events, usage near limits, replicas unavailable.
+      Deterministic rules; missing data is reported as a gap. Read-only.
+    tools: [get_deployment, list_deployment_views, list_pods, list_events, get_pod_metrics, get_pod_log]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5
+    timeout_seconds: 300
+
+  propose_change:
+    module: k8s_agent.capabilities.propose_change
+    description: >
+      For any requested change — Deployment replicas, a KEDA/HPA min or
+      max, or CPU/memory requests/limits. Works out the exact change,
+      checks it (autoscaler rules, replica floor of 1, node-capacity cap,
+      capacity and Cluster Autoscaler outlook, pre-flight risks), dry-runs
+      it against the API server, and pauses for a person's approval. Never
+      changes the cluster. Refuses (with the reason) anything not explicit
+      enough or not allowed.
+    tools:
+      - llm_complete
+      - get_deployment
+      - find_autoscaler
+      - list_nodes
+      - list_pods
+      - get_ca_status
+      - list_pdbs
+      - get_pvcs
+      - get_flux_chain
+      - dry_run_patch
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5
+    timeout_seconds: 300
+
+  apply_approved_change:
+    module: k8s_agent.capabilities.apply_approved_change
+    description: >
+      Applies a change a person approved, and only that: refuses without a
+      confirmed proposal, re-checks that the cluster has not changed since
+      the proposal, writes at most once, then verifies the outcome from
+      cluster state (rollout progress, failing new pods, pods that cannot be
+      scheduled and why). Never planned directly — reachable only through
+      the approval of a propose_change proposal.
+    tools: [get_deployment, find_autoscaler, patch_workload, wait_rollout, get_flux_chain]
+    # A second attempt (the worker died, or a read failed, mid-step) finds the
+    # approved values already in place and verifies instead of writing again.
+    retry:
+      max_attempts: 2
+      backoff_seconds: 10
+    timeout_seconds: 900
+
+  # `internal: true` — never chosen by the planner. Shared with every
+  # agent kind; only agent_meta.respond_domain_note varies.
+  respond:
+    module: common.respond
+    description: >
+      Write the final human-facing response — a direct answer when no
+      cluster data was needed, or a synthesis of what was found, proposed,
+      refused or applied.
+    tools: [llm_complete]
+    internal: true
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5

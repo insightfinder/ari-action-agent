@@ -1,5 +1,6 @@
-"""Per-request LLM client factory, used only by the planner
-(`planning/planner.py`) to turn a prompt into a step plan. There is
+"""Per-request LLM client factory: ARI's own model calls — the planner
+(`common/planner.py`), the shared `respond` step, and every capability that
+calls the `llm_complete` tool (configs/<kind>/tools.yaml). There is
 deliberately no global/shared LLM key anywhere in this service — every call
 is made with the provider, model, and API key carried in *that request's*
 own `config.llm`, so a fresh SDK client is constructed per call rather than
@@ -19,11 +20,14 @@ script with no deadline of its own; this call has one.
 This is unrelated to opencode's own LLM calls (opencode manages those
 itself via the `provider.apiKey` written into its per-request
 opencode.json — see tools/opencode_cli.py); this client exists solely for
-ARI's own planning step.
+ARI's own calls.
 """
 
 import os
+import re
 
+import anthropic
+import openai
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
@@ -35,12 +39,43 @@ _TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 _MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 
 
+# A provider's error text can quote the key it was sent: OpenAI's 401 says "Incorrect API key
+# provided: sk-proj-****abcd", first and last characters intact. Masked or not, it has no business in
+# a failure reason, which reaches the `respond` step's prompt, the caller's reply and Temporal's history.
+# "api key provided: X" / "api_key=X", where X looks like a key (has a digit or a mask), not a word.
+_KEY_ECHO = re.compile(r"(?i)(api[ _-]?key\b[^:=\n]{0,30}[:=]\s*['\"]?)(?=[^\s'\",]*[0-9*])[^\s'\",]{6,}")
+_KEY_LIKE = re.compile(
+    r"\b(?:sk|pk|rk)-[A-Za-z0-9_*.\-]{4,}"  # OpenAI, Anthropic and look-alikes
+    r"|\bAIza[A-Za-z0-9_*\-]{8,}"  # Google
+    r"|\bgsk_[A-Za-z0-9_*]{8,}"  # Groq
+    r"|(?i:\bbearer\s+)[A-Za-z0-9._~+/=*\-]{8,}"
+    r"|\b[0-9a-fA-F]{32,}\b"  # Azure OpenAI and other bare hex keys
+)
+
+
+class LLMProviderError(RuntimeError):
+    """A provider's error response, worded so that it carries no part of the API key."""
+
+
+def _provider_error(provider: str, exc: openai.APIStatusError | anthropic.APIStatusError) -> LLMProviderError:
+    status = exc.status_code
+    if status == 401:
+        # The body of a rejected-key response is about the key, and nothing else in it helps.
+        return LLMProviderError(f"{provider} rejected the API key (HTTP 401)")
+    detail = _KEY_LIKE.sub("[REDACTED]", _KEY_ECHO.sub(r"\1[REDACTED]", str(exc.message)))
+    return LLMProviderError(f"{provider} returned HTTP {status}: {detail[:1000]}")
+
+
 async def complete(llm: dict, system_prompt: str, user_prompt: str) -> str:
     provider = llm["provider"].lower()
-    if provider == "openai":
-        return await _openai_complete(llm, system_prompt, user_prompt)
-    if provider == "anthropic":
-        return await _anthropic_complete(llm, system_prompt, user_prompt)
+    try:
+        if provider == "openai":
+            return await _openai_complete(llm, system_prompt, user_prompt)
+        if provider == "anthropic":
+            return await _anthropic_complete(llm, system_prompt, user_prompt)
+    except (openai.APIStatusError, anthropic.APIStatusError) as exc:
+        # `from None`: the SDK exception, message and all, must not ride along as the cause.
+        raise _provider_error(provider, exc) from None
     raise ValueError(f"Unsupported llm.provider: {provider!r}")
 
 

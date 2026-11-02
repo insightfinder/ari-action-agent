@@ -17,3 +17,5 @@ node_modules/
 logs/
 *.pid
 tmp/
+CLAUDE.local.md
+.DS_Store
