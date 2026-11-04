@@ -76,6 +76,7 @@ class AgentMeta:
     planner_skills: bool = True
     direct_capabilities: tuple[str, ...] = ()
     planner_skills: bool = True
+    prompt_redacted_fields: tuple[str, ...] = ()
 
 
 def _agent_package(agent_kind: str) -> str:

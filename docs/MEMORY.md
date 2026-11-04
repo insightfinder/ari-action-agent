@@ -5474,3 +5474,29 @@ checks a proposal's age. `execute_action` does, at 30 minutes
 (`_MAX_PROPOSAL_AGE_SECONDS`), which is shorter than the 10800s approval
 window UIE now uses; the doc now states the exception, and the mismatch
 is still open.
+
+## 2026-11-04 — Fields an agent kind must never show its own model
+
+The action agent's approval emails and Action Reports carried the action
+server's internal address, e.g. `172.31.63.118/run`. Nothing templated it
+in: the model wrote it, because `propose_action` interpolated the whole
+`pending_action` into its prompt and `respond` dumped every step result to
+JSON, and both of those carry `action_server_url`. An internal IP and port
+were reaching customer-facing mail, and the approver has no use for them.
+
+`AgentMeta.prompt_redacted_fields` names the keys this agent kind's own
+prompts must not carry, and `common/redact.py`'s `without_fields` strips
+them at any depth. `respond` applies it to the step results before the
+JSON dump; the action agent applies it to the dict `propose_action` hands
+`llm_complete`. Empty for every other kind, so nothing changes for them.
+
+Only the prompts are redacted. The `pending_action` and `action_result`
+artifacts still carry the URL: they go to MCP Service, not to a reader,
+and the field is the one piece of the proposal that says where the call
+would land. Nothing consumes it even there -- `execute_action` re-reads
+the server block from `ctx.config["action"]` rather than trusting what the
+proposal carried -- so it is informational on both sides of the line.
+
+Checked at the time that these were the only two leaks: the planner's
+prompt takes only prompt/history/options, and `resolve_target`'s catalogue
+is id/name/description.

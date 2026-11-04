@@ -32,6 +32,7 @@ import json
 
 from common.agent_meta import get_agent_meta
 from common.capabilities_base import StepContext
+from common.redact import without_fields
 
 _SYSTEM_PROMPT_TEMPLATE = """You are the final response-writing stage of an autonomous \
 {description}. Given the user's message (and, for a multi-turn conversation, \
@@ -165,7 +166,10 @@ async def run(ctx: StepContext) -> dict:
     )
 
     history_text = "\n".join(f"{m['role']}: {m['content']}" for m in ctx.history)
-    step_results = {k: v for k, v in ctx.results.items() if k != "respond"}
+    step_results = without_fields(
+        {k: v for k, v in ctx.results.items() if k != "respond"},
+        getattr(meta, "prompt_redacted_fields", ()),
+    )
     fact = execution_fact(meta, step_results)
 
     user_prompt = (
