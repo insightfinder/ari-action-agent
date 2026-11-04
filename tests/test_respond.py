@@ -231,3 +231,58 @@ class TestTheFactReachesThePrompt:
     async def test_the_system_prompt_makes_fact_lines_binding(self):
         assert 'beginning "FACT:"' in respond._SYSTEM_PROMPT_TEMPLATE
         assert "never state or imply that" in respond._SYSTEM_PROMPT_TEMPLATE
+
+
+class TestRedactedFieldsNeverReachThePrompt:
+    @pytest.mark.asyncio
+    async def test_a_declared_field_is_stripped_from_the_step_results(self, monkeypatch):
+        monkeypatch.setattr(respond, "get_agent_meta", lambda: SimpleNamespace(
+            confirm_capability="execute_action",
+            planner_description="agent that runs actions",
+            respond_domain_note="what was resolved",
+            prompt_redacted_fields=("action_server_url",),
+        ))
+        llm_complete = AsyncMock(return_value="ok")
+        ctx = _ctx(
+            prompt="roll it back",
+            results={
+                "propose_action": {
+                    "pending_action": {
+                        "id": "pa-1",
+                        "action_server_url": "https://172.31.63.118/run",
+                        "instance_name": "web-01",
+                    }
+                },
+                "execute_action": {
+                    "result": {"ran": True, "action_server_url": "https://172.31.63.118/run"}
+                },
+            },
+            params={"pipeline_status": "completed"},
+            tools={"llm_complete": llm_complete},
+        )
+
+        await respond.run(ctx)
+
+        user_prompt = llm_complete.await_args.args[2]
+        assert "172.31.63.118" not in user_prompt
+        assert "action_server_url" not in user_prompt
+        assert "web-01" in user_prompt
+
+    @pytest.mark.asyncio
+    async def test_a_kind_declaring_nothing_keeps_every_field(self, monkeypatch):
+        monkeypatch.setattr(respond, "get_agent_meta", lambda: SimpleNamespace(
+            confirm_capability=None,
+            planner_description="on-call agent",
+            respond_domain_note="what was found",
+        ))
+        llm_complete = AsyncMock(return_value="ok")
+        ctx = _ctx(
+            prompt="what happened",
+            results={"clone_repo": {"action_server_url": "https://172.31.63.118/run"}},
+            params={"pipeline_status": "completed"},
+            tools={"llm_complete": llm_complete},
+        )
+
+        await respond.run(ctx)
+
+        assert "172.31.63.118" in llm_complete.await_args.args[2]
