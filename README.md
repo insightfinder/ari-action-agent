@@ -1,4 +1,4 @@
-# ARI On-Call Agent
+# ARI Action Agent
 
 A standalone agent that receives an incident/prompt + full configuration in
 a single request, autonomously clones a repo, analyzes the problem, generates
@@ -43,7 +43,7 @@ The same framework hosts several independently deployed *agent kinds*
 
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how kinds are added.
 
-## Why it looks the way it does
+## Major features
 
 - **Temporal-only execution.** There is no "inline" fallback engine. Every
   request runs as one Temporal workflow, one A2A `Task`. Temporal (hosted
