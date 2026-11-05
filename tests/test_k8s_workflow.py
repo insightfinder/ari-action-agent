@@ -8,7 +8,6 @@ the real code. Only the LLM and the Kubernetes API are fakes.
 """
 
 import json
-import os
 import sys
 import uuid
 from pathlib import Path

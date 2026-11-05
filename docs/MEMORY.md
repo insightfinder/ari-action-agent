@@ -5474,6 +5474,83 @@ checks a proposal's age. `execute_action` does, at 30 minutes
 (`_MAX_PROPOSAL_AGE_SECONDS`), which is shorter than the 10800s approval
 window UIE now uses; the doc now states the exception, and the mismatch
 is still open.
+## 2026-10-28 - Public ingress for the k8s agent on test
+
+`test-fluxcd/apps/insightfinder/ari-k8s/release.yaml` now sets
+`ariK8sAgent.api.ingress` to enabled with host
+`test-ari-k8s-agent.insightfinder.com` and TLS on (no secretName, Traefik's
+default certificate), the same shape as ari-oncall's
+`test-ari-oncall-agent.insightfinder.com`. Asked for so the k8s agent is
+reachable like the other agents. This reverses the earlier "in-cluster only,
+use port-forward" choice: the worker still holds cluster-wide patch rights, so
+the public API is guarded only by `agentApiKeys` (the test key committed in
+the release) plus propose -> confirm -> apply.
+
+**Verified:** pinned chart 0.3.9 (charts `f564832`) rendered with the new
+values gives Ingress `ari-k8s-api-ingress` -> Service `ari-k8s-api:80`.
+There is no wildcard DNS: each host needs its own Cloudflare record.
+
+**Live**, 2026-10-28, after test-fluxcd `410a4d9`: HelmRelease `ari-k8s` Ready
+(release v12, chart 0.3.9), Ingress on the Traefik ELB with ports 80/443.
+Requests to the ELB IP with the host pinned (`curl --resolve`): agent card
+200, trusted Let's Encrypt `insightfinder.com` certificate (Traefik default),
+JSON-RPC without a key 401, with the key 200.
+DNS: the user added a DNS-only CNAME `test-ari-k8s-agent` -> the Traefik ELB
+in Cloudflare. Cloudflare and Google DNS-over-HTTPS return it, and an HTTPS
+request to the IP that DoH returned gives agent card 200. Plain `dig`, even
+`@simon.ns.cloudflare.com`, returned nothing from the developer's network:
+port-53 queries there are intercepted and answered by a local resolver that
+had cached the earlier NXDOMAIN (the zone's negative TTL is 1800s). Use DoH,
+not `dig`, to check a new record from that network.
+Through the URL (DoH-resolved, 10:40 CST): agent card 200, no key 401, with
+key 200, plain HTTP 200 (no redirect to HTTPS), and a real `message:send`
+read-only health check of namespace `insightfinder` COMPLETED in 19s with a
+namespace-scoped `health_report`.
+**Not verified:** `agentPublicUrl` still advertises the in-cluster Service.
+
+## 2026-10-29 - The k8s kind ported onto main and staging (II-25173)
+
+The k8s kind was built on `test`, and `test` carries work that `main` and
+`staging` do not (II-25278 tracing, test-only doc history), so the feature
+branch could not be opened against them as is. Branches
+`II-25173-k8s-agent-main` (from `origin/main`) and
+`II-25173-k8s-agent-staging` (from `origin/staging`) instead cherry-pick
+(`-x`) only the k8s commits: `81948c5`, `1f0071a`, `878ec38`, `b8dca6e`,
+`991405f`, `8477fb5`, `39d7988`. The entries above are those commits'
+MEMORY history, copied from `test`.
+
+What was resolved by hand:
+- The k8s kind sits beside the Jenkins kind, not in place of it. On `test`
+  the k8s commits were written while the Jenkins kind was deprecated, and
+  their doc hunks said so; on `main` the Jenkins kind is live (2026-10-23),
+  so `README.md`, `docs/ARCHITECTURE.md`, `docs/design.md` and
+  `docs/DEVELOPER_GUIDE.md` keep main's Jenkins text and add the k8s kind.
+- `AgentMeta.planner_skills` already existed on `main` (the Jenkins port
+  added it); the k8s commit's copy of the field is dropped, its comment kept.
+- `tests/test_skills_wiring.py`: main's Jenkins case and the k8s case of
+  "a kind without run_skill is not offered skills" are one parametrized test.
+- No tracing: `src/k8s_agent/schemas.py` has no `trace` field, the live
+  script sends no `trace` block, and `deploy/k8s-agent-e2e/agent.yaml` has no
+  `AGENT_NAME` line for span names. Those arrive with II-25278.
+
+What the k8s commits change in `src/common/` (every kind, oncall and
+jenkins included; see the 2026-10-16 entry above): a wrong or missing
+`x-api-key` is a 401 on REST too (`ApiKeyMiddleware`), LLM provider errors
+no longer carry key fragments (`LLMProviderError`), a confirmed step that
+Temporal stopped waiting on is recorded as `interrupted` and reported as
+unknown, and `"k8s"` is registered in `_AGENT_PACKAGES`.
+
+**Verified:** full `pytest` on each branch: 942 passed, 3 skipped, 2
+failed; `origin/main` alone gives the same 2 failures
+(`test_a2a_agent_card::test_agent_card_has_the_code_analysis_fix_skill`,
+`test_a2a_executor::test_publish_result_completed_with_pr_and_root_cause`),
+which pass when their two files run on their own (test isolation, not this
+change). The k8s code is unchanged from what ran live on `test` apart from
+the tracing lines above.
+**Not verified:** no live run from these branches, and nothing deployed to
+stg (stg is read-only from here). `poetry.lock` was already out of date with
+`pyproject.toml` on `main` (`poetry check --lock` fails there too); the
+images install with pip and do not read it, and it is left as is.
 
 ## 2026-11-04 — Fields an agent kind must never show its own model
 
