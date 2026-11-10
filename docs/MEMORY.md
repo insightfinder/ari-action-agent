@@ -5577,3 +5577,55 @@ proposal carried -- so it is informational on both sides of the line.
 Checked at the time that these were the only two leaks: the planner's
 prompt takes only prompt/history/options, and `resolve_target`'s catalogue
 is id/name/description.
+
+---
+
+## 2026-11-10 - The pull request description links back to its incident (II-25597)
+
+A pull request this agent opened said nothing about which InsightFinder
+incident caused it. MCP Service now sends the incident's link in the
+request's data part, under a top-level `incident` object beside `repo`,
+`llm` and `options` (II-25558):
+
+```
+"incident": {"link": "https://<insightfinder-host>/ui/global/systemrootcause?..."}
+```
+
+`plan_pr` appends one footer line after the existing description, separated
+by a blank line, and changes nothing else:
+
+```
+**InsightFinder incident:** [View incident and ARI report](<link>)
+```
+
+**Where it is added, and why there.** `plan_pr` is the one place that
+decides the pull request, and its `body` rides through the approval inside
+the `pending_action` artifact, so the footer is part of what a person
+approves and `publish_pr` opens it without recomputing anything. No change
+in `common/`: `_extract_config` hands the data part over as a plain dict,
+so `ctx.config["incident"]` was already reachable.
+
+**The commit message does not get the footer.** `plan_pr` now returns
+`commit_body` (the description as before) next to `body`, and `propose_pr`
+commits with `commit_body`. The ticket asks for the pull request
+description only, and a commit message is permanent in the target
+repository's history.
+
+**`incident` is optional.** Chat requests and older MCP Service versions
+do not send it; the description is then byte-for-byte what it was. The
+same holds when the value is unusable: not an object, `link` missing or not
+a string, a scheme other than http/https, or a link containing `<`, `>` or
+a line break. The link is written in Markdown's angle-bracket form so
+parentheses in the query string cannot end it early, and those characters
+are the ones that could break out of that form.
+
+**Verified:** `tests/test_propose_pr.py`, 34 passed, 12 of them new (footer
+present, commit message unchanged, nine unusable shapes leave the body
+alone, the approved body reaches `github_create_pr`). Whole suite on
+Windows: 585 passed, 11 skipped; 19 modules could not be collected there
+(13 import `a2a`, 6 import `fcntl`, neither installed locally), so
+`test_ari_oncall_meta.py` and `test_activities.py` did not run for this
+change and still need a run inside the worker image.
+
+**Not verified:** a live run. Nothing has yet been observed end to end with
+MCP Service sending `incident.link` and a real pull request opened.

@@ -242,6 +242,9 @@ agent's own contract for what it expects inside one `DataPart`.
     "model": "gpt-5-mini",
     "base_url": null            // optional override
   },
+  "incident": {                 // optional — appended to the pull request description as a footer link
+    "link": "https://<insightfinder-host>/ui/global/systemrootcause?..."
+  },
   "options": {
     "skip_tests": true          // free-form — the planner reads whatever you put here
   },
