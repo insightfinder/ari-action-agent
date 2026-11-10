@@ -5619,13 +5619,17 @@ a line break. The link is written in Markdown's angle-bracket form so
 parentheses in the query string cannot end it early, and those characters
 are the ones that could break out of that form.
 
-**Verified:** `tests/test_propose_pr.py`, 34 passed, 12 of them new (footer
-present, commit message unchanged, nine unusable shapes leave the body
-alone, the approved body reaches `github_create_pr`). Whole suite on
-Windows: 585 passed, 11 skipped; 19 modules could not be collected there
-(13 import `a2a`, 6 import `fcntl`, neither installed locally), so
-`test_ari_oncall_meta.py` and `test_activities.py` did not run for this
-change and still need a run inside the worker image.
+**Verified:** full suite inside the deployed worker image
+(`ari-oncall-agent-worker:2611101100-test`): 722 passed, 12 skipped. 12 new
+cases in `tests/test_propose_pr.py`: footer present, commit message
+unchanged, nine unusable shapes leave the body alone, the approved body
+reaches `github_create_pr`.
 
-**Not verified:** a live run. Nothing has yet been observed end to end with
-MCP Service sending `incident.link` and a real pull request opened.
+**Verified live on test (2026-11-10)** against the deployed agent, through
+`svc/ari-oncall-api`, with `incident.link` in the request's data part and
+`insightfinder/OnCall-ARI-InfraCore-testing` as the repository. The proposal
+paused with the footer already in `body`, and the approval opened
+insightfinder/OnCall-ARI-InfraCore-testing#37 five seconds later. Its
+description ends with the footer, GitHub renders the link with its full
+query string (the test link carried parentheses on purpose), and the commit
+message on the branch has the title and summary only.
