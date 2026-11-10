@@ -150,7 +150,7 @@ async def run(ctx: StepContext) -> dict:
     git_push = ctx.tool("git_push")
 
     await git_add(repo_dir, plan["changed_files"])
-    await git_commit(repo_dir, plan["title"], plan["body"])
+    await git_commit(repo_dir, plan["title"], plan["commit_body"])
     await git_push(repo_dir, ctx.config["repo"], plan["branch"])
 
     change = ctx.results.get("generate_change", {})
