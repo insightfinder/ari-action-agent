@@ -57,7 +57,7 @@ async def main() -> None:
         interactive_task_queue=settings.interactive_task_queue() or None,
         interactive_max_concurrent_activities=settings.interactive_max_concurrent_activities,
     )
-    tracing.init_tracing(settings.agent_name, settings.trace_server_url)
+    tracing.init_tracing(settings.agent_name, settings.trace_server_url, settings.environment)
     # Python's default SIGTERM kills the process on the spot, so the `finally`
     # below never flushed the spans still queued for export on a rollout.
     loop = asyncio.get_running_loop()

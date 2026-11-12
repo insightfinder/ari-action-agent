@@ -165,6 +165,26 @@ def test_each_comma_separated_endpoint_gets_its_own_exporter_and_every_span(monk
     assert names == [["a2a-task:oncall"], ["a2a-task:oncall"]]
 
 
+@pytest.mark.parametrize("environment, recorded", [("stg", "stg"), ("", "unknown-env")])
+def test_every_span_names_the_environment_it_came_from(monkeypatch, environment, recorded):
+    import opentelemetry.exporter.otlp.proto.grpc.trace_exporter as otlp
+    import opentelemetry.sdk.trace.export as sdk_export
+
+    memory = InMemorySpanExporter()
+    monkeypatch.setattr(otlp, "OTLPSpanExporter", lambda **kw: memory)
+    monkeypatch.setattr(sdk_export, "BatchSpanProcessor", SimpleSpanProcessor)
+    tracing.install_provider(None)
+    try:
+        assert tracing.init_tracing("ARI Kubernetes Agent", "http://traceserver:4618", environment) is True
+        with tracing.span("a2a-task:k8s", target=tracing.target_for(_traced_config())):
+            pass
+        resource = memory.get_finished_spans()[0].resource.attributes
+    finally:
+        tracing.shutdown_tracing()
+    assert resource["service.name"] == "ARI Kubernetes Agent"
+    assert resource["environment"] == recorded
+
+
 @pytest.mark.parametrize("endpoint", ["", " ", ",", " , "])
 def test_init_tracing_without_an_endpoint_leaves_tracing_off(endpoint):
     tracing.install_provider(None)

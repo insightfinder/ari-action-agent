@@ -309,6 +309,11 @@ A trace server forwards a trace only to its own InsightFinder, so the one
 whose InsightFinder does not know the caller's license rejects that copy
 and the caller's own environment keeps the whole trace.
 
+Every span's resource carries `environment`, the deployment's `ENVIRONMENT`
+(`test`, `stg`, `prod`; `unknown-env` when unset), the same key mcp-service
+sets on its own spans. In a trace that crosses environments it tells which
+environment's agent ran the task.
+
 To check a deployment end to end, `scripts/trace_e2e.py` plays the caller:
 it records `chat-prompt-response` and `agent:<name>` on the trace server
 the way mcp-service does, sends one task with that span in its `trace`

@@ -113,14 +113,16 @@ class TraceTarget:
 # ─── Provider lifecycle ──────────────────────────────────────────────────
 
 
-def init_tracing(service_name: str, endpoint: str) -> bool:
+def init_tracing(service_name: str, endpoint: str, environment: str = "") -> bool:
     """Installs the process-wide exporter. Returns whether tracing is on.
 
     `endpoint` is `TRACE_SERVER_URL`, an OTLP/gRPC address such as
     http://traceserver-llm-labs.traceserver.svc.cluster.local:4618. An
     `https://` address is exported over TLS; `http://` or no scheme, in
     plaintext. Several addresses separated by commas each get their own
-    exporter, and every span goes to all of them. Empty leaves tracing off."""
+    exporter, and every span goes to all of them. Empty leaves tracing off.
+    `environment` is `ENVIRONMENT`, the deployment's name (test, stg, prod),
+    recorded on every span's resource under the key mcp-service uses."""
     global _provider
     if _provider is not None:
         return True
@@ -133,7 +135,10 @@ def init_tracing(service_name: str, endpoint: str) -> bool:
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-        provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
+        provider = TracerProvider(resource=Resource.create({
+            "service.name": service_name,
+            "environment": environment or "unknown-env",
+        }))
         for item in endpoints:
             tls = item.startswith("https://")
             address = item.removeprefix("https://").removeprefix("http://")
