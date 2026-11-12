@@ -5122,3 +5122,59 @@ the tracing lines above.
 stg (stg is read-only from here). `poetry.lock` was already out of date with
 `pyproject.toml` on `main` (`poetry check --lock` fails there too); the
 images install with pip and do not read it, and it is left as is.
+
+---
+
+## 2026-11-10 - The pull request description links back to its incident (II-25597)
+
+A pull request this agent opened said nothing about which InsightFinder
+incident caused it. MCP Service now sends the incident's link in the
+request's data part, under a top-level `incident` object beside `repo`,
+`llm` and `options` (II-25558):
+
+```
+"incident": {"link": "https://<insightfinder-host>/ui/global/systemrootcause?..."}
+```
+
+`plan_pr` appends one footer line after the existing description, separated
+by a blank line, and changes nothing else:
+
+```
+**InsightFinder incident:** [View incident and ARI report](<link>)
+```
+
+**Where it is added, and why there.** `plan_pr` is the one place that
+decides the pull request, and its `body` rides through the approval inside
+the `pending_action` artifact, so the footer is part of what a person
+approves and `publish_pr` opens it without recomputing anything. No change
+in `common/`: `_extract_config` hands the data part over as a plain dict,
+so `ctx.config["incident"]` was already reachable.
+
+**The commit message does not get the footer.** `plan_pr` now returns
+`commit_body` (the description as before) next to `body`, and `propose_pr`
+commits with `commit_body`. The ticket asks for the pull request
+description only, and a commit message is permanent in the target
+repository's history.
+
+**`incident` is optional.** Chat requests and older MCP Service versions
+do not send it; the description is then byte-for-byte what it was. The
+same holds when the value is unusable: not an object, `link` missing or not
+a string, a scheme other than http/https, or a link containing `<`, `>` or
+a line break. The link is written in Markdown's angle-bracket form so
+parentheses in the query string cannot end it early, and those characters
+are the ones that could break out of that form.
+
+**Verified:** full suite inside the deployed worker image
+(`ari-oncall-agent-worker:2611101100-test`): 722 passed, 12 skipped. 12 new
+cases in `tests/test_propose_pr.py`: footer present, commit message
+unchanged, nine unusable shapes leave the body alone, the approved body
+reaches `github_create_pr`.
+
+**Verified live on test (2026-11-10)** against the deployed agent, through
+`svc/ari-oncall-api`, with `incident.link` in the request's data part and
+`insightfinder/OnCall-ARI-InfraCore-testing` as the repository. The proposal
+paused with the footer already in `body`, and the approval opened
+insightfinder/OnCall-ARI-InfraCore-testing#37 five seconds later. Its
+description ends with the footer, GitHub renders the link with its full
+query string (the test link carried parentheses on purpose), and the commit
+message on the branch has the title and summary only.
