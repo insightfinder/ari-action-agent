@@ -15,6 +15,7 @@ from a2a.server.tasks import (
     InMemoryPushNotificationConfigStore,
 )
 
+from common import tracing
 from common.a2a_server.agent_card import build_agent_card
 from common.a2a_server.auth import ApiKeyCallContextBuilder, ApiKeyMiddleware
 from common.a2a_server.executor import AriAgentExecutor
@@ -62,11 +63,13 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        tracing.init_tracing(settings.agent_name, settings.trace_server_url)
         reconcile = asyncio.create_task(reconcile_unfinished_tasks(task_store))
         try:
             yield
         finally:
             reconcile.cancel()
+            tracing.shutdown_tracing()
 
     app = FastAPI(
         title=settings.agent_name,

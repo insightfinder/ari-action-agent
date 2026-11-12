@@ -128,6 +128,13 @@ ari-action-agent/
   and executor are already generic over the capability catalog — a new class
   of request just means new capabilities/tools registered, same engine.
 
+**Tracing.** Set `TRACE_SERVER_URL` (the InsightFinder trace server's
+OTLP/gRPC address, the same variable mcp-service uses) on both the API and
+the worker to send OpenTelemetry spans. A request is traced only when its
+config carries a `trace` block naming the caller's trace project; see
+[`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §5 for the block and the
+spans.
+
 ## Running locally
 
 Temporal itself is **not** run locally by default — `TEMPORAL_HOST` in `.env`
