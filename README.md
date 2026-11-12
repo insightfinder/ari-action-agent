@@ -105,7 +105,8 @@ Beyond skills, a new **capability** is a module under `<kind package>/capabiliti
 
 **Tracing.** Set `TRACE_SERVER_URL` (the InsightFinder trace server's
 OTLP/gRPC address, the same variable mcp-service uses) on both the API and
-the worker to send OpenTelemetry spans. A request is traced only when its
+the worker to send OpenTelemetry spans; several addresses separated by
+commas each receive every span. A request is traced only when its
 config carries a `trace` block naming the caller's trace project; see
 [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §5 for the block and the
 spans.
