@@ -123,6 +123,7 @@ class Settings(BaseSettings):
     # which trace project its spans belong to is the caller's to say, not
     # this deployment's (see common/tracing.py).
     trace_server_url: str = ""
+    environment: str = ""
 
     def task_queue_for(self, config: dict | None) -> str:
         lane = ((config or {}).get("options") or {}).get("lane")

@@ -63,7 +63,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        tracing.init_tracing(settings.agent_name, settings.trace_server_url)
+        tracing.init_tracing(settings.agent_name, settings.trace_server_url, settings.environment)
         reconcile = asyncio.create_task(reconcile_unfinished_tasks(task_store))
         try:
             yield
