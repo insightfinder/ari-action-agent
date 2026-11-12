@@ -117,6 +117,13 @@ class Settings(BaseSettings):
 
     log_level: str = "info"
 
+    # OTLP/gRPC address of the InsightFinder trace server (TRACE_SERVER_URL,
+    # the same variable mcp-service reads). Empty turns tracing off. Even
+    # when set, a request is traced only if it carries a `trace` block —
+    # which trace project its spans belong to is the caller's to say, not
+    # this deployment's (see common/tracing.py).
+    trace_server_url: str = ""
+
     def task_queue_for(self, config: dict | None) -> str:
         lane = ((config or {}).get("options") or {}).get("lane")
         if lane == "interactive" and self.interactive_task_queue():
