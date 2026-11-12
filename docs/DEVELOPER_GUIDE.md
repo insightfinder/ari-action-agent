@@ -304,7 +304,13 @@ as commit SHAs included: a completion can quote a file the agent read, and
 of its error.
 
 `TRACE_SERVER_URL` with `https://` is exported over TLS; `http://` or no
-scheme, in plaintext.
+scheme, in plaintext. It may hold several addresses separated by commas;
+every span is then sent to each of them. An agent that callers in more than
+one environment reach lists each environment's trace server, for example
+`http://traceserver-llm-labs.traceserver.svc.cluster.local:4618,https://stg-traceserver-llm-labs.insightfinder.com:443`.
+A trace server forwards a trace only to its own InsightFinder, so the one
+whose InsightFinder does not know the caller's license rejects that copy
+and the caller's own environment keeps the whole trace.
 
 To check a deployment end to end, `scripts/trace_e2e.py` plays the caller:
 it records `chat-prompt-response` and `agent:<name>` on the trace server

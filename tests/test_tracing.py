@@ -132,9 +132,43 @@ def test_an_https_endpoint_is_exported_over_tls(monkeypatch, endpoint, address, 
     assert seen == {"endpoint": address, "insecure": insecure}
 
 
-def test_init_tracing_without_an_endpoint_leaves_tracing_off():
+def test_each_comma_separated_endpoint_gets_its_own_exporter_and_every_span(monkeypatch):
+    import opentelemetry.exporter.otlp.proto.grpc.trace_exporter as otlp
+    import opentelemetry.sdk.trace.export as sdk_export
+
+    built = []
+
+    def exporter_for(**kw):
+        memory = InMemorySpanExporter()
+        built.append((kw, memory))
+        return memory
+
+    monkeypatch.setattr(otlp, "OTLPSpanExporter", exporter_for)
+    monkeypatch.setattr(sdk_export, "BatchSpanProcessor", SimpleSpanProcessor)
     tracing.install_provider(None)
-    assert tracing.init_tracing("ARI On-Call Agent", "") is False
+    try:
+        assert tracing.init_tracing(
+            "ARI On-Call Agent", "http://traceserver:4618, https://stg-traceserver.example:443,"
+        ) is True
+        target = tracing.target_for({"trace": {
+            "trace_project": "acme-LLM", "trace_admin_user": "acme-admin", "trace_admin_user_license": "lic",
+        }})
+        with tracing.span("a2a-task:oncall", target=target):
+            pass
+        names = [[s.name for s in memory.get_finished_spans()] for _, memory in built]
+    finally:
+        tracing.shutdown_tracing()
+    assert [kw for kw, _ in built] == [
+        {"endpoint": "traceserver:4618", "insecure": True},
+        {"endpoint": "stg-traceserver.example:443", "insecure": False},
+    ]
+    assert names == [["a2a-task:oncall"], ["a2a-task:oncall"]]
+
+
+@pytest.mark.parametrize("endpoint", ["", " ", ",", " , "])
+def test_init_tracing_without_an_endpoint_leaves_tracing_off(endpoint):
+    tracing.install_provider(None)
+    assert tracing.init_tracing("ARI On-Call Agent", endpoint) is False
     assert not tracing.enabled()
 
 

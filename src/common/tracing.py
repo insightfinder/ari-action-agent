@@ -119,11 +119,13 @@ def init_tracing(service_name: str, endpoint: str) -> bool:
     `endpoint` is `TRACE_SERVER_URL`, an OTLP/gRPC address such as
     http://traceserver-llm-labs.traceserver.svc.cluster.local:4618. An
     `https://` address is exported over TLS; `http://` or no scheme, in
-    plaintext. Empty leaves tracing off."""
+    plaintext. Several addresses separated by commas each get their own
+    exporter, and every span goes to all of them. Empty leaves tracing off."""
     global _provider
     if _provider is not None:
         return True
-    if not endpoint:
+    endpoints = [e.strip() for e in (endpoint or "").split(",") if e.strip()]
+    if not endpoints:
         return False
     try:
         from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
@@ -131,12 +133,13 @@ def init_tracing(service_name: str, endpoint: str) -> bool:
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-        tls = endpoint.startswith("https://")
-        address = endpoint.removeprefix("https://").removeprefix("http://")
         provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=address, insecure=not tls)))
+        for item in endpoints:
+            tls = item.startswith("https://")
+            address = item.removeprefix("https://").removeprefix("http://")
+            provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=address, insecure=not tls)))
         _provider = provider
-        logger.info("tracing_enabled", endpoint=endpoint, service_name=service_name)
+        logger.info("tracing_enabled", endpoints=endpoints, service_name=service_name)
         return True
     except Exception as exc:  # noqa: BLE001 - tracing must never stop the process
         logger.warning("tracing_init_failed", error=f"{type(exc).__name__}: {exc}")
