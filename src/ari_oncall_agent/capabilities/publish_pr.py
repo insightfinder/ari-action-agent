@@ -51,6 +51,17 @@ def _branch_name(title: str, request_id: str) -> str:
     return f"ari/{slug}-{request_id[:8]}"
 
 
+def _incident_footer(config: dict) -> str:
+    incident = config.get("incident")
+    link = incident.get("link") if isinstance(incident, dict) else None
+    if not isinstance(link, str):
+        return ""
+    link = link.strip()
+    if urlsplit(link).scheme not in ("http", "https") or any(c in link for c in "<>\r\n"):
+        return ""
+    return f"**InsightFinder incident:** [View incident and ARI report](<{link}>)"
+
+
 def plan_pr(ctx: StepContext) -> dict:
     """Exactly the pull request this pipeline will open, decided once.
 
@@ -74,7 +85,9 @@ def plan_pr(ctx: StepContext) -> dict:
     # lengths, so the title read as a sentence cut off mid-word (e.g.
     # insightfinder/insightfinder-mcp-server#55).
     title = ctx.params.get("title") or f"ARI: {change.get('title') or 'automated change'}"
-    body = change.get("summary") or ctx.prompt
+    commit_body = change.get("summary") or ctx.prompt
+    footer = _incident_footer(ctx.config)
+    body = f"{commit_body}\n\n{footer}" if footer else commit_body
     repo = ctx.config["repo"]
     # The planner can override the PR's target branch independently of
     # whatever branch clone_repo actually checked out ("check the repo in
@@ -98,6 +111,7 @@ def plan_pr(ctx: StepContext) -> dict:
     return {
         "title": title,
         "body": body,
+        "commit_body": commit_body,
         "branch": branch,
         "base_ref": base_ref,
         "changed_files": changed_files,

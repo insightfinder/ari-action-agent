@@ -332,3 +332,69 @@ async def test_a_proposal_separates_an_unfinished_verify_from_a_failed_build():
 
     assert proposal["verification"]["status"] == "inconclusive"
     assert "timed out" in proposal["verification"]["detail"]
+
+
+_INCIDENT_LINK = "https://app.insightfinder.com/ui/global/systemrootcause?systemId=abc(1)&t=1700000000000"
+_INCIDENT_FOOTER = f"**InsightFinder incident:** [View incident and ARI report](<{_INCIDENT_LINK}>)"
+
+
+@pytest.mark.asyncio
+async def test_pr_body_ends_with_the_incident_link_when_the_request_carries_one():
+    tools = _tools()
+    ctx = _ctx(tools)
+    ctx.config["incident"] = {"link": _INCIDENT_LINK}
+
+    proposal = (await propose_pr.run(ctx))["pending_action"]
+
+    assert proposal["body"] == f"the cart was empty\n\n{_INCIDENT_FOOTER}"
+
+
+@pytest.mark.asyncio
+async def test_the_incident_link_stays_out_of_the_commit_message():
+    tools = _tools()
+    ctx = _ctx(tools)
+    ctx.config["incident"] = {"link": _INCIDENT_LINK}
+
+    await propose_pr.run(ctx)
+
+    assert tools["git_commit"].await_args.args[2] == "the cart was empty"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "incident",
+    [
+        None,
+        {},
+        {"link": ""},
+        {"link": None},
+        {"link": 42},
+        "https://app.insightfinder.com/x",
+        {"link": "javascript:alert(1)"},
+        {"link": "https://x.test/a>) [evil](https://evil.test"},
+        {"link": "https://x.test/a\n\n# heading"},
+    ],
+)
+async def test_pr_body_is_unchanged_without_a_usable_incident_link(incident):
+    tools = _tools()
+    ctx = _ctx(tools)
+    if incident is not None:
+        ctx.config["incident"] = incident
+
+    proposal = (await propose_pr.run(ctx))["pending_action"]
+
+    assert proposal["body"] == "the cart was empty"
+
+
+@pytest.mark.asyncio
+async def test_the_opened_pull_request_carries_the_approved_body_with_the_incident_link():
+    tools = _tools()
+    ctx = _ctx(tools)
+    ctx.config["incident"] = {"link": _INCIDENT_LINK}
+    proposal = (await propose_pr.run(ctx))["pending_action"]
+
+    publish_ctx = _ctx(tools, params=proposal)
+    publish_ctx.confirmed = True
+    await publish_pr.run(publish_ctx)
+
+    assert tools["github_create_pr"].await_args.args[3].endswith(_INCIDENT_FOOTER)
