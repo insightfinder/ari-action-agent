@@ -75,6 +75,7 @@ class AgentMeta:
     # capability: it could only plan a step that does not exist here, and the
     # guarantee should not hang on the image remembering SKILLS_ENABLED=false.
     planner_skills: bool = True
+    prompt_redacted_fields: tuple[str, ...] = ()
 
 
 def _agent_package(agent_kind: str) -> str:
