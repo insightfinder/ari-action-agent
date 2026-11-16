@@ -40,6 +40,7 @@ from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Part, Role, Task, TaskState, TaskStatus
 
+from common import tracing
 from common.agent_meta import get_agent_meta
 from common.orchestration.temporal_client import get_temporal_client
 from common.orchestration.workflow import AriAgentWorkflow
@@ -132,6 +133,53 @@ async def _publish_result(updater: TaskUpdater, result: dict) -> None:
     await updater.update_status(state, message=final_message)
 
 
+def _open_task_span(target, agent_kind: str, context: RequestContext, prompt: str,
+                    confirmed_action: dict | None) -> str | None:
+    """Records this task's root span under the caller's and returns its
+    traceparent.
+
+    Ended at once, the way mcp-service's own durable tasks do it: the
+    workflow outlives any one API pod, so a span held open across
+    `handle.result()` would be lost — orphaning every activity span under
+    it — whenever this pod restarts mid-run. The outcome is recorded by the
+    worker, from the `respond` step (orchestration/activities.py), so it
+    survives that restart too."""
+    try:
+        with tracing.span(
+            f"a2a-task:{agent_kind}",
+            target=target,
+            traceparent=target.traceparent,
+            attributes={
+                "trace.entity": "agent-task",
+                "agent.kind": agent_kind,
+                "a2a.task_id": context.task_id,
+                "a2a.context_id": context.context_id,
+                "agent.query": tracing.truncate(prompt),
+                "agent.confirmed_action": (confirmed_action or {}).get("id"),
+            },
+        ) as span:
+            return tracing.traceparent_of(span)
+    except Exception:  # noqa: BLE001 - tracing must never fail a request
+        return None
+
+
+def _record_task_error(target, config: dict, error: Exception) -> None:
+    """The one outcome the worker cannot record: the workflow never produced
+    a result at all. Never raises."""
+    if target is None:
+        return
+    try:
+        with tracing.span(
+            "a2a-task-result",
+            target=target,
+            traceparent=config["trace"].get("traceparent"),
+            attributes={"trace.entity": "agent-task-result", "agent.status": "failed"},
+        ) as span:
+            tracing.mark_failed(span, error)
+    except Exception:  # noqa: BLE001 - tracing must never fail a request
+        pass
+
+
 class AriAgentExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         prompt = context.get_user_input()
@@ -184,6 +232,13 @@ class AriAgentExecutor(AgentExecutor):
                 return
 
         settings = get_settings()
+        target = tracing.target_for(config)
+        if target is not None:
+            # Every activity re-roots its spans on this task's own span, so
+            # the traceparent the workflow carries is ours, not the caller's.
+            config["trace"]["traceparent"] = _open_task_span(
+                target, settings.agent_kind, context, prompt, confirmed_action
+            ) or target.traceparent
         workflow_input = {
             "prompt": prompt,
             "history": history,
@@ -201,6 +256,7 @@ class AriAgentExecutor(AgentExecutor):
             )
             result = await handle.result()
         except Exception as exc:
+            _record_task_error(target, config, exc)
             await updater.failed(message=updater.new_agent_message([Part(text=f"Internal error: {exc}")]))
             return
 

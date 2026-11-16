@@ -10,6 +10,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from common.models.trace_config import TraceConfig
+
 
 class LLMConfig(BaseModel):
     provider: Literal["openai", "anthropic"]
@@ -38,3 +40,4 @@ class K8sRequestConfig(BaseModel):
     llm: LLMConfig
     options: K8sOptions = K8sOptions()
     confirm_pending_action: Optional[ConfirmPendingAction] = None
+    trace: Optional[TraceConfig] = None

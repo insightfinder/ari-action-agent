@@ -22,6 +22,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from common.models.trace_config import TraceConfig
+
 
 class RepoConfig(BaseModel):
     provider: Literal["github", "gitlab", "generic-git"] = "github"
@@ -51,6 +53,7 @@ class LLMConfig(BaseModel):
 class RequestConfig(BaseModel):
     repo: RepoConfig
     llm: LLMConfig
+    trace: Optional[TraceConfig] = None  # optional; see common/tracing.py
     system_prompt: Optional[str] = None  # optional override of the default planner/executor system prompt
     # Free-form dynamic directives the planner takes into account, e.g.
     # {"skip_tests": true}. Deliberately not enumerated — new directives

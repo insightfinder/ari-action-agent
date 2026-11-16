@@ -17,6 +17,9 @@ dependencies = [
     "anthropic>=1.6",
     "a2a-sdk[fastapi]>=1.1",
     "cryptography>=42",
+    "opentelemetry-api>=1.37",
+    "opentelemetry-sdk>=1.37",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.37",
 ]
 
 [project.optional-dependencies]

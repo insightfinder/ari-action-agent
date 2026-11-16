@@ -207,3 +207,10 @@ def test_missing_llm_key_is_reported_not_traced(agent, monkeypatch):
         assert result.exit_code == 1
         assert "LLM_API_KEY" in result.output
         assert "Traceback" not in result.output
+
+
+def test_task_output_masks_the_trace_license():
+    # A task started by ARI carries the caller's InsightFinder license in its `trace` block.
+    cli = pytest.importorskip("ari_cli.main")
+    shown = cli.redact({"trace": {"trace_admin_user_license": "if-license", "trace_project": "acme-LLM"}})
+    assert shown == {"trace": {"trace_admin_user_license": "***", "trace_project": "acme-LLM"}}

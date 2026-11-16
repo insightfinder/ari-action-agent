@@ -51,8 +51,9 @@ import os
 import time
 
 import structlog
+from opentelemetry.trace import SpanKind
 
-from . import skills, subprocess_watch
+from . import skills, subprocess_watch, tracing
 from .settings import get_settings
 
 logger = structlog.get_logger()
@@ -270,6 +271,184 @@ def merge_traces(*traces: dict) -> dict:
     }
 
 
+def _ns(ms) -> int | None:
+    return int(ms) * 1_000_000 if isinstance(ms, (int, float)) and ms > 0 else None
+
+
+def record_spans(ctx, agent: str, events: list[dict], started_ns: int, ended_ns: int,
+                 failure: str | None, *, continued_session: bool = False) -> None:
+    """One `opencode:<agent>` span for this call, with opencode's own steps
+    and tool calls under it, timed by opencode's own timestamps.
+
+    The event shapes are opencode 1.18.31's `--format json` (pinned in
+    Dockerfile.oncall; checked against its run.ts and v1 session schema, and
+    against a live run on test): a `step_start` / `step_finish` pair per model
+    call, the latter carrying `part.tokens` {input, output, reasoning, cache:
+    {read, write}} and `part.cost`; `tool_use` once per call when it completes
+    or fails, with `part.state.time` {start, end} in epoch milliseconds. A
+    no-op when the request is untraced; never raises, and never leaves a
+    started span unended."""
+    if not tracing.active():
+        return
+    outer = tracing.start_span(
+        f"opencode:{agent}",
+        start_time=started_ns,
+        attributes={
+            "trace.entity": "opencode-call",
+            "opencode.agent": agent,
+            "opencode.capability": ctx.capability,
+            "opencode.continued_session": continued_session,
+        },
+    )
+    if outer is None:
+        return
+    open_steps: list = []
+    try:
+        _record_steps(ctx, outer, events, started_ns, ended_ns, open_steps)
+        if failure:
+            tracing.mark_failed(outer, failure)
+    except Exception as exc:  # noqa: BLE001 - tracing must never fail a step
+        logger.warning("opencode_trace_failed", request_id=ctx.request_id,
+                       error=f"{type(exc).__name__}: {exc}")
+    finally:
+        for step in open_steps:
+            step.end(end_time=ended_ns)
+        outer.end(end_time=ended_ns)
+
+
+def _number(value) -> float:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def _record_steps(ctx, outer, events: list[dict], started_ns: int, ended_ns: int, open_steps: list) -> None:
+    """`open_steps` holds the step span still open, so the caller can end it
+    whatever happens here."""
+    llm = ctx.config["llm"]
+    provider, model = llm["provider"].lower(), llm["model"]
+    step_text: list[str] = []
+    steps, tool_calls, cost = 0, 0, 0.0
+    seen_calls: set[str] = set()
+    last_ns = started_ns
+
+    def finish_step(end_ns):
+        if open_steps:
+            step = open_steps.pop()
+            tracing.set_attributes(step, {
+                "gen_ai.completion.0.role": "assistant",
+                "gen_ai.completion.0.content": tracing.truncate("\n".join(step_text)),
+            })
+            step.end(end_time=end_ns)
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        kind = part.get("type")
+        # An event without a time keeps its predecessor's, inside this call.
+        timestamp = _ns(event.get("timestamp")) or last_ns
+        last_ns = timestamp
+
+        if kind == "step-start":
+            finish_step(timestamp)
+            steps += 1
+            step_text = []
+            step = tracing.start_span(
+                f"llm:{provider}/{model}",
+                parent=outer,
+                kind=SpanKind.CLIENT,
+                start_time=timestamp,
+                attributes={
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.system": provider,
+                    "gen_ai.request.model": model,
+                    "opencode.step": steps,
+                },
+            )
+            if step is not None:
+                open_steps.append(step)
+        elif kind == "text" and isinstance(part.get("text"), str) and part["text"]:
+            step_text.append(part["text"])
+        elif kind == "tool":
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            call_id = str(part.get("callID") or part.get("id") or "")
+            if state.get("status") not in ("completed", "error") or (call_id and call_id in seen_calls):
+                continue
+            seen_calls.add(call_id)
+            tool_calls += 1
+            _record_tool(open_steps[-1] if open_steps else outer, part, state, timestamp)
+        elif kind == "step-finish":
+            tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+            cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+            cache_read, cache_write = _number(cache.get("read")), _number(cache.get("write"))
+            if open_steps:
+                # opencode's `input` excludes the cache and `output` excludes
+                # reasoning; the dashboard wants raw input and billed output.
+                tracing.set_token_attributes(
+                    open_steps[-1],
+                    _number(tokens.get("input")) + cache_read + cache_write,
+                    _number(tokens.get("output")) + _number(tokens.get("reasoning")),
+                    cache_read, cache_write, model,
+                )
+                tracing.set_attributes(open_steps[-1], {
+                    "gen_ai.usage.reasoning_tokens": _number(tokens.get("reasoning")),
+                    "opencode.finish_reason": part.get("reason"),
+                    "opencode.cost_usd": _number(part.get("cost")),
+                })
+            cost += _number(part.get("cost"))
+            finish_step(timestamp)
+
+    finish_step(ended_ns)
+    tracing.set_attributes(outer, {
+        "opencode.steps": steps,
+        "opencode.tool_call_total": tool_calls,
+        "opencode.cost_usd": round(cost, 6),
+    })
+
+
+# Tool arguments that name *where*, not *what*: kept verbatim. Everything
+# else — a `write`'s file contents, an `edit`'s old and new text, a `bash`
+# command that may carry a token — is recorded as its size only, for the same
+# reason a tool's output is: it is the customer's code, and the trace server
+# stores whatever it is sent.
+_LOCATION_ARGS = frozenset({"filePath", "path", "pattern", "include", "glob", "description"})
+
+
+def _tool_args(arguments) -> str:
+    if not isinstance(arguments, dict):
+        return ""
+    summary = {
+        key: value if key in _LOCATION_ARGS and isinstance(value, str) else f"<{len(str(value))} chars>"
+        for key, value in arguments.items()
+    }
+    return tracing.truncate(json.dumps(summary, default=str), 1000)
+
+
+def _record_tool(parent, part: dict, state: dict, fallback_ns) -> None:
+    times = state.get("time") if isinstance(state.get("time"), dict) else {}
+    tool = part.get("tool") or "unknown"
+    output = state.get("output") if isinstance(state.get("output"), str) else ""
+    span = tracing.start_span(
+        f"tool:{tool}",
+        parent=parent,
+        start_time=_ns(times.get("start")) or fallback_ns,
+        attributes={
+            "gen_ai.operation.name": "execute_tool",
+            "tool.name": tool,
+            "tool.status": state.get("status"),
+            "tool.args": _tool_args(state.get("input")),
+            "tool.result_size": len(output),
+        },
+    )
+    if span is None:
+        return
+    if state.get("status") == "error":
+        # Its first line only: the rest of a tool's error can quote the file
+        # or command output it was working on.
+        error = str(state.get("error") or "tool failed").strip().splitlines() or ["tool failed"]
+        tracing.mark_failed(span, tracing.truncate(error[0], 200))
+    span.end(end_time=_ns(times.get("end")) or fallback_ns)
+
+
 def opencode_config_home(workspace: str) -> str:
     return os.path.join(workspace, ".opencode-state", "config")
 
@@ -363,13 +542,21 @@ async def run_opencode(
         env.pop(name, None)
 
     start = time.monotonic()
+    started_ns = time.time_ns()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
-    stdout, stderr = await _communicate(proc, agent, _subprocess_deadline(ctx))
+    try:
+        stdout, stderr = await _communicate(proc, agent, _subprocess_deadline(ctx))
+    except BaseException as exc:
+        # A timed-out call is the one most worth seeing in the trace; its
+        # output died with the process, so the span carries only the failure.
+        record_spans(ctx, agent, [], started_ns, time.time_ns(), f"{type(exc).__name__}: {exc}",
+                     continued_session=should_continue)
+        raise
     wall_elapsed = time.monotonic() - start
     result = _parse_events(stdout)
     result["trace"] = _build_trace(result["raw_events"], wall_elapsed)
@@ -381,6 +568,11 @@ async def run_opencode(
         continued_session=should_continue,
         **result["trace"],
     )
+    failure = None
+    if proc.returncode != 0:
+        failure = result.get("error") or stderr.decode(errors="replace") or f"exit {proc.returncode}"
+    record_spans(ctx, agent, result["raw_events"], started_ns, time.time_ns(), failure,
+                 continued_session=should_continue)
     if proc.returncode != 0:
         # stderr is reliably empty in production (confirmed live — even a
         # hard 401 produces nothing on stderr); the real message is in the

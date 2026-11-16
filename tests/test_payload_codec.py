@@ -126,3 +126,29 @@ def test_data_converter_builds_a_codec_when_key_configured():
 
     assert converter.payload_codec is not None
     assert isinstance(converter.payload_codec, EncryptionCodec)
+
+
+@pytest.mark.asyncio
+async def test_the_trace_license_is_masked_and_the_rest_of_the_trace_block_is_not():
+    # The caller's InsightFinder license rides in the request's `trace`
+    # block, which travels in the workflow input like the LLM key does.
+    codec = EncryptionCodec(_key())
+    original = _json_payload(
+        {
+            "config": {
+                "trace": {
+                    "trace_project": "acme-MCP-Anthropic-x-x-LLM",
+                    "trace_admin_user": "acme-admin",
+                    "trace_admin_user_license": "if-license-secret",
+                }
+            }
+        }
+    )
+
+    [encoded] = await codec.encode([original])
+    trace = json.loads(encoded.data.decode())["config"]["trace"]
+
+    assert "if-license-secret" not in encoded.data.decode()
+    assert trace["trace_admin_user_license"].startswith("enc:v1:")
+    assert trace["trace_project"] == "acme-MCP-Anthropic-x-x-LLM"
+    assert trace["trace_admin_user"] == "acme-admin"

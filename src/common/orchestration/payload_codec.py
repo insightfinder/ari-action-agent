@@ -1,6 +1,7 @@
 """Masks only the handful of genuinely sensitive fields in a Temporal
-payload (a request's LLM `api_key`, repo `pat`/`ssh_key`) before it's sent
-to the Temporal server for persistence — everything else in the payload
+payload (a request's LLM `api_key`, repo `pat`/`ssh_key`, and the
+InsightFinder `trace_admin_user_license` of its `trace` block) before it's
+sent to the Temporal server for persistence — everything else in the payload
 (prompt, capability, params, step results, diffs, PR links, ...) stays
 fully readable plain JSON in Temporal's Web UI / `temporal workflow show`.
 
@@ -17,9 +18,10 @@ Anthropic API key in cleartext).
 How it works: the default Temporal payload converter serializes a Python
 dict/dataclass as JSON (`encoding: json/plain`). This codec parses that
 JSON, walks it recursively, and replaces the *value* of any dict key named
-`api_key`, `pat`, or `ssh_key` (wherever it appears, at any nesting depth —
-robust to whichever capability's payload shape carries it) with an
-AES-256-GCM-encrypted, base64-armored string tagged with a fixed prefix.
+`api_key`, `pat`, `ssh_key` or `trace_admin_user_license` (wherever it
+appears, at any nesting depth — robust to whichever capability's payload
+shape carries it) with an AES-256-GCM-encrypted, base64-armored string
+tagged with a fixed prefix.
 The payload's `encoding` metadata is left as `json/plain` — unchanged — so
 it still renders as ordinary JSON to any viewer; only those specific field
 values are unreadable. `decode()` reverses exactly that transformation,
@@ -38,7 +40,10 @@ from temporalio.api.common.v1 import Payload
 from temporalio.converter import PayloadCodec
 
 _JSON_ENCODING = b"json/plain"
-_SENSITIVE_KEYS = {"api_key", "pat", "ssh_key"}
+# `trace_admin_user_license` is the caller's InsightFinder license, carried in
+# a request's `trace` block (common/tracing.py) — the same name mcp-service's
+# own codec masks.
+_SENSITIVE_KEYS = {"api_key", "pat", "ssh_key", "trace_admin_user_license"}
 _ENCRYPTED_PREFIX = "enc:v1:"
 _NONCE_SIZE = 12  # standard for AES-GCM
 
