@@ -5204,3 +5204,190 @@ insightfinder/OnCall-ARI-InfraCore-testing#37 five seconds later. Its
 description ends with the footer, GitHub renders the link with its full
 query string (the test link carried parentheses on purpose), and the commit
 message on the branch has the title and summary only.
+
+## 2026-11-20 - A remote MCP gateway: the agents from Claude, Cursor and other AI apps (II-25648)
+
+The leader asked for the ARI agents inside Cursor and Claude Code, next to
+Slack, Teams and the CLI, and for an "ARI-SRE" that does work there, not a
+data lookup (that is what `insightfinder-mcp-server` is, and it is sold with
+UIE). `src/mcp_gateway/` is a remote MCP server (streamable HTTP, `mcp` SDK
+2.3) in front of the Coordinator; `docs/MCP_GATEWAY.md` is the guide.
+
+**Why remote, not a plugin with a local process.** A local stdio server or
+a skill that shells out to `ari` works only in apps that run commands on the
+person's machine (Cursor, Claude Code), needs Python and the CLI installed,
+and puts the LLM key and the GitHub token on every laptop. A remote server
+is one URL in any MCP app, including the Claude desktop app's ordinary chat
+and claude.ai, which cannot run local commands. The keys stay where the
+Slack and Teams gateways already keep them. Cursor and Claude Code plugins
+can still be added later as thin wrappers that point at the same URL.
+
+**It is a client, like the chat gateways.** It reuses `Bridge`,
+`AgentClient`, `GatewaySettings`, `SessionStore` and the renderers; the
+Bridge's wait budget is set to `MCP_TOOL_WAIT_SECONDS` (25) so a tool call
+returns "working" instead of blocking past what apps tolerate (Cursor is
+reported to give up near 60 s), and `ari_status` follows again. Nothing in
+`chat_gateway/`, the Coordinator or the agents changed. It ships in the
+`ari-chat-gateway` image (`python -m mcp_gateway`), +17 MB.
+
+**Sign-in.** The gateway is its own OAuth 2.1 authorization server (DCR,
+PKCE, RFC 8707 resource binding, RFC 9728 metadata, revocation) and uses a
+GitHub OAuth App only to learn the login. Decisions:
+
+- Our own authorization server rather than pointing apps at an IdP: apps
+  register dynamically and send redirect URIs such as `cursor://...` and
+  `http://localhost:8787/callback`, which GitHub, Entra and Cloudflare do not
+  accept for dynamic clients (several Cursor and Claude forum reports).
+- A consent page of our own before GitHub, naming the app and its return
+  address. GitHub remembers consent for our OAuth App, so without it a
+  dynamically registered look-alike client would get a code silently from a
+  person's existing GitHub session (the "confused deputy" case in the MCP
+  security guidance). The page cannot be framed, and both the form post
+  and the GitHub callback must come from the browser that loaded it
+  (single-use cookie).
+- Allow-list required (`MCP_ALLOWED_USERS` and/or `MCP_ALLOWED_GITHUB_ORGS`);
+  the gateway refuses to start without one. The GitHub token is used once
+  and dropped. Users removed from `MCP_ALLOWED_USERS` lose access at the
+  next request after a restart; for org-based access `python -m mcp_gateway
+  revoke <login>` deletes their tokens, because membership cannot be
+  re-checked without the person.
+- `MCP_STATE_FILE` keeps clients and SHA-256 hashes of tokens (0600,
+  atomic); a test asserts no token, client secret, LLM key or PAT is in it.
+
+**Approvals.** Identity is the token's subject (GitHub login), never a tool
+argument. `ari_approve` needs the `proposal_id` that was shown; `ari_ask`
+refuses "yes"/"approve" while a proposal waits, so the Bridge's typed-yes
+shortcut cannot be used to bypass `ari_approve`; when the app supports
+elicitation the person confirms in a dialog the model does not control;
+`MCP_APPROVAL_REQUIRES_ELICITATION=true` refuses approvals from apps that
+cannot ask. Conversation ids are random 128-bit; other users are refused
+even with the id unless they are in `MCP_APPROVERS`.
+
+**Verified:** Windows 703 passed (the 7 known POSIX-only modules not
+collected); Linux 1058 passed in `ari-oncall-agent-worker:2611101100-test`
+with the extras installed. 36 new cases: service logic with the Bridge fake,
+and the real Starlette app over HTTP (metadata, 401 without token, DCR +
+PKCE + consent + callback + token, tool calls, code reuse, refresh rotation,
+restart, revoke, allow-list removal, deny, cookie binding, callback without
+consent, refused user, wrong resource).
+
+**Live on the gateway EC2 (2026-11-20)**, image `ari-chat-gateway:ii25648`
+built there, in a throwaway container with `test/agent.env`, the real MCP
+SDK client (`OAuthClientProvider`) and a stub in place of GitHub: discovery,
+registration, consent, token, protocol 2025-11-25; `ari_whoami` read the
+Coordinator card; a question answered in 6.9 s; a change request returned
+"working" at 26 s and `ari_status` brought the proposal (branch pushed to
+OnCall-ARI-InfraCore-testing); a typed "yes" and a wrong `proposal_id` were
+refused; the elicitation dialog arrived with repository, branch, files and
+diff link, was declined, and the proposal stayed waiting; `ari_decline`
+cancelled it. No pull request was opened. Not yet tried: a real GitHub
+OAuth App and the Claude, Cursor and Claude Code apps, which need a public
+hostname.
+
+### 2026-11-22 - Approvals from real apps: input_required, a browser page, and a live PR (II-25648)
+
+**Real clients, first run (2026-11-20).** With the gateway public at
+`test-ari-mcp.insightfinder.com` (container `mcp-test` on the chat gateway
+EC2, Caddy, a GitHub OAuth App) Claude Code signed in through DCR + the
+consent page + GitHub, `ari_whoami` and a question worked, and a change
+request reached a proposal. Approving failed four times, for two reasons
+found in the gateway log:
+
+- Claude Code in the Claude desktop app speaks protocol **2026-07-28**,
+  where a server cannot send `elicitation/create` in the middle of a tool
+  call (`NoBackChannelError: this transport context has no back-channel`).
+  The question has to travel as an `InputRequiredResult` (form
+  `ElicitRequest` + `request_state`), and the app retries the call with
+  `input_responses`. The harness had passed because the SDK client
+  negotiated 2025-11-25. `confirmation()` now uses `input_required` on
+  2026-07-28 connections and on `NoBackChannelError`, and `ctx.elicit` on
+  older ones. The SDK seals `request_state` with a process key and binds it
+  to the token's principal: another user replaying an answer gets
+  `400 Invalid or expired requestState` before the tool runs.
+- After that fix the same app **declined the question 0.64 s after it was
+  asked, showing nothing** (`approval confirmation answered by
+  input_required: decline (action=decline, after 0.64s)`). It advertises
+  elicitation but does not render it. No approval went through on any of
+  these attempts.
+
+**Browser approval page (`approval.py`).** `MCP_APPROVAL_CONFIRMATION`:
+`dialog` (default: the gateway's dialog where the app shows it, otherwise
+the page), `browser` (always the page), `app` (the app's own tool prompt
+only). When the dialog is unavailable or declined, `ari_approve` returns a
+single-use link (15 min). Opening it starts a GitHub sign-in through the
+same OAuth App and callback URL (state prefix `approve.` routes it), bound
+to the browser by a cookie; the page re-runs `prepare_approval` as the
+signed-in login, so a forwarded link lets a listed approver approve as
+themselves and refuses anyone else; the form carries a per-page CSRF token;
+`X-Frame-Options: DENY`. The model can receive the link but cannot complete
+a GitHub sign-in in the person's browser. A 503 from the Coordinator is now
+reported as "temporarily unavailable, try again", not as a refusal.
+
+**Verified live (2026-11-22)** from this repo's own Claude Code session
+against test: proposal `c324e991` on OnCall-ARI-InfraCore-testing, dialog
+auto-declined in 0.48 s, link created, opened by a person, GitHub sign-in,
+Approve at 10:57:04 UTC → insightfinder/OnCall-ARI-InfraCore-testing#47
+(`docs/mcp-browser-approval-check.md` → `dev`). The PR's author is the
+owner of the PAT in `test/agent.env`, a person, not a bot. 57 gateway tests
+(Windows). Not tried yet: Cursor, and Claude desktop chat, whose custom
+connectors on a Team plan only an organisation owner can add.
+
+**Test cluster during these runs:** three `mng-spot` nodes stopped posting
+kubelet status within ~75 minutes on 2026-11-20 while their instances kept
+running; the single-replica ARI APIs with EBS PVCs stayed in
+ContainerCreating until the instances were terminated and the attach-detach
+controller's 6-minute timeout passed (~12 minutes each time). Root cause
+not established.
+
+## 2026-11-23 — Jenkins agent behind the gateways; test Coordinator under Flux
+
+**Gateway side.** `GatewaySettings` gained `JENKINS_URL`, `JENKINS_USER`,
+`JENKINS_TOKEN`, `JENKINS_AUTH_TYPE` (`api_token` default, `basic`,
+`bearer`) and `JENKINS_VERIFY_TLS`. With `JENKINS_URL` set, `Bridge.build_config`
+adds the `jenkins` block the Jenkins agent reads (`base_url`, `auth`,
+`verify_tls`); unset, requests are unchanged. The token is a secret field
+(masked, stripped). The MCP gateway refuses to start on an incomplete block.
+The Coordinator forwards it only to agents whose `forward_config` lists
+`jenkins`.
+
+**Test deployment, and where each piece is declared.**
+- Jenkins agent: HelmRelease `ari-jenkins` in test-fluxcd
+  `apps/insightfinder/ari-jenkins/` (chart 0.3.13, `fullnameOverride: ari`
+  → `ari-jenkins-api` / `ari-jenkins-worker`, Temporal `jenkins-ari-agent` /
+  `jenkins-ari-queue`, no ingress).
+- Coordinator: was a hand-installed Helm release from a local chart copy
+  (revisions 1–6). Now HelmRelease `ari-coordinator` in test-fluxcd
+  `apps/insightfinder/ari-coordinator/`, chart 0.3.13, whose coordinator
+  templates are byte-identical to that copy; the render with the Flux
+  values equals the live manifest except the `helm.sh/chart` label. Agents:
+  oncall, k8s, jenkins (`forwardConfig: [jenkins, llm, options]`). Edit it
+  there, never with `helm upgrade` by hand: the old published 0.3.8 has no
+  coordinator templates and an upgrade with it deleted every object once.
+- Jenkins network: the test VPC has no NAT, so a pod reaches
+  jenkins.insightfinder.com:8080 from its node's public IP. Security group
+  `sg-01a97ff62f0dec233` (us-east-1) allows tcp/8080 per node IP; rules
+  added 2026-11-23 for the 8 nodes not yet listed: sgr-0102ff0ece4de15e8,
+  sgr-070c7a83e33de4d9f, sgr-00bec66af15ecb660, sgr-0c1cd5a4d995aa650,
+  sgr-0166f6bbacc72c2f5, sgr-0068dc01dff38f595, sgr-00d59c69a07fe5c25,
+  sgr-03b9e66b3b112c33a (50.18.237.155 was already allowed). These go stale
+  whenever spot nodes are replaced; the lasting fix is a fixed egress IP.
+  Not declared in any repository.
+- MCP gateway: `mcp-test` in compose on the chat gateway EC2, with
+  `JENKINS_URL`, `JENKINS_USER`, `JENKINS_TOKEN` in `test/mcp.env`. That host
+  is configured by hand, like the Slack and Teams gateways on it; the
+  variables are listed in `.env.example.mcp-gateway`. It runs a locally
+  built `ari-chat-gateway:ii25648` until this branch reaches `test` and CI
+  publishes a `-test` tag.
+
+**Jenkins times are converted by code (2026-11-23).** Asked for the last
+builds of ARI-Agent-Test-Pipeline through the MCP gateway, the agent
+reported build #9 as started 2024-12-05 15:00:28; Jenkins said
+`timestamp 1791454828356`, i.e. 2026-10-08 10:20:28 UTC. The Jenkins MCP
+plugin returns epoch milliseconds and the model in opencode converted them
+itself, wrongly (only the seconds matched). `jenkins_agent/timefmt.py`:
+`resolve_target`, `inspect` and `diagnose` append a rule telling the model
+to write `[ts:<ms>]` / `[dur:<ms>]` verbatim, and `humanize` turns those into
+`YYYY-MM-DD HH:MM:SS UTC` / `8m 4s` before any later step sees the text; a
+bare 13-digit number in the 2001–2100 range also gets its date alongside.
+Probed with claude-haiku-4-5 on a getBuild payload: 3 of 3 answers used the
+markers.
