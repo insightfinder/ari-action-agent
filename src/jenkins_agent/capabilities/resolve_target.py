@@ -5,6 +5,7 @@ ari_oncall_agent's clone_repo — there's no clone step here, so this is
 where that setup naturally lands instead)."""
 
 from common.capabilities_base import StepContext
+from jenkins_agent.timefmt import humanize, with_time_rule
 
 
 async def run(ctx: StepContext) -> dict:
@@ -22,5 +23,5 @@ async def run(ctx: StepContext) -> dict:
         "or stop anything.\n\n"
         f"{ctx.prompt}"
     )
-    result = await opencode(ctx, instruction)
-    return {"resolution": result["text"], "trace": result["trace"]}
+    result = await opencode(ctx, with_time_rule(instruction))
+    return {"resolution": humanize(result["text"]), "trace": result["trace"]}

@@ -72,6 +72,29 @@ async def test_inspect_includes_the_resolved_target_in_its_instruction():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "module, capability, key, text",
+    [
+        (resolve_target, "resolve_target", "resolution", "ARI-Agent-Test-Pipeline #9, started [ts:1791454828356]"),
+        (inspect, "inspect", "findings", "#9 SUCCESS, started [ts:1791454828356], ran [dur:484357]"),
+        (diagnose, "diagnose", "cause", "SUMMARY:\n#9 failed at [ts:1791454828356] after [dur:484357]"),
+    ],
+)
+async def test_jenkins_times_are_converted_by_code_not_by_the_model(module, capability, key, text):
+    opencode = AsyncMock(return_value={"text": text, "trace": _STUB_TRACE})
+    ctx = _ctx(capability, results={}, tools={"opencode_config": Mock(), "opencode": opencode}, params={"instruction": "custom"})
+
+    result = await module.run(ctx)
+
+    instruction = opencode.await_args.args[1]
+    assert instruction.startswith("custom") and "[ts:<milliseconds>]" in instruction
+    assert "2026-10-08 10:20:28 UTC" in result[key]
+    assert "[ts:" not in result[key] and "[dur:" not in result[key]
+    if capability != "resolve_target":
+        assert "8m 4s" in result[key]
+
+
+@pytest.mark.asyncio
 async def test_diagnose_returns_only_the_marked_cause_not_raw_narration():
     opencode = AsyncMock(
         return_value={

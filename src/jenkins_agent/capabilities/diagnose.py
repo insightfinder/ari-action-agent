@@ -13,6 +13,7 @@ clean cause)."""
 
 from common.capabilities_base import StepContext
 from common.opencode_runtime import merge_traces
+from jenkins_agent.timefmt import humanize, with_time_rule
 
 _SUMMARY_MARKER = "SUMMARY:"
 
@@ -48,11 +49,11 @@ async def run(ctx: StepContext) -> dict:
         + (f"Resolved target: {target}\n\n" if target else "")
         + f"Request: {ctx.prompt}"
     )
-    result = await opencode(ctx, instruction)
+    result = await opencode(ctx, with_time_rule(instruction))
     trace = result["trace"]
     cause = _extract_summary(result["text"])
     if cause is None:
         followup = await opencode(ctx, _ENFORCEMENT_INSTRUCTION, continue_session=True)
         cause = followup["text"].strip() or result["text"].strip()
         trace = merge_traces(trace, followup["trace"])
-    return {"cause": cause, "trace": trace}
+    return {"cause": humanize(cause), "trace": trace}

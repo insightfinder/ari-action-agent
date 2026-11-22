@@ -15,6 +15,7 @@ It is a standard **A2A (Agent2Agent) protocol server**, built on the official [`
 | Your own service | A2A over HTTP, blocking, polling or webhook | [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md), runnable [`docs/examples/sample_client.py`](docs/examples/sample_client.py) |
 | A terminal | `ari`, an interactive chat with approval menus, plus scriptable commands | [`docs/CLI.md`](docs/CLI.md) |
 | Slack or Microsoft Teams | the chat gateway: mention the bot, approve with buttons | [`docs/CHAT_GATEWAY.md`](docs/CHAT_GATEWAY.md) |
+| Claude, Cursor, Claude Code | the MCP gateway: add one URL, sign in with GitHub, approve in the app or the browser | [`docs/MCP_GATEWAY.md`](docs/MCP_GATEWAY.md) |
 
 ## Extend it with Agent Skills
 
@@ -97,7 +98,8 @@ Run one API Deployment and one worker Deployment per agent kind, against a Tempo
 │   ├── ari_oncall_agent/    # the oncall kind's capabilities, tools and metadata
 │   ├── k8s_agent/           # the k8s kind's capabilities, tools and metadata
 │   ├── ari_cli/             # the `ari` command
-│   └── chat_gateway/        # the Slack and Teams gateway, sharing its bridge with `ari`
+│   ├── chat_gateway/        # the Slack and Teams gateway, sharing its bridge with `ari`
+│   └── mcp_gateway/         # remote MCP server for Claude, Cursor and other AI apps
 └── tests/
 ```
 

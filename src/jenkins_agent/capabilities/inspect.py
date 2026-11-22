@@ -11,6 +11,7 @@ run first in the same plan, there would otherwise be no opencode.json on
 disk yet at all."""
 
 from common.capabilities_base import StepContext
+from jenkins_agent.timefmt import humanize, with_time_rule
 
 
 async def run(ctx: StepContext) -> dict:
@@ -28,5 +29,5 @@ async def run(ctx: StepContext) -> dict:
         + (f"Resolved target: {target}\n\n" if target else "")
         + f"Request: {ctx.prompt}"
     )
-    result = await opencode(ctx, instruction)
-    return {"findings": result["text"], "trace": result["trace"]}
+    result = await opencode(ctx, with_time_rule(instruction))
+    return {"findings": humanize(result["text"]), "trace": result["trace"]}
