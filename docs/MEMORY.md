@@ -5391,3 +5391,21 @@ to write `[ts:<ms>]` / `[dur:<ms>]` verbatim, and `humanize` turns those into
 bare 13-digit number in the 2001–2100 range also gets its date alongside.
 Probed with claude-haiku-4-5 on a getBuild payload: 3 of 3 answers used the
 markers.
+
+**Claude Code plugin (2026-11-23).** The repository root is a plugin
+marketplace (`.claude-plugin/marketplace.json`, name `ari-agent`) with one
+plugin, `plugins/ari`: a remote MCP server whose URL comes from the
+`server_url` user option (`${user_config.server_url}`), so every company
+points it at its own gateway. Install with
+`claude plugin marketplace add insightfinder/ari-action-agent` and
+`claude plugin install ari@ari-agent`. The icon is the UIE ARI icon (the
+1024 px PNG embedded in `ari.svg`, cropped the way UIE shows it); the plugin
+directory takes the icon only from the first submission.
+`claude plugin validate --strict --profile directory plugins/ari` passes.
+Claude Code drops a plugin MCP server whose URL equals a manually added one
+("Suppressing plugin MCP server ... duplicates manually-configured"), so
+remove a hand-added entry for the same gateway before testing the plugin.
+The Claude desktop app lists the plugin server as "Connects in sessions" but
+gives no way to sign in to it; signing in from the CLI (`/mcp` ->
+`plugin:ari:ari` -> Authenticate) works, the desktop app shares that token,
+and a session started afterwards calls `ari_whoami` (verified 2026-11-24).
