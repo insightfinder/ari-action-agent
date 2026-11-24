@@ -58,11 +58,15 @@ class Bridge:
 
     def build_config(self, thread_key: str, directives: dict[str, str], *, require_pat: bool = False) -> dict[str, Any]:
         repo_url = directives.get("repo") or self.settings.repo_for(thread_key)
-        return {
+        config = {
             "repo": self.settings.repo_config(repo_url, directives.get("ref", ""), require_pat=require_pat),
             "llm": self.settings.llm_config(),
             "options": self.settings.options(),
         }
+        jenkins = self.settings.jenkins_config()
+        if jenkins is not None:
+            config["jenkins"] = jenkins
+        return config
 
     def can_take_part(self, conversation: Conversation, actor: str) -> bool:
         return actor == conversation.requester or actor in self.settings.approver_set()

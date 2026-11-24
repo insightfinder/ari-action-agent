@@ -9,7 +9,9 @@ DEFAULT_MODELS = {"openai": "gpt-4o-mini", "anthropic": "claude-haiku-4-5"}
 
 INTERACTIVE_LANE = "interactive"
 
-SECRET_FIELDS = frozenset({"ari_api_key", "llm_api_key", "github_pat"})
+SECRET_FIELDS = frozenset({"ari_api_key", "llm_api_key", "github_pat", "jenkins_token"})
+
+JENKINS_AUTH_TYPES = ("api_token", "bearer", "basic")
 
 
 class ConfigError(ValueError):
@@ -37,8 +39,13 @@ class GatewaySettings(BaseSettings):
     wait_seconds: float = 3600.0
     agent_outage_seconds: float = 600.0
     request_timeout_seconds: float = 60.0
+    jenkins_url: str = ""
+    jenkins_user: str = ""
+    jenkins_token: str = ""
+    jenkins_auth_type: str = "api_token"
+    jenkins_verify_tls: bool = True
 
-    @field_validator("ari_api_key", "llm_api_key", "github_pat", mode="before")
+    @field_validator("ari_api_key", "llm_api_key", "github_pat", "jenkins_token", mode="before")
     @classmethod
     def strip_secret(cls, value: Any) -> Any:
         return value.strip() if isinstance(value, str) else value
@@ -53,6 +60,25 @@ class GatewaySettings(BaseSettings):
         if self.llm_base_url:
             llm["base_url"] = self.llm_base_url
         return llm
+
+    def jenkins_config(self) -> dict[str, Any] | None:
+        if not self.jenkins_url:
+            return None
+        parts = urlsplit(self.jenkins_url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ConfigError("JENKINS_URL must be an http or https address")
+        if parts.username or parts.password:
+            raise ConfigError("JENKINS_URL must not embed credentials; use JENKINS_USER and JENKINS_TOKEN")
+        if self.jenkins_auth_type not in JENKINS_AUTH_TYPES:
+            raise ConfigError(f"JENKINS_AUTH_TYPE must be one of {', '.join(JENKINS_AUTH_TYPES)}")
+        if not self.jenkins_token:
+            raise ConfigError("JENKINS_URL is set but JENKINS_TOKEN is empty")
+        if self.jenkins_auth_type != "bearer" and not self.jenkins_user:
+            raise ConfigError(f"JENKINS_USER is required with JENKINS_AUTH_TYPE={self.jenkins_auth_type}")
+        auth: dict[str, Any] = {"type": self.jenkins_auth_type, "token": self.jenkins_token}
+        if self.jenkins_user:
+            auth["user"] = self.jenkins_user
+        return {"base_url": self.jenkins_url.rstrip("/"), "auth": auth, "verify_tls": self.jenkins_verify_tls}
 
     def repo_map_entries(self) -> dict[str, str]:
         entries: dict[str, str] = {}
