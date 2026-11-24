@@ -36,11 +36,29 @@ capabilities:
       backoff_seconds: 5
     timeout_seconds: 300
 
+  query_resources:
+    module: k8s_agent.capabilities.query_resources
+    description: >
+      Lists objects of any kind this agent can read as a table — pods,
+      per-container CPU/memory requests, limits and usage (kind Container),
+      Deployments, StatefulSets, Jobs, Services, Ingresses, PVCs, nodes,
+      events, HPAs, KEDA ScaledObjects and more — filtered, sorted and
+      capped in code, with how many rows matched. For "list / show / which /
+      table of ..." questions, including all pods with their limits and
+      usage. Read-only. Optional param: `namespace`.
+    tools: [llm_complete, list_views, namespace_names, get_pod_metrics]
+    retry:
+      max_attempts: 2
+      backoff_seconds: 5
+    timeout_seconds: 180
+
   propose_change:
     module: k8s_agent.capabilities.propose_change
     description: >
       For any requested change — Deployment replicas, a KEDA/HPA min or
-      max, or CPU/memory requests/limits. Works out the exact change,
+      max, CPU/memory requests/limits of a Deployment (rolls its pods), or
+      CPU/memory of one running pod in place (no rollout; needs Kubernetes
+      in-place pod resize, read live from the cluster). Works out the exact change,
       checks it (autoscaler rules, replica floor of 1, node-capacity cap,
       capacity and Cluster Autoscaler outlook, pre-flight risks), dry-runs
       it against the API server, and pauses for a person's approval. Never
@@ -56,6 +74,8 @@ capabilities:
       - list_pdbs
       - get_pvcs
       - get_flux_chain
+      - get_pod
+      - get_resize_support
       - dry_run_patch
     retry:
       max_attempts: 2
@@ -69,9 +89,10 @@ capabilities:
       confirmed proposal, re-checks that the cluster has not changed since
       the proposal, writes at most once, then verifies the outcome from
       cluster state (rollout progress, failing new pods, pods that cannot be
-      scheduled and why). Never planned directly — reachable only through
+      scheduled and why; for an in-place pod resize, the values the kubelet
+      reports as applied on the same pod). Never planned directly — reachable only through
       the approval of a propose_change proposal.
-    tools: [get_deployment, find_autoscaler, patch_workload, wait_rollout, get_flux_chain]
+    tools: [get_deployment, find_autoscaler, get_pod, get_resize_support, list_nodes, patch_workload, wait_rollout, wait_resize, get_flux_chain]
     # A second attempt (the worker died, or a read failed, mid-step) finds the
     # approved values already in place and verifies instead of writing again.
     retry:

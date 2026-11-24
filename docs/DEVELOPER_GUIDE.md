@@ -529,7 +529,7 @@ a request never carries cluster credentials.
     the request states values for**.
 
   Never below 1 replica. Targets above `options.high_replica_threshold`
-  (default 50) are proposed with `risk_tier: critical`. CPU/memory values
+  (default 30) are proposed with `risk_tier: critical`. CPU/memory values
   above what one eligible node can give the container (allocatable minus
   DaemonSet requests, minus `options.node_headroom_ratio`, default 20%,
   minus the requests of the pod's other containers; CPU and memory taken
@@ -545,7 +545,7 @@ a request never carries cluster credentials.
   "llm": {"provider": "anthropic", "api_key": "...", "model": "..."},
   "options": {
     "namespace": "shop",
-    "high_replica_threshold": 50,
+    "high_replica_threshold": 30,
     "node_headroom_ratio": 0.2,
     "include_logs": true
   }
@@ -561,7 +561,8 @@ are `a2a-task:k8s`, `plan_task`, one `capability:<name>` per step (`check_health
 
 1. `message/send` "scale checkout to 5 replicas" → the task ends in
    `TASK_STATE_INPUT_REQUIRED` with a `pending_action` artifact: `id`,
-   `action` (`scale_replicas` | `set_autoscaler_bounds` | `set_resources`),
+   `action` (`scale_replicas` | `set_autoscaler_bounds` | `set_resources` |
+   `resize_pod`, see docs/K8S_AGENT_INTERFACE.md),
    `action_name` (the line an approval email shows), `before`/`after`,
    `clamped`, `risk_tier`, `risks`, `capacity_outlook`, the server-side
    `dry_run` result, `drift_notice`, `persistence`, and a `snapshot` of

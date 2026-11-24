@@ -23,7 +23,7 @@ class LLMConfig(BaseModel):
 class K8sOptions(BaseModel):
     namespace: Optional[str] = Field(None, description="Default namespace when the request names none.")
     high_replica_threshold: int = Field(
-        50, description="Replica targets above this are flagged as the highest risk tier in the proposal."
+        30, description="Replica targets above this are flagged as the highest risk tier in the proposal."
     )
     node_headroom_ratio: float = Field(
         0.2, description="CPU/memory caps use at most (1 - ratio) of the best node's allocatable capacity."

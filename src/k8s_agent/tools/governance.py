@@ -139,3 +139,12 @@ def drift_notice(ownership: dict, chain: dict | None = None) -> str:
             f"chart's value.{detail}"
         )
     return "This object has no GitOps or Helm owner: the change persists, but nothing in version control records it."
+
+
+def deployment_of(pod: dict) -> str | None:
+    """The Deployment that owns `pod` (a pod view), read from its ReplicaSet owner and pod-template-hash label."""
+    owner = pod.get("owner_name")
+    template_hash = (pod.get("labels") or {}).get("pod-template-hash")
+    if pod.get("owner_kind") == "ReplicaSet" and owner and template_hash and owner.endswith(f"-{template_hash}"):
+        return owner[: -len(template_hash) - 1]
+    return None

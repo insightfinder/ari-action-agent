@@ -331,3 +331,135 @@ async def wait_rollout(
             verdict["waited_seconds"] = elapsed
             return verdict
         await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
+
+
+# ---------------------------------------------------------------- in-place pod resize
+
+
+def _container_status(pod: dict, container: str) -> dict:
+    return next((c for c in pod.get("containers") or [] if c.get("name") == container), {})
+
+
+def _resize_condition(pod: dict, kind: str) -> dict | None:
+    return next((c for c in pod.get("conditions") or [] if c.get("type") == kind and c.get("status") == "True"), None)
+
+
+def _status_matches(pod: dict, container: str, approved: dict) -> bool:
+    actual = (pod.get("status_resources") or {}).get(container)
+    if actual is None:
+        return False
+    for side, values in (approved or {}).items():
+        for resource, value in (values or {}).items():
+            have = (actual.get(side) or {}).get(resource)
+            try:
+                if have is None or quantities.to_units(resource, have) != quantities.to_units(resource, value):
+                    return False
+            except ValueError:
+                return False
+    return True
+
+
+async def wait_resize(
+    namespace: str,
+    pod: str,
+    container: str,
+    resources: dict,
+    uid: str | None,
+    max_wait_seconds: float,
+    restarts_before: int | None = None,
+    poll_seconds: float = POLL_SECONDS,
+) -> dict:
+    """Poll one pod after an in-place resize until the kubelet reports the approved values as applied.
+
+    Succeeded: the same pod (uid) shows the approved values in `status.containerStatuses[].resources`, no
+    PodResizePending/PodResizeInProgress condition is left, and the container is ready and stays up without a
+    further restart for STABILITY_SECONDS (a restart is expected once under `RestartContainer`; a lowered
+    memory limit can OOM-kill the restarted process right after). With `restarts_before` set (a restart is
+    expected), nothing counts as applied until the container has restarted past it, so the old container
+    still reporting ready is never taken as the result. Infeasible ends the wait at once; Deferred
+    (the node has the room only once other pods shrink or leave) is waited for until the window ends.
+    """
+    started = time.monotonic()
+    stable_since: float | None = None
+    baseline = 0
+    while True:
+        view = await read.get_pod(namespace, pod)
+        elapsed = round(time.monotonic() - started)
+        base = {"pod": pod, "container": container, "waited_seconds": elapsed}
+        if view is None or (uid and view.get("uid") != uid):
+            return {
+                **base,
+                "done": True,
+                "status": "pod_replaced",
+                "detail": (
+                    "The pod was replaced while the resize was being watched (it no longer exists, or has a new uid); "
+                    "its replacement runs with the Deployment template's values."
+                ),
+            }
+        pending = _resize_condition(view, "PodResizePending")
+        in_progress = _resize_condition(view, "PodResizeInProgress")
+        status = _container_status(view, container)
+        state = status.get("state") or {}
+        failing = state.get("state") == "waiting" and state.get("reason") in _FAILING_WAIT_REASONS
+        base["restart_count"] = status.get("restart_count")
+        if pending and pending.get("reason") == "Infeasible":
+            return {
+                **base,
+                "done": True,
+                "status": "resize_infeasible",
+                "detail": f"The kubelet cannot apply this resize on the pod's node: {pending.get('message') or 'Infeasible'}",
+            }
+        applied = _status_matches(view, container, resources)
+        if applied and failing:
+            last = status.get("last_state") or {}
+            return {
+                **base,
+                "done": True,
+                "status": "container_failing",
+                "detail": (
+                    f"The resize was applied but container {container} is failing: {state.get('reason')}"
+                    + (f" (last termination {last.get('reason')}, exit code {last.get('exit_code')})" if last.get("state") == "terminated" else "")
+                ),
+            }
+        restarted = restarts_before is None or (status.get("restart_count") or 0) > restarts_before
+        if applied and restarted and not pending and not in_progress and status.get("ready"):
+            if stable_since is None:
+                stable_since, baseline = time.monotonic(), status.get("restart_count") or 0
+            elif (status.get("restart_count") or 0) > baseline:
+                last = status.get("last_state") or {}
+                return {
+                    **base,
+                    "done": True,
+                    "status": "container_failing",
+                    "detail": (
+                        f"Container {container} restarted again within {round(time.monotonic() - stable_since)}s of the resize "
+                        + (f"({last.get('reason')}, exit code {last.get('exit_code')})" if last.get("state") == "terminated" else "")
+                    ).strip(),
+                }
+            observed = time.monotonic() - stable_since
+            if observed >= STABILITY_SECONDS:
+                return {**base, "done": True, "status": "succeeded", "stable_for_seconds": round(observed), "node": view.get("node_name")}
+        else:
+            stable_since = None
+        if elapsed >= max_wait_seconds:
+            if pending and pending.get("reason") == "Deferred":
+                return {
+                    **base,
+                    "done": True,
+                    "status": "resize_deferred",
+                    "detail": (
+                        "The resize is accepted but deferred: the node does not have the room right now; the kubelet "
+                        f"applies it once it does. {pending.get('message') or ''}"
+                    ).strip(),
+                }
+            note = (in_progress or {}).get("message")
+            return {
+                **base,
+                "done": True,
+                "status": "in_progress",
+                "note": (
+                    "The resize was accepted but had not been reported as applied when the wait window "
+                    f"({int(max_wait_seconds)}s) ended" + (f" ({note})" if note else "") + "; check the pod again later."
+                ),
+            }
+        await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))

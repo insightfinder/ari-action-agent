@@ -12,10 +12,16 @@ import re
 from . import quantities
 
 REPLICA_FLOOR = 1  # never configurable: nothing this agent does scales a workload to zero
-DEFAULT_HIGH_REPLICA_THRESHOLD = 50
+DEFAULT_HIGH_REPLICA_THRESHOLD = 30  # the user's choice, 2026-11-24 (was 50)
 
 _AUTOSCALER_WORDS = re.compile(
     r"(?i)(keda|scaled\s*-?\s*object|\bhpa\b|horizontal\s*pod\s*autoscaler|autoscal\w*|自动扩缩|弹性伸缩)"
+)
+# Wording that asks for an in-place pod resize rather than a Deployment change. A pod name alone is not enough:
+# on-call prompts quote pod names from health findings while asking for the Deployment's memory to change.
+_IN_PLACE_WORDS = re.compile(
+    r"(?i)(in[\s-]?place|\bresize\b[^.\n]{0,40}\bpod\b|\bpod\b[^.\n]{0,40}\bresize\b|without\s+(a\s+)?(restart|rollout|recreat\w*|redeploy\w*)"
+    r"|no\s+(rollout|restart|recreat\w*)|原地|不重建|不重启|不滚动)"
 )
 _DIGIT = re.compile(r"\d")
 _SPACE = re.compile(r"\s+")
@@ -87,6 +93,11 @@ def mentions_autoscaler(prompt: str, own_names: list[str] | None = None) -> bool
     for name in sorted({n for n in own_names or [] if n}, key=len, reverse=True):
         text = re.sub(re.escape(name), " ", text, flags=re.IGNORECASE)
     return bool(_AUTOSCALER_WORDS.search(text))
+
+
+def asks_in_place(prompt: str) -> bool:
+    """Does the request itself ask for an in-place pod resize (not just name a pod)?"""
+    return bool(_IN_PLACE_WORDS.search(prompt or ""))
 
 
 def high_replica_threshold(options: dict) -> int:

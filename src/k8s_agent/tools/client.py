@@ -17,6 +17,9 @@ projected volume and is never logged, returned or copied anywhere.
 Everything else in this package talks to the cluster only through
 `Kube` below, by kind name, and only ever sees plain camelCase dicts (the
 API's own JSON shape) — which is also what the tests' fake implements.
+A kind name resolves to its REST path through `catalog.py`, so there is no
+per-kind dispatch table here: one generic request path serves every kind,
+subresource (`scale`, `eviction`) and verb.
 """
 
 import asyncio
@@ -28,6 +31,8 @@ from kubernetes import client as k8s
 from kubernetes import config as k8s_config
 from kubernetes.client.exceptions import ApiException
 
+from . import catalog
+from .catalog import Kind
 from .redact import bounded, redact_text
 
 FIELD_MANAGER = "ari-k8s-agent"
@@ -37,21 +42,6 @@ _PAGE_SIZE = 500
 PATCH_MERGE = "application/merge-patch+json"
 PATCH_STRATEGIC = "application/strategic-merge-patch+json"
 
-# kind -> (group, version, plural) for objects read through CustomObjectsApi.
-CUSTOM = {
-    "ScaledObject": ("keda.sh", "v1alpha1", "scaledobjects"),
-    "PodMetrics": ("metrics.k8s.io", "v1beta1", "pods"),
-    "HelmRelease": ("helm.toolkit.fluxcd.io", "v2", "helmreleases"),
-    "HelmReleaseV2beta2": ("helm.toolkit.fluxcd.io", "v2beta2", "helmreleases"),
-    "Kustomization": ("kustomize.toolkit.fluxcd.io", "v1", "kustomizations"),
-    "GitRepository": ("source.toolkit.fluxcd.io", "v1", "gitrepositories"),
-    "OCIRepository": ("source.toolkit.fluxcd.io", "v1", "ocirepositories"),
-    "OCIRepositoryV1beta2": ("source.toolkit.fluxcd.io", "v1beta2", "ocirepositories"),
-    "Bucket": ("source.toolkit.fluxcd.io", "v1", "buckets"),
-    "BucketV1beta2": ("source.toolkit.fluxcd.io", "v1beta2", "buckets"),
-    "HelmRepository": ("source.toolkit.fluxcd.io", "v1", "helmrepositories"),
-    "HelmRepositoryV1beta2": ("source.toolkit.fluxcd.io", "v1beta2", "helmrepositories"),
-}
 # Flux source kind -> kinds to try, newest API version first.
 FLUX_SOURCES = {
     "GitRepository": ["GitRepository"],
@@ -64,126 +54,130 @@ CHART_SOURCES = {**FLUX_SOURCES, "HelmRepository": ["HelmRepository", "HelmRepos
 HELMRELEASE_KINDS = ["HelmRelease", "HelmReleaseV2beta2"]
 
 
+def _kind(kind: str | Kind) -> Kind:
+    return kind if isinstance(kind, Kind) else catalog.get(kind)
+
+
 class Kube:
-    """Async, dict-in/dict-out access to exactly the operations this agent uses."""
+    """Async, dict-in/dict-out access to the Kubernetes API by kind name (or a `catalog.Kind` for a custom
+    resource found at run time). Verbs: get, list, patch, delete, create; plus pod_log."""
 
     def __init__(self, api_client: k8s.ApiClient):
         self._api = api_client
         self._core = k8s.CoreV1Api(api_client)
-        self._apps = k8s.AppsV1Api(api_client)
-        self._autoscaling = k8s.AutoscalingV2Api(api_client)
-        self._policy = k8s.PolicyV1Api(api_client)
-        self._custom = k8s.CustomObjectsApi(api_client)
 
-    def _dict(self, obj) -> dict:
-        return obj if isinstance(obj, dict) else self._api.sanitize_for_serialization(obj)
+    # ------------------------------------------------------------ one request path
 
-    # ------------------------------------------------------------ dispatch
+    def _request(self, method: str, path: str, query: list | None = None, body=None, content_type: str | None = None) -> dict:
+        headers = {"Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = content_type or "application/json"
+        method, url, headers, body, _ = self._api.param_serialize(
+            method=method,
+            resource_path=path,
+            query_params=query or [],
+            header_params=headers,
+            body=body,
+            auth_settings=["BearerToken"],
+        )
+        response = self._api.call_api(method, url, header_params=headers, body=body, _request_timeout=_TIMEOUT_SECONDS)
+        response.read()
+        text = response.data.decode("utf-8") if response.data else ""
+        if not 200 <= response.status <= 299:
+            raise ApiException.from_response(http_resp=response, body=text, data=None)
+        return json.loads(text) if text else {}
 
-    def _typed(self, kind: str):
-        """(namespaced get, namespaced list, all-namespaces list) for built-in kinds."""
-        c, a = self._core, self._apps
-        return {
-            "Deployment": (a.read_namespaced_deployment, a.list_namespaced_deployment, a.list_deployment_for_all_namespaces),
-            "Pod": (c.read_namespaced_pod, c.list_namespaced_pod, c.list_pod_for_all_namespaces),
-            "Event": (c.read_namespaced_event, c.list_namespaced_event, c.list_event_for_all_namespaces),
-            "ConfigMap": (c.read_namespaced_config_map, c.list_namespaced_config_map, None),
-            "PersistentVolumeClaim": (c.read_namespaced_persistent_volume_claim, c.list_namespaced_persistent_volume_claim, None),
-            "Node": (c.read_node, None, c.list_node),
-            "HorizontalPodAutoscaler": (
-                self._autoscaling.read_namespaced_horizontal_pod_autoscaler,
-                self._autoscaling.list_namespaced_horizontal_pod_autoscaler,
-                None,
-            ),
-            "PodDisruptionBudget": (
-                self._policy.read_namespaced_pod_disruption_budget,
-                self._policy.list_namespaced_pod_disruption_budget,
-                None,
-            ),
-        }[kind]
+    @staticmethod
+    def _write_query(dry_run: bool, field_manager: bool = True) -> list:
+        query = [("fieldManager", FIELD_MANAGER)] if field_manager else []
+        if dry_run:
+            query.append(("dryRun", "All"))
+        return query
 
-    def _get_sync(self, kind: str, name: str, namespace: str | None) -> dict:
-        if kind in CUSTOM:
-            group, version, plural = CUSTOM[kind]
-            return self._custom.get_namespaced_custom_object(
-                group, version, namespace, plural, name, _request_timeout=_TIMEOUT_SECONDS
-            )
-        get, _, _ = self._typed(kind)
-        if kind == "Node":
-            return self._dict(get(name, _request_timeout=_TIMEOUT_SECONDS))
-        return self._dict(get(name, namespace, _request_timeout=_TIMEOUT_SECONDS))
+    # ------------------------------------------------------------ sync verbs
+
+    def _get_sync(self, kind, name, namespace) -> dict:
+        k = _kind(kind)
+        return self._request("GET", k.path(namespace, name))
 
     def _list_sync(self, kind, namespace, label_selector, field_selector, max_items) -> list[dict]:
+        k = _kind(kind)
         items: list[dict] = []
         token = None
         while True:
-            kwargs = {"limit": _PAGE_SIZE, "_request_timeout": _TIMEOUT_SECONDS}
+            query = [("limit", _PAGE_SIZE)]
             if label_selector:
-                kwargs["label_selector"] = label_selector
+                query.append(("labelSelector", label_selector))
             if field_selector:
-                kwargs["field_selector"] = field_selector
+                query.append(("fieldSelector", field_selector))
             if token:
-                kwargs["_continue"] = token
-            if kind in CUSTOM:
-                group, version, plural = CUSTOM[kind]
-                if namespace:
-                    page = self._custom.list_namespaced_custom_object(group, version, namespace, plural, **kwargs)
-                else:
-                    page = self._custom.list_cluster_custom_object(group, version, plural, **kwargs)
-                page_items = page.get("items") or []
-                token = (page.get("metadata") or {}).get("continue")
-            else:
-                _, list_ns, list_all = self._typed(kind)
-                page = list_ns(namespace, **kwargs) if namespace else list_all(**kwargs)
-                page_items = [self._dict(i) for i in page.items or []]
-                meta = page.metadata
-                token = (getattr(meta, "_continue", None) or getattr(meta, "var_continue", None)) if meta else None
-            items.extend(page_items)
+                query.append(("continue", token))
+            page = self._request("GET", k.path(namespace if k.namespaced else None), query)
+            items.extend(page.get("items") or [])
+            token = (page.get("metadata") or {}).get("continue")
             if not token or len(items) >= max_items:
                 return items[:max_items]
 
-    def _patch_sync(self, kind, name, namespace, body, content_type, dry_run) -> dict:
-        kwargs = {
-            "field_manager": FIELD_MANAGER,
-            "_content_type": content_type,
-            "_request_timeout": _TIMEOUT_SECONDS,
-        }
-        if dry_run:
-            kwargs["dry_run"] = "All"
-        if kind == "Scale":
-            return self._dict(self._apps.patch_namespaced_deployment_scale(name, namespace, body, **kwargs))
-        if kind == "Deployment":
-            return self._dict(self._apps.patch_namespaced_deployment(name, namespace, body, **kwargs))
-        if kind == "HorizontalPodAutoscaler":
-            return self._dict(
-                self._autoscaling.patch_namespaced_horizontal_pod_autoscaler(name, namespace, body, **kwargs)
-            )
-        if kind == "ScaledObject":
-            group, version, plural = CUSTOM[kind]
-            return self._custom.patch_namespaced_custom_object(group, version, namespace, plural, name, body, **kwargs)
-        raise ValueError(f"patching {kind} is not supported")
+    def _patch_sync(self, kind, name, namespace, body, content_type, dry_run, subresource) -> dict:
+        k = _kind(kind)
+        return self._request("PATCH", k.path(namespace, name, subresource), self._write_query(dry_run), body, content_type)
 
-    def _log_sync(self, namespace, pod, container, previous, tail_lines, limit_bytes) -> str:
+    def _delete_sync(self, kind, name, namespace, dry_run, grace_period_seconds) -> dict:
+        k = _kind(kind)
+        query = self._write_query(dry_run, field_manager=False)
+        if grace_period_seconds is not None:
+            query.append(("gracePeriodSeconds", int(grace_period_seconds)))
+        return self._request("DELETE", k.path(namespace, name), query, {"propagationPolicy": "Background"})
+
+    def _create_sync(self, kind, namespace, body, dry_run, name, subresource) -> dict:
+        k = _kind(kind)
+        # An eviction is a create on the pod's subresource; fieldManager is not a parameter there.
+        query = self._write_query(dry_run, field_manager=subresource is None)
+        return self._request("POST", k.path(namespace, name, subresource), query, body)
+
+    # Fixed paths only: neither takes a value that could become part of a request path.
+    def _server_version_sync(self) -> dict:
+        return self._request("GET", "/version")
+
+    def _core_resources_sync(self) -> list[str]:
+        """Resource names the API server serves under /api/v1, subresources included ("pods/resize")."""
+        return [r.get("name") for r in self._request("GET", "/api/v1").get("resources") or [] if r.get("name")]
+
+    def _log_sync(self, namespace, pod, container, previous, tail_lines, limit_bytes, since_seconds) -> str:
         kwargs = {"tail_lines": tail_lines, "limit_bytes": limit_bytes, "_request_timeout": _TIMEOUT_SECONDS}
         if container:
             kwargs["container"] = container
         if previous:
             kwargs["previous"] = True
+        if since_seconds:
+            kwargs["since_seconds"] = int(since_seconds)
         return self._core.read_namespaced_pod_log(pod, namespace, **kwargs)
 
     # ------------------------------------------------------------ async API
 
-    async def get(self, kind: str, name: str, namespace: str | None = None) -> dict:
+    async def get(self, kind, name: str, namespace: str | None = None) -> dict:
         return await asyncio.to_thread(self._get_sync, kind, name, namespace)
 
-    async def list(self, kind: str, namespace=None, label_selector=None, field_selector=None, max_items=5000) -> list[dict]:
+    async def list(self, kind, namespace=None, label_selector=None, field_selector=None, max_items=5000) -> list[dict]:
         return await asyncio.to_thread(self._list_sync, kind, namespace, label_selector, field_selector, max_items)
 
-    async def patch(self, kind: str, name: str, namespace: str, body: dict, content_type: str, dry_run: bool) -> dict:
-        return await asyncio.to_thread(self._patch_sync, kind, name, namespace, body, content_type, dry_run)
+    async def patch(self, kind, name: str, namespace: str | None, body: dict, content_type: str, dry_run: bool, subresource: str | None = None) -> dict:
+        return await asyncio.to_thread(self._patch_sync, kind, name, namespace, body, content_type, dry_run, subresource)
 
-    async def pod_log(self, namespace, pod, container=None, previous=True, tail_lines=40, limit_bytes=8000) -> str:
-        return await asyncio.to_thread(self._log_sync, namespace, pod, container, previous, tail_lines, limit_bytes)
+    async def delete(self, kind, name: str, namespace: str | None, dry_run: bool, grace_period_seconds: int | None = None) -> dict:
+        return await asyncio.to_thread(self._delete_sync, kind, name, namespace, dry_run, grace_period_seconds)
+
+    async def create(self, kind, namespace: str | None, body: dict, dry_run: bool, name: str | None = None, subresource: str | None = None) -> dict:
+        return await asyncio.to_thread(self._create_sync, kind, namespace, body, dry_run, name, subresource)
+
+    async def pod_log(self, namespace, pod, container=None, previous=True, tail_lines=40, limit_bytes=8000, since_seconds=None) -> str:
+        return await asyncio.to_thread(self._log_sync, namespace, pod, container, previous, tail_lines, limit_bytes, since_seconds)
+
+    async def server_version(self) -> dict:
+        return await asyncio.to_thread(self._server_version_sync)
+
+    async def core_resources(self) -> list[str]:
+        return await asyncio.to_thread(self._core_resources_sync)
 
 
 _lock = threading.Lock()

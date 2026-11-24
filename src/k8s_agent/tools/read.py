@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 from urllib3.exceptions import HTTPError as Urllib3Error
 
-from . import capacity, governance, persistence, views
+from . import capacity, catalog, governance, persistence, views
 from .client import CHART_SOURCES, FLUX_SOURCES, HELMRELEASE_KINDS, api_status, get_client, safe_error
 from .redact import bounded, redact_text
 
@@ -75,6 +75,72 @@ async def list_pods(namespace: str | None = None, selector: dict | str | None = 
     if active_only:
         pods = [p for p in pods if p.get("phase") not in ("Succeeded", "Failed")]
     return pods
+
+
+class ReadForbidden(RuntimeError):
+    """The ServiceAccount may not read this kind (HTTP 403): reported as a gap, never as an empty result."""
+
+
+class KindNotServed(RuntimeError):
+    """The API server does not serve this kind (HTTP 404 on the list, e.g. KEDA or Flux not installed)."""
+
+
+async def list_views(kind: str, namespace: str | None = None, label_selector: str | None = None) -> list[dict]:
+    """Every object of a catalog kind, as its whitelisted view. A 403/404 becomes a typed error the caller
+    reports as a gap, so a list the agent could not read is never shown as an empty one."""
+    k = catalog.get(kind)
+    try:
+        raws = await _list_dicts(kind, namespace=namespace if k.namespaced else None, labels=label_selector)
+    except Exception as exc:  # noqa: BLE001
+        status = api_status(exc)
+        if status == 403:
+            raise ReadForbidden(f"not allowed to list {kind} ({safe_error(exc)})") from None
+        if status == 404:
+            raise KindNotServed(f"this cluster does not serve {kind}") from None
+        raise RuntimeError(f"could not list {kind}: {safe_error(exc)}") from None
+    return [k.view(r) for r in raws]
+
+
+async def namespace_names() -> list[str] | None:
+    """Every namespace's name, or None when the ServiceAccount may not list namespaces."""
+    try:
+        return sorted(v.get("name") for v in await list_views("Namespace"))
+    except ReadForbidden:
+        return None
+
+
+async def get_pod(namespace: str, name: str) -> dict | None:
+    """The pod's view, or None when it no longer exists (replaced, evicted, scaled away)."""
+    try:
+        return views.pod_view(await _get_dict("Pod", name, namespace))
+    except Exception as exc:  # noqa: BLE001
+        if api_status(exc) == 404:
+            return None
+        raise RuntimeError(f"could not read Pod {namespace}/{name}: {safe_error(exc)}") from None
+
+
+async def get_resize_support() -> dict:
+    """Whether this API server serves in-place pod resize (`pods/resize`), read live from discovery, plus its
+    version for the record. Discovery, not the version number, decides: 1.33/1.34 serve it as beta (on by
+    default), and an alpha cluster with the feature gate off does not serve it at all. Anything unreadable
+    counts as unsupported."""
+    out: dict = {"supported": False, "server_version": None}
+    try:
+        out["server_version"] = (await _retry(lambda: get_client().server_version())).get("gitVersion")
+    except Exception as exc:  # noqa: BLE001 — the version is informational
+        out["version_error"] = safe_error(exc)
+    try:
+        resources = await _retry(lambda: get_client().core_resources())
+    except Exception as exc:  # noqa: BLE001
+        out["reason"] = f"API discovery (/api/v1) could not be read: {safe_error(exc)}"
+        return out
+    out["supported"] = "pods/resize" in resources
+    if not out["supported"]:
+        out["reason"] = (
+            f"the API server ({out['server_version'] or 'unknown version'}) does not serve pods/resize: in-place "
+            "pod resize needs Kubernetes 1.33 or later (beta in 1.33-1.34, GA from 1.35)"
+        )
+    return out
 
 
 async def list_events(namespace: str | None = None, involved_name: str | None = None, since_minutes: int = 60) -> list[dict]:

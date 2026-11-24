@@ -12,7 +12,7 @@ logger = structlog.get_logger()
 _MUTATING = "apply_approved_change"
 # Every capability the planner may put in a plan (configs/k8s/capabilities.yaml
 # minus the mutating step and the internal `respond`).
-_PLANNABLE = ("find_workload", "check_health", "propose_change")
+_PLANNABLE = ("find_workload", "check_health", "propose_change", "query_resources")
 _NEEDS_TARGET = ("check_health", "propose_change")
 
 
@@ -42,8 +42,12 @@ def _keep_plans_safe(plan: Plan, options: dict) -> list[Step]:
 
 META = AgentMeta(
     description=(
-        "Kubernetes agent for the cluster it runs in: checks Pod-level health, scales Deployments, and changes "
-        "CPU/memory — every change proposed first and applied only after a person approves it. Deployments "
+        "Kubernetes agent for the cluster it runs in: lists any readable kind as a table (pods, per-container "
+        "CPU/memory requests, limits and usage, workloads, nodes, events, ...), checks Pod-level health, scales "
+        "Deployments, and changes "
+        "CPU/memory — of a Deployment (rolls its pods) or of one running pod in place (no rollout, where the "
+        "cluster supports in-place pod resize) — every change proposed first and applied only after a person "
+        "approves it. Deployments "
         "managed by KEDA or an HPA are scaled only through their autoscaler's min/max, and only on explicit "
         "request; CPU/memory change only on explicit request, capped by real node capacity."
     ),
@@ -51,25 +55,34 @@ META = AgentMeta(
         id="kubernetes_ops",
         name="Kubernetes Health & Scaling",
         description=(
-            "Check Pod health for a Deployment, a namespace or the whole cluster (crash loops with their cause, "
+            "List objects as a table with filters, sort and counts (e.g. every pod's containers with CPU/memory "
+            "requests, limits and usage in a namespace; Deployments, StatefulSets, Jobs, Services, nodes, "
+            "events). Check Pod health for a Deployment, a namespace or the whole cluster (crash loops with their cause, "
             "OOM kills, image pull failures, unschedulable pods, warning events, usage near limits). Propose and, "
             "once approved, apply: a Deployment replica change; a KEDA ScaledObject's or HPA's min/max (explicit "
-            "request only); CPU/memory requests or limits of a container (explicit request only). Never scales "
-            "anything below 1 replica."
+            "request only); CPU/memory requests or limits of a container (explicit request only), either in the "
+            "Deployment's template (rolls its pods) or in place on one named running pod (no recreation; memory "
+            "only for containers whose resizePolicy restarts them). Never scales anything below 1 replica."
         ),
         tags=["kubernetes", "health", "scaling", "keda", "hpa"],
         examples=[
             "check the health of the pods in the insightfinder namespace",
+            "list all pods with cpu and memory limit and usage in the insightfinder namespace",
             "scale the checkout deployment to 3 replicas",
             "set the KEDA max replicas of the anomaly worker to 10",
+            "resize pod checkout-7d9f5c6b8-x2k4q in place: cpu limit 2",
         ],
     ),
     planner_description="Kubernetes agent that checks cluster health and scales Deployments",
-    planner_domain_guidance="""Requests are either a health question, a change, or a plain question.
+    planner_domain_guidance="""Requests are either a listing question, a health question, a change, or a plain question.
+- A listing question ("list / show / which / table of ...": all pods with their CPU/memory limits and usage, \
+Deployments, nodes, events, PVCs, ...): plan "query_resources" alone (no "find_workload"); pass a namespace the \
+request names as its `namespace` param. Read-only. Prefer it over "check_health" whenever the request asks for \
+everything of some kind rather than what is wrong.
 - A health question ("what's wrong with X", "check the pods in namespace Y", "is the cluster healthy"): \
 plan "find_workload" then "check_health". Read-only; never needs approval.
-- A change (scale a Deployment, change its KEDA/HPA min or max, change CPU/memory): plan "find_workload" then \
-"propose_change". "propose_change" works out and checks the exact change and pauses for a person's approval; \
+- A change (scale a Deployment, change its KEDA/HPA min or max, change CPU/memory of a Deployment or, in place, \
+of one pod): plan "find_workload" then "propose_change". "propose_change" works out and checks the exact change and pauses for a person's approval; \
 it decides itself whether the request is explicit enough and refuses otherwise — do not try to pre-judge that.
 - **NEVER schedule "apply_approved_change".** It runs only after a person approves a proposal, through a \
 confirmation path that bypasses planning; a planned one refuses to run.
@@ -102,7 +115,10 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "for approval. For an applied change: the verified outcome from the verification status — succeeded, "
         "still in progress, new pods failing, rollout failed, or pods unschedulable (lead with that problem and "
         "the Cluster Autoscaler/scheduler reason), reverted (the autoscaler's bounds were changed back), or "
-        "verification unavailable (the change WAS applied, but its rollout could not be checked; say both) — "
+        "verification unavailable (the change WAS applied, but its rollout could not be checked; say both); for "
+        "an in-place pod resize also: resize infeasible or deferred on the pod's node, pod replaced while "
+        "watched, or container failing after the resize — and that the Deployment template still has the old "
+        "values until the change is made in Git — "
         "plus the drift notice and persistence hint. For a refusal: "
         "the reason, the current values it reports, and what an acceptable request would look like; a refusal means "
         "no change was proposed and nothing is waiting for approval, so never describe one as proposed or ready "
@@ -112,7 +128,11 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "with the exact request that would get it proposed, e.g. 'To have it proposed, ask: set the memory "
         "limit of container app in deployment X (namespace Y) to <value>'. Never print anything "
         "that looks like a "
-        "credential"
+        "credential. For a listing (query_resources) result: the rows reach the caller as structured data (the "
+        "query_result artifact), so do not reproduce them or draw a table; say what was listed (kind; namespace or all "
+        "namespaces; label selector, filters and sort as applied), how many rows matched and how many are shown, "
+        "everything under `ignored` and `gaps` (a gap means that part could not be read, never that it is empty), "
+        "and at most a few notable rows (for containers, e.g. the highest usage as a % of limit)"
     ),
     # Order matters: MCP Service resolves an approval against the first
     # artifact carrying an `id`, and only `pending_action` has one.
@@ -121,6 +141,7 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "health_report": "check_health.report",
         "action_result": "apply_approved_change.action_result",
         "refusal": "propose_change.refusal",
+        "query_result": "query_resources.table",
     },
     default_step_policy=_keep_plans_safe,
     confirm_capability=_MUTATING,

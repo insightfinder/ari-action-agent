@@ -32,9 +32,10 @@ from datetime import datetime, timedelta, timezone
 
 from common.capabilities_base import StepContext
 
+from .. import actions
+from ..actions.base import artifact_int as _int, target_of
 from ..stepkit import finish
-from ..tools import governance, persistence, quantities
-from ..tools.write import ACTIONS
+from ..tools import governance, persistence
 
 _VERIFY_MARGIN_SECONDS = 60
 _DEFAULT_STEP_SECONDS = 900
@@ -48,49 +49,15 @@ def _require_confirmed(ctx: StepContext) -> dict:
             "something a plan should schedule directly."
         )
     params = ctx.params
-    missing = [k for k in ("id", "action", "namespace", "deployment", "snapshot") if not params.get(k)]
-    if params.get("action") not in ACTIONS or missing:
+    target = target_of(params)
+    missing = [k for k in ("id", "action", "snapshot") if not params.get(k)]
+    missing += [f"target {k}" for k in ("kind", "namespace", "name") if not target.get(k)]
+    if params.get("action") not in actions.ACTIONS or missing:
         raise RuntimeError(
             f"apply_approved_change: the confirmed proposal is not one this agent made (action="
             f"{params.get('action')!r}, missing fields: {missing or 'none'}). Ask again and a fresh one is proposed."
         )
     return params
-
-
-def _int(value):
-    # A2A artifacts round-trip through protobuf Value, whose only number type
-    # is a double: 3 comes back as 3.0.
-    return int(value) if isinstance(value, float) and value == int(value) else value
-
-
-def _drift_since_proposal(proposal: dict, dep: dict, autoscaler: dict | None) -> list[str]:
-    snapshot = proposal["snapshot"]
-    changes = []
-    action = proposal["action"]
-    current_fp = governance.autoscaler_fingerprint(autoscaler)
-    proposed_fp = snapshot.get("autoscaler")
-    if (current_fp is None) != (proposed_fp is None):
-        changes.append(
-            "an autoscaler now governs this Deployment" if current_fp else "the autoscaler governing it is gone"
-        )
-    elif current_fp and proposed_fp:
-        for key in ("kind", "name", "min", "max", "generation"):
-            if _int(current_fp.get(key)) != _int(proposed_fp.get(key)):
-                changes.append(f"autoscaler {key} changed from {_int(proposed_fp.get(key))} to {current_fp.get(key)}")
-    # Only the fields the approved change depends on. The Deployment's
-    # `generation` is deliberately not compared: image automation upgrades
-    # Helm releases several times an hour (observed on test, 2026-10-13),
-    # each bumping it, so an approval hours later would almost always be
-    # refused for a change that has nothing to do with it.
-    if action == "scale_replicas" and _int(snapshot.get("deployment_replicas")) != dep.get("replicas"):
-        changes.append(f"replicas changed from {_int(snapshot.get('deployment_replicas'))} to {dep.get('replicas')}")
-    if action == "set_resources":
-        container = proposal.get("container")
-        now = next((c["resources"] for c in dep["template"]["containers"] if c["name"] == container), None)
-        then = (snapshot.get("container_resources") or {}).get(container)
-        if now != then:
-            changes.append(f"container {container} resources changed since the proposal")
-    return changes
 
 
 def _proposed_at(proposal: dict) -> datetime | None:
@@ -100,64 +67,17 @@ def _proposed_at(proposal: dict) -> datetime | None:
         return None
 
 
-def _same_quantity(resource: str, have, want) -> bool:
-    try:
-        return have is not None and quantities.to_units(resource, have) == quantities.to_units(resource, want)
-    except (ValueError, TypeError):
-        return False
-
-
-def _at_target(action: dict, dep: dict, autoscaler: dict | None) -> bool:
-    """Whether the cluster already holds exactly what `action` would write."""
-    if action["action"] == "scale_replicas":
-        return dep.get("replicas") == action["replicas"]
-    if action["action"] == "set_autoscaler_bounds":
-        fingerprint = governance.autoscaler_fingerprint(autoscaler) or {}
-        if fingerprint.get("name") != (action.get("autoscaler") or {}).get("name"):
-            return False
-        return all(_int(fingerprint.get(b)) == action[b] for b in ("min", "max") if action.get(b) is not None)
-    current = next((c["resources"] for c in dep["template"]["containers"] if c["name"] == action["container"]), None)
-    if current is None:
-        return False
-    return all(
-        _same_quantity(resource, (current.get(side) or {}).get(resource), value)
-        for side, values in (action.get("resources") or {}).items()
-        for resource, value in (values or {}).items()
-    )
-
-
-def _patch_action(proposal: dict) -> dict:
-    action = {k: proposal.get(k) for k in ("action", "namespace", "deployment")}
-    if proposal["action"] == "scale_replicas":
-        action["replicas"] = _int(proposal["replicas"])
-    elif proposal["action"] == "set_autoscaler_bounds":
-        action["autoscaler"] = proposal["autoscaler"]
-        for bound in ("min", "max"):
-            if proposal.get(bound) is not None:
-                action[bound] = _int(proposal[bound])
-    else:
-        action["container"] = proposal["container"]
-        action["resources"] = proposal["resources"]
-    return action
-
-
-def _verify_target(action: dict) -> dict:
-    if action["action"] == "scale_replicas":
-        return {"kind": "replicas", "replicas": action["replicas"]}
-    if action["action"] == "set_autoscaler_bounds":
-        return {"kind": "autoscaler", "min": action.get("min"), "max": action.get("max")}
-    return {"kind": "resources", "container": action["container"], "resources": action["resources"]}
-
-
 async def run(ctx: StepContext) -> dict:
     proposal = _require_confirmed(ctx)
-    namespace, name = proposal["namespace"], proposal["deployment"]
-    action = _patch_action(proposal)
+    spec = actions.get(proposal["action"])
+    target = target_of(proposal)
+    namespace = target["namespace"]
+    action = spec.patch_action(proposal)
 
-    dep = await ctx.tool("get_deployment")(namespace, name)
-    autoscaler = await ctx.tool("find_autoscaler")(namespace, name)
-    drift = _drift_since_proposal(proposal, dep, autoscaler)
-    already = bool(drift) and _at_target(action, dep, autoscaler)
+    state = await spec.load_state(ctx, target)
+    dep = state.get("deployment") or {}
+    drift = spec.drift(proposal, state)
+    already = bool(drift) and spec.at_target(action, state)
     if drift and not already:
         raise RuntimeError(
             "apply_approved_change: the cluster changed after this proposal was made ("
@@ -168,6 +88,9 @@ async def run(ctx: StepContext) -> dict:
     # Second precision on pod creation timestamps: back off a little so pods
     # created by this very patch are never mistaken for older ones.
     applied_at = (datetime.now(timezone.utc) - timedelta(seconds=2)).replace(microsecond=0)
+    # The state this attempt's write starts from (None when an earlier attempt already wrote it): a verifier
+    # that expects one container restart counts it from here.
+    before_write = None if already else state
     if already:
         # An earlier attempt of this step (or someone else) already put the approved values in place.
         applied = {"already_at_target": True, "note": "the cluster already held the approved values; nothing was written again"}
@@ -178,17 +101,17 @@ async def run(ctx: StepContext) -> dict:
         try:
             applied = await ctx.tool("patch_workload")(action)
         except Exception as exc:  # noqa: BLE001 — the API may have applied it before the call failed
-            dep = await ctx.tool("get_deployment")(namespace, name)
-            autoscaler = await ctx.tool("find_autoscaler")(namespace, name)
-            if not _at_target(action, dep, autoscaler):
+            state = await spec.load_state(ctx, target)
+            dep = state.get("deployment") or dep
+            if not spec.at_target(action, state):
                 raise
             applied = {"applied_despite_error": f"{type(exc).__name__}: {exc}"}
 
     try:
         budget = (ctx.step_deadline_seconds or _DEFAULT_STEP_SECONDS) - _VERIFY_MARGIN_SECONDS
         max_wait = max(30, min((dep.get("progress_deadline_seconds") or 600) + 60, budget))
-        verification = await ctx.tool("wait_rollout")(
-            namespace, name, _verify_target(action), applied_at.isoformat() if applied_at else None, max_wait
+        verification = await spec.verify(
+            ctx, action, proposal, before_write, applied_at.isoformat() if applied_at else None, max_wait
         )
     except Exception as exc:  # noqa: BLE001 — the change is in; say so, whatever verification hit
         verification = {
@@ -199,16 +122,12 @@ async def run(ctx: StepContext) -> dict:
         verification = await _check_bounds_held(ctx, action, verification)
 
     try:
-        changed = (
-            {"labels": (autoscaler or {}).get("labels") or {}, "annotations": (autoscaler or {}).get("annotations") or {}}
-            if action["action"] == "set_autoscaler_bounds"
-            else {"labels": dep["labels"], "annotations": dep["annotations"]}
-        )
+        changed = spec.changed_object(action, state)
         chain = await ctx.tool("get_flux_chain")(changed["labels"], changed["annotations"])
         hint = persistence.build_hint(
             chain, (proposal.get("persistence") or {}).get("changes") or [], outcome=verification.get("status")
         )
-        drift_notice = governance.drift_notice(chain.get("ownership") or {}, chain)
+        drift_notice = spec.lifetime_notice(chain.get("ownership") or {}, chain)
     except Exception as exc:  # noqa: BLE001 — supporting information only
         hint = {"available": False, "note": f"The GitOps chain could not be read: {type(exc).__name__}: {exc}"}
         drift_notice = None
@@ -221,7 +140,11 @@ async def run(ctx: StepContext) -> dict:
         # reaches here has the change in place.
         "ran": True,
         "namespace": namespace,
-        "deployment": name,
+        "deployment": proposal.get("deployment"),
+        # Added in II-25740 (docs/K8S_AGENT_INTERFACE.md): the object changed, for any kind, and a marker a
+        # consumer can key on instead of a list of action names.
+        "target": target,
+        "kubernetes_change": True,
         "applied": applied,
         "requested": proposal.get("requested"),
         "clamped": proposal.get("clamped") or [],
