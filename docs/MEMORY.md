@@ -5634,7 +5634,6 @@ description ends with the footer, GitHub renders the link with its full
 query string (the test link carried parentheses on purpose), and the commit
 message on the branch has the title and summary only.
 
-<<<<<<< HEAD
 ## 2026-11-20 - A remote MCP gateway: the agents from Claude, Cursor and other AI apps (II-25648)
 
 The leader asked for the ARI agents inside Cursor and Claude Code, next to
@@ -5821,7 +5820,6 @@ to write `[ts:<ms>]` / `[dur:<ms>]` verbatim, and `humanize` turns those into
 bare 13-digit number in the 2001–2100 range also gets its date alongside.
 Probed with claude-haiku-4-5 on a getBuild payload: 3 of 3 answers used the
 markers.
-=======
 ---
 
 ## 2026-11-20 - k8s kind, phase 0 of full Kubernetes coverage: catalog, generic client, action registry (II-25740)
@@ -6096,4 +6094,10 @@ chart label only; pod templates unchanged, and the api/worker pods were not rest
 as `ari-k8s`: patch pods/resize yes; list statefulsets, customresourcedefinitions, namespaces, ingresses,
 jobs yes; list configmaps, helmreleases, secrets no; plain patch pods no. The agent image is still the old
 code until this branch reaches `test`.
->>>>>>> II-25740-Expand-k8s-agent-capabilities
+
+**Deployed to test (2026-11-24 ~10:01 UTC):** branch commit `32d361f`, merged into `test` as `4559769`; CI built
+`2611240957-test` for every image; image automation committed the tags to test-fluxcd (`099c9a0e`, `1b4aac59`)
+and `ari-k8s-api` / `ari-k8s-worker` rolled to them. Worker started cleanly with `query_resources` among its
+capabilities; the API's agent card carries the new description and examples. The merge commit left conflict
+markers in `README.md` and this file on `test`; fixed in the follow-up commit (markers removed, both sides of
+this file kept, README's k8s row replaced). In-cluster end-to-end run not done yet.

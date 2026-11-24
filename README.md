@@ -31,15 +31,9 @@ The same engine hosts several independently deployed *agent kinds* (`AGENT_KIND`
 
 | Kind | What it does | Worker image |
 |---|---|---|
-<<<<<<< HEAD
 | `oncall` | Code analysis and fixes, pull request after approval, Agent Skills | `ari-oncall-agent-worker` (`Dockerfile.oncall`) |
-| `k8s` | Pod-level health of the cluster it runs in; Deployment scaling and CPU/memory changes, each proposed first and applied only after a person approves (see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §10) | `ari-k8s-agent-worker` (`Dockerfile.k8s`) |
+| `k8s` | Tables of any readable kind (e.g. every pod's CPU/memory limits and usage); Pod-level health of the cluster it runs in; Deployment scaling and CPU/memory changes (of a Deployment, or in place on one running pod where the cluster supports in-place pod resize), each proposed first and applied only after a person approves (see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §10; artifacts, action names and cross-repo notes in [`docs/K8S_AGENT_INTERFACE.md`](docs/K8S_AGENT_INTERFACE.md)) | `ari-k8s-agent-worker` (`Dockerfile.k8s`) |
 | `jenkins` | Job and build state on a Jenkins server, failure diagnosis, and triggering or stopping a build — each change proposed first and run only after a person approves (see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §9) | `ari-jenkins-agent-worker` (`Dockerfile.jenkins`) |
-=======
-| `oncall` | Everything described above: code analysis, fix, PR after approval | `ari-oncall-agent-worker` (`Dockerfile.oncall`) |
-| `jenkins` | Reads and diagnoses a Jenkins job or build; triggers or stops a build, each proposed first and run only after a person approves — see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §9 | `ari-jenkins-agent-worker` (`Dockerfile.jenkins`) |
-| `k8s` | Tables of any readable kind (e.g. every pod's CPU/memory limits and usage); Pod-level health of the cluster it runs in; Deployment scaling and CPU/memory changes (of a Deployment, or in place on one running pod where the cluster supports in-place pod resize), each proposed first and applied only after a person approves — see [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) §10; artifacts, action names and cross-repo notes in [`docs/K8S_AGENT_INTERFACE.md`](docs/K8S_AGENT_INTERFACE.md) | `ari-k8s-agent-worker` (`Dockerfile.k8s`) |
->>>>>>> II-25740-Expand-k8s-agent-capabilities
 
 The API image (`Dockerfile.api`) is shared by every kind. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains how a new kind is added.
 
