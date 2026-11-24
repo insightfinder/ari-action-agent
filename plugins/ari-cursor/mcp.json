@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "ari-gateway": {
+      "url": "${env:ARI_SERVER_URL}"
+    }
+  }
+}

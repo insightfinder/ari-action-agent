@@ -5409,3 +5409,31 @@ The Claude desktop app lists the plugin server as "Connects in sessions" but
 gives no way to sign in to it; signing in from the CLI (`/mcp` ->
 `plugin:ari:ari` -> Authenticate) works, the desktop app shares that token,
 and a session started afterwards calls `ari_whoami` (verified 2026-11-24).
+
+**Cursor plugin (2026-11-24).** `.cursor-plugin/marketplace.json` makes the
+repository a Cursor marketplace too; the plugin is `plugins/ari-cursor`
+(manifest `.cursor-plugin/plugin.json`, name `ari`, server `ari-gateway` in
+`mcp.json`). Verified on Cursor 3.31 (Windows, Hobby account):
+- Plain `~/.cursor/mcp.json` with the gateway URL: Cursor registers itself
+  by DCR (redirect `http://localhost:8787/callback`), GitHub sign-in,
+  `ari_whoami`, a proposal and the approval all work. Cursor shows the
+  gateway's elicitation form in the chat, so approvals need no browser link
+  (OnCall-ARI-InfraCore-testing #51).
+- Plugin `variables` cannot be filled by a person: the values are set by a
+  team admin in the Cursor dashboard. A required variable with no value
+  makes Cursor drop the MCP server silently. The URL therefore comes from
+  `${env:ARI_SERVER_URL}`, which Cursor resolves in a plugin's `url`; Cursor
+  must be restarted after the variable is set.
+- Cursor imports installed Claude Code plugins (`claude=true` in the
+  "Cursor Plugins" log). It reads `.mcp.json` in preference to `mcp.json`
+  and does not resolve `${user_config.*}`, so the Cursor plugin lives in its
+  own directory. Server ids are `plugin-<plugin>-<server>`; with the same
+  plugin and server names the two plugins collapse into one failing
+  `plugin-ari-ari`, hence the server name `ari-gateway`.
+- Like Claude Code, Cursor hides a plugin server whose URL equals a
+  hand-added one.
+- Logs: `%APPDATA%\Cursor\logs\<session>\mcp-server-<id>.log`; tool lists
+  appear under `~/.cursor/projects/*/mcps/<id>/tools`.
+- Jenkins agent: "list the Jenkins jobs" was routed to the jenkins agent,
+  which answered that it had no Jenkins access without calling a tool; its
+  capabilities all start from a named job (inferred, agent logs not read).
