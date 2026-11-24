@@ -75,6 +75,14 @@ async def test_cpu_resize_of_a_named_pod_is_proposed_in_place(cluster):
     assert fx.CANARY not in json.dumps(result)
 
 
+async def test_a_resize_back_to_the_template_value_has_nothing_to_persist(cluster):
+    # The Deployment's template already has cpu limit 1; the pod gets it back in place.
+    change = _change(action="resize_pod", pod="checkout-1", container="app", resources={"limits": {"cpu": {"value": "1", "quote": "cpu limit 1"}}})
+    pa = (await _propose(cluster, "resize pod checkout-1 in place: cpu limit 1", change))["pending_action"]
+    assert pa["persistence"]["needed"] is False and pa["persistence"]["changes"] == []
+    assert "already holds these values" in pa["persistence"]["reason"]
+
+
 async def test_memory_is_refused_in_place_unless_the_container_restarts_for_it(cluster):
     result = await _propose(cluster, "resize pod checkout-1 in place: memory limit 3Gi", _MEM_LIMIT)
     assert "memory resizePolicy NotRequired" in result["refusal"]["reason"]

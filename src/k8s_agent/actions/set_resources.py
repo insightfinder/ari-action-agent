@@ -259,6 +259,8 @@ def _plan_resources(ctx, dep, change, nodes, pods, headroom):
         "scale_down": False,
         "high_replicas": False,
         "new_pods": _surge_pods(dep) if raised else 0,
+        "rolls_pods": True,
+        "roll_message": "Changing CPU/memory triggers a rolling restart of every pod of this Deployment.",
         "per_pod_override": {"container": name, "requests": new_requests},
         "changed_object": {"kind": "Deployment", "name": dep["name"], "labels": dep["labels"], "annotations": dep["annotations"]},
         "rendered_changes": [

@@ -31,9 +31,18 @@ label and email). Other fields are informational for the approver.
 - `id`, `action`, `action_name`, `namespace`, `deployment` — unchanged.
 - `target`: `{"kind", "namespace", "name"}` — the object the change is about. **Added II-25740.**
   `kind: "Deployment"`, except `resize_pod`, which sets `kind: "Pod"` and still fills `deployment` with the
-  pod's owning Deployment (and adds `pod` and `container`). Actions on other kinds (StatefulSet, DaemonSet,
-  CronJob, Node) will set it and may leave `deployment` empty. A proposal without `target` (made before
-  II-25740) is still applied.
+  pod's owning Deployment (and adds `pod` and `container`). Actions on other kinds set it and may leave
+  `deployment` empty (null): `restart_rollout` of a StatefulSet or DaemonSet (`kind` is that kind), and
+  `delete_pod` (`kind: "Pod"`; `deployment` is filled only for a Deployment's pod). A proposal without
+  `target` (made before II-25740) is still applied.
+- Per-action fields (spread into the proposal beside the common ones; informational, the agent rebuilds the
+  write from them): `restart_rollout`: `workload_kind`, `workload`, `restarted_at` (the value the template's
+  `kubectl.kubernetes.io/restartedAt` gets). `rollback`: `from_revision`, `to_revision`, `replicaset`,
+  `replicaset_uid`, `images` (container -> image of the target revision; the pod template itself is never in
+  the proposal). `delete_pod`: `workload_kind`, `workload`, `pod`, `pod_uid`. **Added II-25740.**
+- `persistence.needed`: `false` when nothing has to change in Git (a restart, a deleted pod, an in-place
+  resize back to the template's own values); `reason` says why and `changes` is empty. `true` otherwise.
+  **Added II-25740.**
 - `before`, `after`, `requested`, `clamped`, `node_cap`, `risk_tier` (low/medium/high/critical), `risks`,
   `notes`, `capacity_outlook`, `dry_run`, `ownership`, `drift_notice`, `persistence`,
   `estimated_seconds_per_pod_to_ready`, `snapshot`, `created_at` — unchanged.
@@ -52,6 +61,13 @@ UIE (`ran`).
   (the kubelet cannot fit it on the node), `resize_deferred` (accepted, waiting for room on the node),
   `pod_replaced` (the pod was replaced while watched), `container_failing` (applied, then the container failed
   or restarted again). **Added II-25740.** The other actions keep their statuses.
+- `status` for `restart_rollout` and `rollback` of a Deployment (II-25740): `succeeded`, `in_progress`,
+  `new_pods_failing`, `rollout_failed`, `unschedulable`; a rollback also `reverted` (the newer image came back
+  while watched: image automation or a Helm upgrade). A StatefulSet or DaemonSet restart: `succeeded`,
+  `in_progress`, `new_pods_failing`, `unschedulable`. `delete_pod`: `succeeded` (the old uid is gone and a
+  replacement is ready and stable; `verification.replacement` names it), `in_progress`, `new_pods_failing`,
+  `unschedulable`. A pod that was already gone or replaced when the approval arrived counts as done:
+  `applied.already_at_target` is true and nothing is deleted.
 
 ### `query_result`
 
@@ -90,19 +106,33 @@ kind on the test cluster conformed.
 
 ### Action names (`action`)
 
-`scale_replicas`, `set_autoscaler_bounds`, `set_resources`, `resize_pod` today
-(`k8s_agent/actions/__init__.py`, `ACTIONS`). `resize_pod` (**added II-25740**): CPU/memory of one container
+`scale_replicas`, `set_autoscaler_bounds`, `set_resources`, `resize_pod`, `restart_rollout`, `rollback`,
+`delete_pod` today (`k8s_agent/actions/__init__.py`, `ACTIONS`). `resize_pod` (**added II-25740**): CPU/memory of one container
 of one running pod, in place through `pods/resize` — no rollout, same pod. Chosen only when the request asks
 for an in-place change (decided in code; naming a pod is not enough). Proposed only when the API server serves
 `pods/resize` (live discovery) and both the API server and the pod's kubelet are >= 1.35; memory only when
 the container's memory `resizePolicy` is `RestartContainer`. The Deployment template is not changed, so the
 persistence hint names the template fields to change in Git.
 
-Planned under II-25740 (not built yet), in this order after the phase 1 reads:
-- `restart_rollout` (Deployment, StatefulSet, DaemonSet), `rollback`, `set_image`, `pause_rollout`,
-  `resume_rollout`, `delete_pod` (controller-owned pods only), `suspend_cronjob`, `resume_cronjob`,
-  `trigger_cronjob`, `cordon_node`, `uncordon_node`, `drain_node`, StatefulSet replica scaling, and `batch`
-  (one approval for the same change on several targets).
+Added II-25740 (write batch 1). Restart, rollback and delete are proposed only when the request's own words ask
+for them (decided in code: an on-call prompt quoting "restarted 5 times" does not); otherwise the refusal
+carries `asked_for` with the action the model picked.
+- `restart_rollout`: a rolling restart of a Deployment, StatefulSet or DaemonSet, as `kubectl rollout restart`
+  (sets `kubectl.kubernetes.io/restartedAt` on the pod template). Refused for a paused Deployment, an
+  `OnDelete` update strategy, or no pods. Tier `medium`; `high` under `Recreate` or for a one-pod StatefulSet.
+- `rollback`: a Deployment back to the previous revision, or to the one the request states, as `kubectl
+  rollout undo` (JSON patch replacing `spec.template` with that ReplicaSet's, after a `test` of the current
+  revision). Refused for a paused Deployment or when no such revision is kept. Tier `medium`.
+- `delete_pod`: one pod, named in the request, that a Deployment, StatefulSet or DaemonSet owns; deleted with a
+  uid precondition (a plain delete, not an eviction: a PodDisruptionBudget is reported, not waited for). Tier
+  `medium`; `high` when no other pod of the workload is ready.
+- `find_workload` now also resolves StatefulSets and DaemonSets (`{"scope": "workload", "kind", ...}` in its
+  step result; a Deployment keeps `{"scope": "deployment", ...}`).
+
+Planned under II-25740 (not built yet), in this order:
+- `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob`, `resume_cronjob`, `trigger_cronjob`,
+  `cordon_node`, `uncordon_node`, `drain_node`, StatefulSet replica scaling, and `batch` (one approval for the
+  same change on several targets).
 - Added 2026-11-24 (user decision), in this order: `flux_reconcile` (set `reconcile.fluxcd.io/requestedAt` on a
   HelmRelease or Kustomization so a merged fix applies now; changes no desired state, tier `low`);
   `resize_pod` for StatefulSet pods (same rules as for Deployment pods; persistence hint points at the
@@ -143,7 +173,9 @@ Not to be added. A change to this list is a decision of its own, recorded here a
 reads and writes exactly the same resources as before, so neither changed. Later phases add reads (and the
 new writes) and will list the exact rules here. `resize_pod` adds `patch` on `pods/resize` (core group), in
 both files from oncallari 0.3.14; until a cluster has that rule, the dry run's 403 comes back as a refusal
-naming it. The chart is this agent's own deployment: any change here
+naming it. Write batch 1 adds `patch` on `statefulsets` and `daemonsets` (apps group; a restart) and `delete`
+on `pods` (core group; `delete_pod`), in both files from oncallari 0.3.15; a Deployment restart or rollback
+needs no new rule. The chart is this agent's own deployment: any change here
 that needs a new RBAC rule, env var or value updates the oncallari chart in the same piece of work (charts
 repo, same ticket branch, `Chart.yaml` version bumped).
 
@@ -153,7 +185,7 @@ Recorded for their owners; not changed from this repository.
 
 | Repo | What | Why | Since |
 |---|---|---|---|
-| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod` ships with II-25740. | II-25740 |
+| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `rollback` and `delete_pod` ship with II-25740. | II-25740 |
 | insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship. | II-25740 |
 | insightfinder-mcp-service | Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. Do not have a model re-type the rows: 100+ rows exceed its output limit and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
 | insightfinder-mcp-service | Confirm live that a follow-up chat turn ("in table format") can reach the previous turn's agent result, or that the coordinator calls the agent again. | Screenshot of 2026-11-19 (stg): the coordinator answered from memory. | II-25740 |
@@ -170,3 +202,8 @@ Recorded for their owners; not changed from this repository.
 - **2026-11-24, II-25740** — planned actions extended (`flux_reconcile`, `resize_pod` for StatefulSet pods, `expand_pvc`), a "later" list, and a permanent "Never" list (user decision). Documentation only; nothing built.
 - **2026-11-24, II-25740 phase 1** — new capability `query_resources` and artifact `query_result` (appended after the existing artifacts; nothing reordered). The agent card's description, skill and examples now mention listings.
 - **2026-11-24, II-25740 phase 1** — `query_result` is data only: `schema` and `column_types` added; the agent no longer appends a Markdown table to its reply (never shipped).
+- **2026-11-24, II-25740 write batch 1** — new actions `restart_rollout`, `rollback`, `delete_pod` and their
+  per-action proposal fields; `pending_action.target.kind` can be `StatefulSet`/`DaemonSet` (restart) or `Pod`
+  (delete), with `deployment` null for a non-Deployment workload; `persistence.needed`; refusal `asked_for`;
+  new `action_result.status` meanings listed above. RBAC adds `patch` on statefulsets/daemonsets and `delete`
+  on pods (oncallari 0.3.15). Additive; nothing removed or renamed.

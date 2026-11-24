@@ -212,20 +212,37 @@ def readiness(outcome: str | None) -> dict:
     }
 
 
-def build_hint(chain: dict, changes: list[dict], outcome: str | None = None) -> dict:
+def not_needed(reason: str) -> dict:
+    """The hint for a change that leaves nothing to write to Git (a restart, a deleted pod, values Git already
+    holds). `needed: false` is what a caller keys on; `changes` is empty."""
+    return {
+        "available": False,
+        "needed": False,
+        "reason": reason,
+        "changes": [],
+        "ready_to_persist": False,
+        "readiness_reason": reason,
+    }
+
+
+def build_hint(chain: dict, changes: list[dict], outcome: str | None = None, nothing_to_persist: str | None = None) -> dict:
     """The persistence hint shown in the proposal and the result.
 
     `chain` is what `read.get_flux_chain` resolved (each link may be None,
     with `broken_at` saying where it stopped). `changes` are the rendered
     fields this change touches, as `{object, field, from, to}` (values are
     rendered as manifest strings). `outcome` is the apply's verification
-    status, None for a proposal.
+    status, None for a proposal. `nothing_to_persist`, when set, says why
+    there is nothing to write to Git, and the hint says only that.
     """
+    if nothing_to_persist:
+        return not_needed(nothing_to_persist)
     changes = manifest_changes(changes)
     ownership = chain.get("ownership") or {}
     if ownership.get("class") == "unowned":
         return {
             "available": False,
+            "needed": True,
             "reason": "This object has no Flux or Helm owner, so there is no Git source to update.",
             "changes": changes,
             "ready_to_persist": False,
@@ -237,6 +254,7 @@ def build_hint(chain: dict, changes: list[dict], outcome: str | None = None) -> 
     revision = (kustomization or {}).get("applied_revision") or (source or {}).get("artifact_revision")
     hint = {
         "available": bool(source),
+        "needed": True,
         "as_of_revision": revision,
         "source": source,
         "git": git_coordinates(source, revision),

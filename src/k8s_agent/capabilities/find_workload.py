@@ -1,11 +1,15 @@
-"""Turns the request into a concrete Deployment (or a namespace/cluster
-scope for a health check).
+"""Turns the request into a concrete workload — a Deployment, StatefulSet or
+DaemonSet — (or a namespace/cluster scope for a health check).
 
-The answer must exist in the cluster: a Deployment the model names that is
+The answer must exist in the cluster: a workload the model names that is
 not in the live list is discarded, never passed on. When a single
-Deployment name appears verbatim in the request, it is used without asking
+workload name appears verbatim in the request, it is used without asking
 the model at all. When the match is genuinely ambiguous, candidates are
 returned instead of a guess — a wrong target becomes a wrong proposal.
+
+A Deployment resolves to `{"scope": "deployment", namespace, name}`, as it
+always has; a StatefulSet or DaemonSet to `{"scope": "workload", "kind",
+namespace, name}` (II-25740).
 """
 
 import json
@@ -19,9 +23,9 @@ from ..stepkit import finish, options
 _SENTINEL = "RESOLUTION_JSON:"
 _MAX_CANDIDATES = 300
 _SYSTEM = (
-    "You map a request about a Kubernetes cluster onto the Deployments that actually exist. You never "
-    "invent a namespace or Deployment name: every value you return must appear in the list you are given. "
-    "If more than one Deployment plausibly matches, say so instead of choosing."
+    "You map a request about a Kubernetes cluster onto the workloads (Deployments, StatefulSets, DaemonSets) "
+    "that actually exist. You never invent a namespace or workload name: every value you return must appear in "
+    "the list you are given. If more than one workload plausibly matches, say so instead of choosing."
 )
 
 
@@ -39,16 +43,38 @@ def _mentioned(prompt: str, deployments: list[dict]) -> list[dict]:
 _GENERATED = "[bcdfghjklmnpqrstvwxz2456789]"
 
 
-def _pods_mentioned(prompt: str, deployments: list[dict]) -> list[dict]:
-    """Deployments one of whose pods the request names verbatim ("resize pod checkout-7d9f5c6b8-x2k4q")."""
+# A pod's name after its workload's: `<deployment>-<pod-template-hash>-<suffix>`, `<statefulset>-<ordinal>`,
+# `<daemonset>-<suffix>`.
+_POD_SUFFIX = {
+    "Deployment": rf"-{_GENERATED}{{6,10}}-{_GENERATED}{{5}}",
+    "StatefulSet": r"-\d+",
+    "DaemonSet": rf"-{_GENERATED}{{5}}",
+}
+
+
+def _pods_mentioned(prompt: str, workloads: list[dict]) -> list[dict]:
+    """Workloads one of whose pods the request names verbatim ("resize pod checkout-7d9f5c6b8-x2k4q")."""
     text = prompt.lower()
     hits = []
-    for d in deployments:
+    for d in workloads:
         name = (d.get("name") or "").lower()
-        pattern = rf"(?<![\w-]){re.escape(name)}-{_GENERATED}{{6,10}}-{_GENERATED}{{5}}(?![\w-])"
+        pattern = rf"(?<![\w-]){re.escape(name)}{_POD_SUFFIX[d.get('kind') or 'Deployment']}(?![\w-])"
         if name and re.search(pattern, text):
             hits.append(d)
     return hits
+
+
+def _label(w: dict) -> str:
+    """How a workload is shown to the model: `namespace/name` for a Deployment, as before, plus the kind for
+    the others."""
+    text = f"{w['namespace']}/{w['name']}"
+    return text if (w.get("kind") or "Deployment") == "Deployment" else f"{text} ({w['kind']})"
+
+
+def _resolution(w: dict) -> dict:
+    if (w.get("kind") or "Deployment") == "Deployment":
+        return {"scope": "deployment", "namespace": w["namespace"], "name": w["name"]}
+    return {"scope": "workload", "kind": w["kind"], "namespace": w["namespace"], "name": w["name"]}
 
 
 def _prefer_namespace(hits: list[dict], prompt: str, default_ns: str | None) -> list[dict]:
@@ -105,37 +131,37 @@ def _shortlist(prompt: str, deployments: list[dict], default_ns: str | None) -> 
 
 
 async def run(ctx: StepContext) -> dict:
-    list_deployments = ctx.tool("list_deployments")
     default_ns = ctx.params.get("namespace") or options(ctx).get("namespace")
-    deployments = await list_deployments(None)
-    known = {(d["namespace"], d["name"]) for d in deployments}
-    namespaces = {d["namespace"] for d in deployments}
+    workloads = await ctx.tool("list_workloads")(None)
+    by_label = {_label(w): w for w in workloads}
+    namespaces = {w["namespace"] for w in workloads}
 
-    hits = _prefer_namespace(_mentioned(ctx.prompt, deployments) or _pods_mentioned(ctx.prompt, deployments), ctx.prompt, default_ns)
-    # One Deployment named verbatim settles it without the model, unless the prompt uses that name for a
+    hits = _prefer_namespace(_mentioned(ctx.prompt, workloads) or _pods_mentioned(ctx.prompt, workloads), ctx.prompt, default_ns)
+    # One workload named verbatim settles it without the model, unless the prompt uses that name for a
     # namespace: "the pods in the cert-manager namespace" is not about the cert-manager Deployment alone.
     if len(hits) == 1 and not (hits[0]["name"] in namespaces and _names_namespace(ctx.prompt, hits[0]["name"])):
-        hit = hits[0]
         return finish(
             {
-                "resolution": {"scope": "deployment", "namespace": hit["namespace"], "name": hit["name"]},
+                "resolution": _resolution(hits[0]),
                 "candidates": [],
-                "reasoning": "the Deployment name, or one of its pods' names, appears verbatim in the request",
+                "reasoning": "the workload name, or one of its pods' names, appears verbatim in the request",
             }
         )
 
-    shortlist = hits or _shortlist(ctx.prompt, deployments, default_ns)
-    shortlist_names = ["{}/{}".format(d["namespace"], d["name"]) for d in shortlist]
+    shortlist = hits or _shortlist(ctx.prompt, workloads, default_ns)
     user_prompt = (
         f"Request:\n{ctx.prompt}\n\n"
         f"Default namespace (if the request names none): {default_ns or 'none'}\n"
-        f"Namespaces that have Deployments: {json.dumps(sorted(namespaces))}\n"
-        f"Candidate Deployments (namespace/name): {json.dumps(shortlist_names)}\n\n"
-        "Decide what the request is about: one Deployment, a whole namespace, or the whole cluster. "
+        f"Namespaces that have workloads: {json.dumps(sorted(namespaces))}\n"
+        "Candidate workloads (namespace/name; a StatefulSet or DaemonSet has its kind in parentheses): "
+        f"{json.dumps([_label(w) for w in shortlist])}\n\n"
+        "Decide what the request is about: one workload, a whole namespace, or the whole cluster. "
         f"End your response with a line reading exactly '{_SENTINEL}' followed by ONLY a JSON object:\n"
-        '{"scope": "deployment" | "namespace" | "cluster", "namespace": "<namespace or null>", '
-        '"name": "<deployment name or null>", "confident": true|false, '
-        '"candidates": ["<namespace/name>", ...], "reasoning": "<one line>"}'
+        '{"scope": "deployment" | "workload" | "namespace" | "cluster", '
+        '"kind": "Deployment" | "StatefulSet" | "DaemonSet" | null, "namespace": "<namespace or null>", '
+        '"name": "<workload name or null>", "confident": true|false, '
+        '"candidates": ["<candidate exactly as listed>", ...], "reasoning": "<one line>"}\n'
+        'Use scope "deployment" for a Deployment and "workload" (with its kind) for a StatefulSet or DaemonSet.'
     )
     raw = await ctx.tool("llm_complete")(ctx.config["llm"], _SYSTEM, user_prompt)
     try:
@@ -143,19 +169,21 @@ async def run(ctx: StepContext) -> dict:
     except RuntimeError:
         parsed = {}
 
-    scope = parsed.get("scope") if parsed.get("scope") in ("deployment", "namespace", "cluster") else None
+    scope = parsed.get("scope") if parsed.get("scope") in ("deployment", "workload", "namespace", "cluster") else None
     namespace, name = parsed.get("namespace"), parsed.get("name")
-    candidates = [c for c in parsed.get("candidates") or [] if isinstance(c, str) and tuple(c.split("/", 1)) in known]
+    kind = parsed.get("kind") if parsed.get("kind") in ("StatefulSet", "DaemonSet") and scope == "workload" else "Deployment"
+    chosen = by_label.get(_label({"kind": kind, "namespace": namespace, "name": name})) if namespace and name else None
+    candidates = [c for c in parsed.get("candidates") or [] if isinstance(c, str) and c in by_label]
 
     resolution = None
-    if scope == "deployment" and (namespace, name) in known and parsed.get("confident", True):
-        resolution = {"scope": "deployment", "namespace": namespace, "name": name}
+    if scope in ("deployment", "workload") and chosen and parsed.get("confident", True):
+        resolution = _resolution(chosen)
     elif scope == "namespace" and namespace in namespaces:
         resolution = {"scope": "namespace", "namespace": namespace, "name": None}
     elif scope == "cluster":
         resolution = {"scope": "cluster", "namespace": None, "name": None}
-    elif scope == "deployment" and (namespace, name) in known:
-        candidates = candidates or [f"{namespace}/{name}"]
+    elif scope in ("deployment", "workload") and chosen:
+        candidates = candidates or [_label(chosen)]
 
     return finish(
         {

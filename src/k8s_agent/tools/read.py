@@ -65,6 +65,40 @@ async def get_deployment(namespace: str, name: str) -> dict:
         raise RuntimeError(f"could not read Deployment {namespace}/{name}: {safe_error(exc)}") from None
 
 
+async def list_workloads(namespace: str | None = None) -> list[dict]:
+    """`{kind, namespace, name}` of every Deployment, StatefulSet and DaemonSet. Deployments must be readable;
+    a StatefulSet or DaemonSet list the ServiceAccount may not read (a chart older than 0.3.14) is left out."""
+    out = [{"kind": "Deployment", **d} for d in await list_deployments(namespace)]
+    for kind in ("StatefulSet", "DaemonSet"):
+        try:
+            raws = await _list_dicts(kind, namespace=namespace)
+        except Exception as exc:  # noqa: BLE001
+            if api_status(exc) in (403, 404):
+                continue
+            raise
+        out.extend({"kind": kind, "namespace": r["metadata"].get("namespace"), "name": r["metadata"].get("name")} for r in raws)
+    return out
+
+
+async def get_workload(kind: str, namespace: str, name: str) -> dict:
+    """One Deployment, StatefulSet or DaemonSet as its view."""
+    if kind not in governance.WORKLOAD_KINDS:
+        raise ValueError(f"not a workload kind: {kind!r}")
+    if kind == "Deployment":
+        return await get_deployment(namespace, name)
+    try:
+        return catalog.get(kind).view(await _get_dict(kind, name, namespace))
+    except Exception as exc:
+        raise RuntimeError(f"could not read {kind} {namespace}/{name}: {safe_error(exc)}") from None
+
+
+async def list_replicasets(namespace: str, deployment: str, selector: dict | str | None = None) -> list[dict]:
+    """The ReplicaSets a Deployment owns (its revision history), as views."""
+    raws = await _list_dicts("ReplicaSet", namespace=namespace, labels=selector or None)
+    sets = [views.replicaset_view(r) for r in raws]
+    return [rs for rs in sets if (rs.get("owner") or {}).get("kind") == "Deployment" and (rs.get("owner") or {}).get("name") == deployment]
+
+
 async def list_deployment_views(namespace: str | None = None) -> list[dict]:
     return [views.deployment_view(r) for r in await _list_dicts("Deployment", namespace=namespace)]
 

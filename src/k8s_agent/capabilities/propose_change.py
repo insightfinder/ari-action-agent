@@ -1,8 +1,12 @@
 """Works out exactly what would change, checks it, dry-runs it, and stops.
 
 The model's only job here is to read the request and say which change it
-asks for, quoting the words it took each number from. Everything else is
-code: whether the Deployment is managed by KEDA/HPA (and so may only be
+asks for, quoting the words it took each number from. Which changes are
+offered depends on the workload `find_workload` resolved (a Deployment, a
+StatefulSet or a DaemonSet; each action lists its `workload_kinds`), and a
+change that takes no value (a restart, a rollback, a pod delete) is
+proposed only when the request's own words ask for it (`spec.accepts`).
+Everything else is code: whether the Deployment is managed by KEDA/HPA (and so may only be
 changed through its autoscaler, and only on explicit request), the
 replica floor, the node-capacity cap for CPU/memory, the capacity and
 Cluster Autoscaler outlook, the pre-flight risks, the risk tier, the
@@ -28,19 +32,25 @@ from ..tools import capacity, persistence, policy, quantities
 
 _SENTINEL = "CHANGE_JSON:"
 _SYSTEM = (
-    "You read a request to change a Kubernetes Deployment and report exactly what it asks for. You never "
-    "invent or round a number. For every number you report you also give the exact words of the request "
-    "it came from (a verbatim quote). If the request does not ask for a concrete change, say so."
+    "You read a request to change a Kubernetes workload (a Deployment, StatefulSet or DaemonSet) or one of its "
+    "pods and report exactly what it asks for. You never invent or round a number. For every number you report "
+    "you also give the exact words of the request it came from (a verbatim quote). If the request does not ask "
+    "for a concrete change, say so."
 )
-def _container_summary(dep: dict) -> list[dict]:
-    return [{"name": c["name"], "resources": c["resources"]} for c in dep["template"]["containers"]]
+def _container_summary(workload: dict) -> list[dict]:
+    return [{"name": c["name"], "resources": c["resources"]} for c in workload["template"]["containers"]]
 
 
-async def _extract(ctx: StepContext, dep: dict, autoscaler: dict | None) -> dict:
+def _offered(kind: str) -> list:
+    return [spec for spec in actions.REGISTRY.values() if kind in spec.workload_kinds]
+
+
+async def _extract(ctx: StepContext, workload: dict, autoscaler: dict | None) -> dict:
+    offered = _offered(workload.get("kind") or "Deployment")
     context = {
-        "deployment": f"{dep['namespace']}/{dep['name']}",
-        "current_replicas": dep["replicas"],
-        "containers": _container_summary(dep),
+        "workload": f"{workload.get('kind') or 'Deployment'} {workload['namespace']}/{workload['name']}",
+        "current_replicas": workload.get("replicas"),
+        "containers": _container_summary(workload),
         "autoscaler": (
             {"kind": autoscaler.get("kind"), "name": autoscaler.get("name"), "min": autoscaler.get("min"), "max": autoscaler.get("max")}
             if autoscaler
@@ -50,13 +60,14 @@ async def _extract(ctx: StepContext, dep: dict, autoscaler: dict | None) -> dict
     user_prompt = (
         f"Request:\n{ctx.prompt}\n\nCurrent state:\n{context}\n\n"
         "Which change does the request ask for?\n"
-        + "".join(f"- {spec.name}: {spec.prompt_line}\n" for spec in actions.REGISTRY.values())
+        + "".join(f"- {spec.name}: {spec.prompt_line}\n" for spec in offered)
         + "- none: no concrete change is requested.\n"
         f"End your response with a line reading exactly '{_SENTINEL}' followed by ONLY a JSON object:\n"
-        '{"action": ' + " | ".join(f'"{n}"' for n in (*actions.REGISTRY, "none")) + ', '
+        '{"action": ' + " | ".join(f'"{n}"' for n in (*(spec.name for spec in offered), "none")) + ', '
         '"replicas": <int or null>, "replicas_quote": "<verbatim words or null>", '
         '"min": <int or null>, "min_quote": "<verbatim or null>", "max": <int or null>, "max_quote": "<verbatim or null>", '
         '"container": "<container name or null>", "pod": "<pod name exactly as written in the request, or null>", '
+        '"revision": <revision number to roll back to, or null for the previous one>, "revision_quote": "<verbatim or null>", '
         '"resources": {"requests": {"cpu": {"value": "<quantity>", "quote": "<verbatim>"}, "memory": {...}}, '
         '"limits": {"cpu": {...}, "memory": {...}}}, '
         '"reasoning": "<one line>"}\n'
@@ -95,9 +106,13 @@ def _startup_estimate(dep: dict) -> int | None:
     return worst or None
 
 
-def _pdb_risks(pdbs: list[dict], dep: dict) -> list[dict]:
-    # The pods carry the template's labels (a superset of the selector's); a PDB can key on either.
-    pod_labels = {**(dep["template"].get("labels") or {}), **(dep["selector"] or {})}
+_SCALE_DOWN_PDB = (
+    "It does not block this scale-down, which removes pods through the ReplicaSet rather than by eviction; with "
+    "fewer replicas it leaves less room for voluntary disruptions such as node drains."
+)
+
+
+def _pdb_risks(pdbs: list[dict], pod_labels: dict, message: str) -> list[dict]:
     risks = []
     for pdb in pdbs:
         selector = pdb.get("selector") or {}
@@ -107,13 +122,16 @@ def _pdb_risks(pdbs: list[dict], dep: dict) -> list[dict]:
                     "level": "info",
                     "message": (
                         f"PodDisruptionBudget {pdb['name']} covers these pods (minAvailable={pdb.get('min_available')}, "
-                        f"maxUnavailable={pdb.get('max_unavailable')}). It does not block this scale-down, which removes "
-                        "pods through the ReplicaSet rather than by eviction; with fewer replicas it leaves less room "
-                        "for voluntary disruptions such as node drains."
+                        f"maxUnavailable={pdb.get('max_unavailable')}). {message}"
                     ),
                 }
             )
     return risks
+
+
+def _template_pod_labels(workload: dict) -> dict:
+    # The pods carry the template's labels (a superset of the selector's); a PDB can key on either.
+    return {**(workload["template"].get("labels") or {}), **(workload.get("selector") or {})}
 
 
 # ------------------------------------------------------------------ run
@@ -121,47 +139,61 @@ def _pdb_risks(pdbs: list[dict], dep: dict) -> list[dict]:
 
 async def run(ctx: StepContext) -> dict:
     target = resolved_target(ctx)
-    if target.get("scope") != "deployment" or not target.get("name") or not target.get("namespace"):
+    kind = target.get("kind") or "Deployment"
+    if target.get("scope") not in ("deployment", "workload") or not target.get("name") or not target.get("namespace"):
         candidates = (ctx.results.get("find_workload") or {}).get("candidates") or []
         return refusal(
-            "Which Deployment to change is not clear" + (f"; candidates: {', '.join(candidates)}" if candidates else "."),
+            "Which workload to change is not clear" + (f"; candidates: {', '.join(candidates)}" if candidates else "."),
             candidates=candidates,
         )
 
     opts = options(ctx)
     threshold = policy.high_replica_threshold(opts)
     namespace, name = target["namespace"], target["name"]
-    dep = await ctx.tool("get_deployment")(namespace, name)
-    autoscaler = await ctx.tool("find_autoscaler")(namespace, name)
-    change = await _extract(ctx, dep, autoscaler)
-    spec = actions.REGISTRY.get(change.get("action"))
-    if spec is not None and spec.fallback and not spec.accepts(ctx.prompt):
-        spec = actions.REGISTRY[spec.fallback]
-    state = {"deployment": dep, "autoscaler": autoscaler}
-
-    nodes = pods = None
-    if spec is not None:
-        target_obj, refused = await spec.resolve_target(ctx, dep, change)
-        if refused:
-            return refused
-        if target_obj["kind"] != "Deployment":
-            state = await spec.load_state(ctx, target_obj)
-        if spec.needs_capacity:
-            nodes = await ctx.tool("list_nodes")()
-            pods = await ctx.tool("list_pods")(None, None, True)
-        env = {"threshold": threshold, "headroom": policy.headroom_ratio(opts), "nodes": nodes, "pods": pods}
-        planned, refused = spec.plan(ctx, state, change, env)
+    autoscaler = None
+    if kind == "Deployment":
+        workload = await ctx.tool("get_deployment")(namespace, name)
+        autoscaler = await ctx.tool("find_autoscaler")(namespace, name)
     else:
+        workload = await ctx.tool("get_workload")(kind, namespace, name)
+    change = await _extract(ctx, workload, autoscaler)
+    spec = actions.REGISTRY.get(change.get("action"))
+    if spec is not None and kind not in spec.workload_kinds:
+        spec = None
+    if spec is not None and not spec.accepts(ctx.prompt):
+        if not spec.fallback:
+            # The model's choice alone never proposes a change the request's own words do not ask for.
+            return refusal(spec.not_asked.format(kind=kind, name=name, namespace=namespace), asked_for=spec.name)
+        spec = actions.REGISTRY[spec.fallback]
+    if spec is None:
         # Nothing is proposed without a value the requester chose; hand back what is configured now
         # so a caller (an engineer, or the on-call coordinator) can ask again with one.
         return refusal(
-            "The request does not ask for a concrete scaling or CPU/memory change: "
+            "The request does not ask for a concrete change this agent can make to "
+            f"{kind} {namespace}/{name}: "
             + str(change.get("reasoning") or "no change identified")
-            + ". Nothing was proposed. Ask again with the exact new value, for example 'set the memory limit "
-            f"of container {_container_summary(dep)[0]['name'] if dep['template']['containers'] else '<container>'} "
-            f"in deployment {name} (namespace {namespace}) to <value>'.",
-            current={"replicas": dep.get("replicas"), "containers": _container_summary(dep)},
+            + ". Nothing was proposed. Ask again with the exact change, for example "
+            + (
+                "'set the memory limit "
+                f"of container {_container_summary(workload)[0]['name'] if workload['template']['containers'] else '<container>'} "
+                f"in deployment {name} (namespace {namespace}) to <value>' or "
+                if kind == "Deployment"
+                else ""
+            )
+            + f"'restart {kind.lower()} {name} in namespace {namespace}'.",
+            current={"kind": kind, "replicas": workload.get("replicas"), "containers": _container_summary(workload)},
         )
+
+    target_obj, refused = await spec.resolve_target(ctx, workload, change)
+    if refused:
+        return refused
+    state = await spec.load_state(ctx, target_obj)
+    nodes = pods = None
+    if spec.needs_capacity:
+        nodes = await ctx.tool("list_nodes")()
+        pods = await ctx.tool("list_pods")(None, None, True)
+    env = {"threshold": threshold, "headroom": policy.headroom_ratio(opts), "nodes": nodes, "pods": pods}
+    planned, refused = spec.plan(ctx, state, change, env)
     if refused:
         return refused
     action, facts = planned
@@ -177,10 +209,14 @@ async def run(ctx: StepContext) -> dict:
                 "message": f"The target replica count exceeds {threshold}. Check the number carefully before approving — this is the only confirmation.",
             }
         )
-    if action["action"] == "set_resources":
-        risks.append({"level": "medium", "message": "Changing CPU/memory triggers a rolling restart of every pod of this Deployment."})
-        claims = [c for c in dep["template"]["pvc_claims"] if c]
-        if claims and dep["strategy"]["type"] == "RollingUpdate":
+    for risk in facts.get("risks") or []:
+        risks.append(risk)
+        if risk.get("level") in ("medium", "high", "critical"):
+            tier = policy.raise_tier(tier, risk["level"])
+    if facts.get("rolls_pods"):
+        risks.append({"level": "medium", "message": facts.get("roll_message") or "Every pod of this workload is replaced."})
+        claims = [c for c in workload["template"]["pvc_claims"] if c]
+        if kind == "Deployment" and claims and workload["strategy"]["type"] == "RollingUpdate":
             pvcs = await ctx.tool("get_pvcs")(namespace, claims)
             rwo = [p["name"] for p in pvcs if "ReadWriteOnce" in (p.get("access_modes") or []) or "ReadWriteOncePod" in (p.get("access_modes") or [])]
             if rwo:
@@ -195,14 +231,16 @@ async def run(ctx: StepContext) -> dict:
                     }
                 )
     if facts.get("scale_down"):
-        risks.extend(_pdb_risks(await ctx.tool("list_pdbs")(namespace), dep))
+        risks.extend(_pdb_risks(await ctx.tool("list_pdbs")(namespace), _template_pod_labels(workload), _SCALE_DOWN_PDB))
+    if facts.get("pdb_message"):
+        risks.extend(_pdb_risks(await ctx.tool("list_pdbs")(namespace), facts.get("pod_labels") or {}, facts["pdb_message"]))
 
     outlook = None
     if facts.get("new_pods", 0) > 0:
         nodes = nodes if nodes is not None else await ctx.tool("list_nodes")()
         pods = pods if pods is not None else await ctx.tool("list_pods")(None, None, True)
-        per_pod = _per_pod_requests(dep["template"], facts.get("per_pod_override"))
-        outlook = capacity.estimate_fit(nodes, pods, dep["template"], per_pod, facts["new_pods"])
+        per_pod = _per_pod_requests(workload["template"], facts.get("per_pod_override"))
+        outlook = capacity.estimate_fit(nodes, pods, workload["template"], per_pod, facts["new_pods"])
         if outlook["unplaced"]:
             ca = await ctx.tool("get_ca_status")()
             ca_notes = capacity.ca_risks(ca, outlook["nodes_needed"], outlook["exceeds_every_node"])
@@ -224,12 +262,12 @@ async def run(ctx: StepContext) -> dict:
 
     changed = facts["changed_object"]
     chain = await ctx.tool("get_flux_chain")(changed["labels"], changed["annotations"])
-    drift = spec.lifetime_notice(chain.get("ownership") or {}, chain)
-    if spec.target(action)["kind"] != "Deployment":
-        risks.append({"level": "info", "message": drift})
-    elif (chain.get("ownership") or {}).get("class") != "unowned":
-        risks.append({"level": "medium", "message": drift})
-    hint = persistence.build_hint(chain, facts["rendered_changes"])
+    ownership = chain.get("ownership") or {}
+    drift = spec.lifetime_notice(ownership, chain)
+    level = spec.lifetime_risk(ownership)
+    if level:
+        risks.append({"level": level, "message": drift})
+    hint = persistence.build_hint(chain, facts["rendered_changes"], nothing_to_persist=facts.get("nothing_to_persist"))
 
     try:
         dry_run = await ctx.tool("dry_run_patch")(action)
@@ -243,7 +281,7 @@ async def run(ctx: StepContext) -> dict:
             )
         raise
     # Nothing restarts for an in-place resize without RestartContainer.
-    startup = None if "restart" in facts and not facts["restart"] else _startup_estimate(dep)
+    startup = None if "restart" in facts and not facts["restart"] else _startup_estimate(workload)
 
     pending_action = {
         "id": str(uuid.uuid4()),

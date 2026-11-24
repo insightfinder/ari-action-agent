@@ -143,7 +143,32 @@ async def test_delete_is_background_propagation(kube):
     await kube_.delete("Pod", "p1", "shop", False)
     call = t.calls[0]
     assert call["method"] == "DELETE" and call["path"] == "/api/v1/namespaces/shop/pods/p1"
-    assert call["body"] == {"propagationPolicy": "Background"}
+    assert call["body"] == {"kind": "DeleteOptions", "apiVersion": "v1", "propagationPolicy": "Background"}
+    assert call["query"] == {}
+
+
+async def test_a_dry_run_delete_carries_dry_run_and_the_uid_precondition_in_the_body(kube):
+    # The API server reads DeleteOptions from the body when there is one and then ignores the query string,
+    # so a dryRun only in the query would delete for real.
+    kube_, t = kube
+    await kube_.delete("Pod", "db-1", "shop", True, preconditions={"uid": "uid-db-1"})
+    call = t.calls[0]
+    assert call["method"] == "DELETE"
+    assert call["body"] == {
+        "kind": "DeleteOptions",
+        "apiVersion": "v1",
+        "propagationPolicy": "Background",
+        "dryRun": ["All"],
+        "preconditions": {"uid": "uid-db-1"},
+    }
+
+
+async def test_json_patch_sends_the_operation_list(kube):
+    kube_, t = kube
+    ops = [{"op": "test", "path": "/metadata/annotations/deployment.kubernetes.io~1revision", "value": "3"}, {"op": "replace", "path": "/spec/template", "value": {}}]
+    await kube_.patch("Deployment", "checkout", "shop", ops, client.PATCH_JSON, True)
+    call = t.calls[0]
+    assert call["headers"]["Content-Type"] == "application/json-patch+json" and call["body"] == ops
 
 
 @pytest.mark.parametrize("status", [403, 404, 409, 500])

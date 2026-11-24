@@ -44,10 +44,11 @@ META = AgentMeta(
     description=(
         "Kubernetes agent for the cluster it runs in: lists any readable kind as a table (pods, per-container "
         "CPU/memory requests, limits and usage, workloads, nodes, events, ...), checks Pod-level health, scales "
-        "Deployments, and changes "
+        "Deployments, changes "
         "CPU/memory — of a Deployment (rolls its pods) or of one running pod in place (no rollout, where the "
-        "cluster supports in-place pod resize) — every change proposed first and applied only after a person "
-        "approves it. Deployments "
+        "cluster supports in-place pod resize) —, restarts Deployments, StatefulSets and DaemonSets, rolls a "
+        "Deployment back to an earlier revision and deletes a single pod for its controller to replace — every "
+        "change proposed first and applied only after a person approves it. Deployments "
         "managed by KEDA or an HPA are scaled only through their autoscaler's min/max, and only on explicit "
         "request; CPU/memory change only on explicit request, capped by real node capacity."
     ),
@@ -62,18 +63,24 @@ META = AgentMeta(
             "once approved, apply: a Deployment replica change; a KEDA ScaledObject's or HPA's min/max (explicit "
             "request only); CPU/memory requests or limits of a container (explicit request only), either in the "
             "Deployment's template (rolls its pods) or in place on one named running pod (no recreation; memory "
-            "only for containers whose resizePolicy restarts them). Never scales anything below 1 replica."
+            "only for containers whose resizePolicy restarts them); a rolling restart of a Deployment, StatefulSet "
+            "or DaemonSet; a Deployment rollback to the previous (or a stated) revision; deleting one named pod "
+            "that its Deployment, StatefulSet or DaemonSet replaces. Restart, rollback and delete only when the "
+            "request asks for them. Never scales anything below 1 replica."
         ),
-        tags=["kubernetes", "health", "scaling", "keda", "hpa"],
+        tags=["kubernetes", "health", "scaling", "keda", "hpa", "restart", "rollback"],
         examples=[
             "check the health of the pods in the insightfinder namespace",
             "list all pods with cpu and memory limit and usage in the insightfinder namespace",
             "scale the checkout deployment to 3 replicas",
             "set the KEDA max replicas of the anomaly worker to 10",
             "resize pod checkout-7d9f5c6b8-x2k4q in place: cpu limit 2",
+            "restart the checkout deployment",
+            "roll back the checkout deployment to the previous revision",
+            "delete pod checkout-7d9f5c6b8-x2k4q",
         ],
     ),
-    planner_description="Kubernetes agent that checks cluster health and scales Deployments",
+    planner_description="Kubernetes agent that checks cluster health and changes workloads (scale, resources, restart, rollback, delete a pod)",
     planner_domain_guidance="""Requests are either a listing question, a health question, a change, or a plain question.
 - A listing question ("list / show / which / table of ...": all pods with their CPU/memory limits and usage, \
 Deployments, nodes, events, PVCs, ...): plan "query_resources" alone (no "find_workload"); pass a namespace the \
@@ -82,7 +89,8 @@ everything of some kind rather than what is wrong.
 - A health question ("what's wrong with X", "check the pods in namespace Y", "is the cluster healthy"): \
 plan "find_workload" then "check_health". Read-only; never needs approval.
 - A change (scale a Deployment, change its KEDA/HPA min or max, change CPU/memory of a Deployment or, in place, \
-of one pod): plan "find_workload" then "propose_change". "propose_change" works out and checks the exact change and pauses for a person's approval; \
+of one pod, restart a Deployment/StatefulSet/DaemonSet, roll a Deployment back, delete a pod): plan \
+"find_workload" then "propose_change". "propose_change" works out and checks the exact change and pauses for a person's approval; \
 it decides itself whether the request is explicit enough and refuses otherwise — do not try to pre-judge that.
 - **NEVER schedule "apply_approved_change".** It runs only after a person approves a proposal, through a \
 confirmation path that bypasses planning; a planned one refuses to run.
@@ -118,8 +126,10 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "verification unavailable (the change WAS applied, but its rollout could not be checked; say both); for "
         "an in-place pod resize also: resize infeasible or deferred on the pod's node, pod replaced while "
         "watched, or container failing after the resize — and that the Deployment template still has the old "
-        "values until the change is made in Git — "
-        "plus the drift notice and persistence hint. For a refusal: "
+        "values until the change is made in Git; for a rollback, reverted means the newer version came back "
+        "(image automation or a Helm upgrade); for a deleted pod, which pod replaced it — "
+        "plus the drift notice and persistence hint (when it says nothing needs persisting, say so in one line). "
+        "For a refusal: "
         "the reason, the current values it reports, and what an acceptable request would look like; a refusal means "
         "no change was proposed and nothing is waiting for approval, so never describe one as proposed or ready "
         "to confirm. For a health check, include each flagged workload's configured requests and limits "

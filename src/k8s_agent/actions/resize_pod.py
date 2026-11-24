@@ -270,7 +270,9 @@ class ResizePod(ActionSpec):
                 "labels": dep.get("labels") or {},
                 "annotations": dep.get("annotations") or {},
             },
-            # What would have to change in Git to keep it: the Deployment template's fields.
+            # What would have to change in Git to keep it: the Deployment template's fields. A field the template
+            # already holds (a resize back to the template's value) is not listed; with none left, the hint says
+            # there is nothing to persist.
             "rendered_changes": [
                 {
                     "object": f"Deployment {pod['namespace']}/{dep.get('name')} container {name}",
@@ -279,12 +281,18 @@ class ResizePod(ActionSpec):
                     "to": v,
                 }
                 for k, v in applied_fmt.items()
+                if not _same(k.split(".")[1], (template.get(k.split(".")[0]) or {}).get(k.split(".")[1]), v)
             ],
             "action_name": (
                 f"Resize pod {pod['namespace']}/{pod['name']} ({name}) in place: "
                 + ", ".join(f"{k} {before.get(k)} -> {v}" for k, v in applied_fmt.items())
             ),
         }
+        if not facts["rendered_changes"]:
+            facts["nothing_to_persist"] = (
+                "Nothing to persist: the Deployment's template already holds these values (this resize brings the pod "
+                "back to them)."
+            )
         return (action, facts), None
 
     # ------------------------------------------------------------ write
@@ -385,6 +393,9 @@ class ResizePod(ActionSpec):
     def changed_object(self, action, state):
         dep = state.get("deployment") or {}
         return {"labels": dep.get("labels") or {}, "annotations": dep.get("annotations") or {}}
+
+    def lifetime_risk(self, ownership):
+        return "info"
 
     def lifetime_notice(self, ownership, chain):
         return (

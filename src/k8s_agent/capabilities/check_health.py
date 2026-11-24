@@ -15,7 +15,7 @@ from common.capabilities_base import StepContext
 from ..stepkit import finish, options, resolved_target, untrusted_block
 from ..tools import governance, health_rules
 
-_FINDINGS_LIMIT = {"deployment": 40, "namespace": 40, "cluster": 30}
+_FINDINGS_LIMIT = {"deployment": 40, "workload": 40, "namespace": 40, "cluster": 30}
 _EVENTS_LIMIT = 15
 _LOG_TAILS = 5
 _RESOURCES_LIMIT = 20
@@ -103,16 +103,23 @@ async def run(ctx: StepContext) -> dict:
     target = resolved_target(ctx)
     scope = target.get("scope")
     namespace = target.get("namespace") or options(ctx).get("namespace")
-    if scope not in ("deployment", "namespace", "cluster"):
+    if scope not in ("deployment", "workload", "namespace", "cluster"):
         scope = "namespace" if namespace else "cluster"
     if scope == "cluster":
         namespace = None
 
     gaps: list[str] = []
+    workload = None
     if scope == "deployment":
         dep = await ctx.tool("get_deployment")(namespace, target["name"])
         deployments = [dep]
         pods = await ctx.tool("list_pods")(namespace, dep.get("label_selector") or dep.get("selector") or None)
+    elif scope == "workload":
+        # A StatefulSet or DaemonSet: its own pods, never widened to the namespace.
+        workload = await ctx.tool("get_workload")(target["kind"], namespace, target["name"])
+        deployments = []
+        selected = await ctx.tool("list_pods")(namespace, workload.get("label_selector") or workload.get("selector") or None)
+        pods = [p for p in selected if governance.owned_by(p, target["kind"], target["name"])]
     else:
         deployments = await ctx.tool("list_deployment_views")(namespace)
         pods = await ctx.tool("list_pods")(namespace)
@@ -122,7 +129,7 @@ async def run(ctx: StepContext) -> dict:
     except Exception as exc:  # noqa: BLE001 — events are supporting evidence
         events = []
         gaps.append(f"events could not be read: {exc}")
-    if scope == "deployment":
+    if scope in ("deployment", "workload"):
         own_pods = {p.get("name") for p in pods}
         events = [e for e in events if _belongs_to((e.get("involved") or {}).get("name"), target["name"], own_pods)]
     if not events:
@@ -141,6 +148,8 @@ async def run(ctx: StepContext) -> dict:
     findings = []
     for dep in deployments:
         findings.extend(health_rules.deployment_findings(dep))
+    if workload is not None:
+        findings.extend(health_rules.workload_findings(workload))
     for pod in pods:
         findings.extend(health_rules.pod_findings(pod))
     findings.extend(health_rules.usage_findings(pods, usage))
@@ -165,6 +174,8 @@ async def run(ctx: StepContext) -> dict:
         d for d in deployments
         if scope == "deployment" or (d["namespace"], d["name"]) in flagged_keys
     ][:_RESOURCES_LIMIT]
+    if workload is not None:
+        flagged = [workload]
     container_resources = {
         f"{d['namespace']}/{d['name']}": [
             {"container": c["name"], **(c.get("resources") or {})} for c in (d.get("template") or {}).get("containers") or []
@@ -174,7 +185,12 @@ async def run(ctx: StepContext) -> dict:
     unhealthy_pods = {(f["namespace"], f["name"]) for f in findings if f["kind"] == "Pod" and f["severity"] != "info"}
     degraded = {(f["namespace"], f["name"]) for f in findings if f["kind"] == "Deployment"}
     report = {
-        "scope": {"type": scope, "namespace": namespace, "deployment": target.get("name") if scope == "deployment" else None},
+        "scope": {
+            "type": scope,
+            "namespace": namespace,
+            "deployment": target.get("name") if scope == "deployment" else None,
+            **({"kind": target["kind"], "name": target["name"]} if scope == "workload" else {}),
+        },
         "as_of": datetime.now(timezone.utc).isoformat(),
         "summary": {
             "deployments": len(deployments),

@@ -3,7 +3,7 @@
 # wildcards — and the agent can never:
 #   - read Secrets (not listed at all),
 #   - exec/attach/port-forward into pods,
-#   - create or delete anything,
+#   - create anything, or delete anything but a pod,
 #   - touch RBAC (so it cannot widen its own authority).
 # Writes are cluster-wide; human approval of every
 # change and the agent's in-code bounds are the guardrails on top of this.
@@ -75,9 +75,9 @@ rules:
   - apiGroups: ["source.toolkit.fluxcd.io"]
     resources: [gitrepositories, ocirepositories, buckets, helmrepositories]
     verbs: [get]
-  # ---- write (patch only; the scale subresource for replica changes)
+  # ---- write (the scale subresource for replica changes)
   - apiGroups: ["apps"]
-    resources: [deployments/scale, deployments]
+    resources: [deployments/scale, deployments, statefulsets, daemonsets]
     verbs: [patch]
   - apiGroups: ["autoscaling"]
     resources: [horizontalpodautoscalers]
@@ -90,6 +90,10 @@ rules:
   - apiGroups: [""]
     resources: [pods/resize]
     verbs: [patch]
+  # Deleting a pod lets its controller replace it; nothing else is deleted.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -5491,3 +5491,82 @@ table was shown). Fix: the annotation is a string. Verified: on a Python 3.12 ve
 test collection (6 errors), the fixed tree passes (1081 passed, 1 pre-existing `.DS_Store` failure).
 Lesson: run the suite on 3.12, the images' version (`Dockerfile.*` FROM python:3.12-slim), not the local
 default Python.
+
+**In-cluster read-only end to end, passed (test, 2026-11-24, image `2611241029-test`).** Through the deployed
+API (port-forward to `svc/ari-k8s-api`, an AGENT_API_KEYS key and the LLM config read from the secret and
+`scripts/.env` without printing them) -> Temporal -> worker with its own ServiceAccount, real model:
+- "list all pods with cpu and memory limit, usage for insightfinder": COMPLETED in 23 s, `query_result` with
+  `schema` and `column_types`, 128 container rows = kubectl's 128 (non-terminal, incl. pods stuck Terminating
+  on two unreachable nodes), no gaps, nothing ignored; 79 pods had usage, and the only pod `kubectl top` had
+  that the table lacked was the API pod started seconds before (no metrics sample yet); pods on the dead nodes
+  have null usage, as designed. The reply summarised without a table.
+- "list the statefulsets in the insightfinder namespace": 3 rows = kubectl's 3.
+- "list the configmaps ...": 0 rows plus the gap "not allowed to list ConfigMap (HTTP 403 ...)", and the
+  reply said the 0 comes from the denied read, not an empty namespace.
+Numbers in the artifact arrive as doubles after the A2A round trip (128.0, replicas 1.0), as for every other
+artifact; `column_types` still says integer. Before this run the API rollout hung: node `ip-10-1-23-201` went
+unreachable (cluster issue, not ours), the old API pod stuck Terminating held the RWO task-store PVC under
+the `Recreate` strategy; the user force-deleted that pod and the new one came up. Not run yet: the write path
+(resize_pod) in-cluster.
+
+**In-cluster write end to end, passed (test, 2026-11-24, with the user's OK).** Same path (deployed API ->
+Temporal -> worker with its ServiceAccount, real model), each step proposed, then approved with
+`confirm_pending_action` on the same task, on `insightfinder-dailyreportworker-7fc445d554-fkspm` (memory
+`RestartContainer` from the test-fluxcd postRenderer):
+- cpu limit 2 -> 3: proposed `resize_pod` tier low (no restart), dry run through pods/resize; applied
+  `succeeded` in 72 s; same uid and node, restarts 0 -> 0, spec and status 3.
+- cpu limit 3 -> 2: same, 75 s.
+- memory limit 3500Mi -> 4Gi: tier medium (restart); `succeeded` in 172 s, restarts 0 -> 1, same uid/node,
+  spec and status 4Gi; `wait_resize` waited for the restart and the JVM's readiness, then 50 s stable.
+- memory limit 4Gi -> 3500Mi: same, 173 s, restarts 1 -> 2.
+`persistence.ready_to_persist` true after each, with the template field to change. The pod ends where it
+started (2 / 3500Mi, matching the template). Small gap seen: for a resize back to the template's value the
+persistence hint still lists a change ("from 2 to 2") instead of saying Git already holds it.
+
+**Decision (user, 2026-11-24): no staging until every phase is built and tested on test.** II-25740 keeps
+merging into `test` per batch; `staging` (and the PR to `main`) come once the whole plan is done and tested
+there.
+
+**Write batch 1: `restart_rollout`, `rollback`, `delete_pod` (2026-11-24, uncommitted until the user commits).**
+- `restart_rollout`: rolling restart of a Deployment, StatefulSet or DaemonSet, as `kubectl rollout restart`
+  (template annotation `kubectl.kubernetes.io/restartedAt`, value fixed at proposal time so a retried apply
+  verifies instead of restarting twice). Refused for a paused Deployment, `OnDelete`, or no pods. Deployment
+  verified by `wait_rollout`; StatefulSet/DaemonSet by the new `wait_workload_rollout`. Nothing to persist.
+- `rollback`: Deployment to the previous revision or a quoted one. The proposal carries identifiers and images
+  only; the pod template (env values) is read from the ReplicaSet inside the write tools (new
+  `ActionSpec.build_operations`) and sent as a JSON patch: `test` of the current revision, then `replace
+  /spec/template` (pod-template-hash label dropped, as kubectl does). Verified by `wait_rollout` with an
+  `images` target; image automation rolling forward shows as `reverted`.
+- `delete_pod`: one named pod a Deployment, StatefulSet or DaemonSet owns; plain delete with a uid
+  precondition; PDB reported, not waited for; `high` when no other pod of the workload is ready. Verified by
+  the new `wait_pod_replaced` (old uid gone, a pod created after the delete ready and stable). "restart pod X"
+  counts as a delete.
+- Intent gates in code (`policy.asks_restart/asks_rollback/asks_delete_pod`): these actions take no value, so
+  the model's pick alone never proposes one; health wording ("restarted 9 times", "restart count", "重启了 5
+  次", "without a restart") does not count. `ActionSpec.accepts` now refuses (`asked_for`) when there is no
+  fallback.
+- Shared: `find_workload` resolves StatefulSets and DaemonSets too (`scope: "workload"`, `kind`; Deployments
+  unchanged); `check_health` on one looks at its own pods only, plus a `ReplicasUnavailable` finding.
+  `propose_change` keys the rolling-pods and PDB risks on facts, not action names; `lifetime_risk` hook;
+  `persistence.needed: false` for changes with nothing to write to Git — which also fixes the "from 2 to 2"
+  hint of a resize back to the template's value.
+- RBAC: `patch` on statefulsets/daemonsets, `delete` on pods; `docs/examples/k8s-rbac.yaml` and oncallari
+  0.3.15 (charts branch `II-25740-k8s-agent-write-actions`, cut from main: the 0.3.14 branch was
+  squash-merged).
+- Verified: suite on Python 3.12, 1150 passed (the one failure is the known local `skills/.DS_Store`).
+  Server-side dry runs on test with my own kubeconfig: the agent's rollback patch (built by
+  `Rollback.build_operations` from a real ReplicaSet) replaced the template with revision 1083's image, and a
+  stale revision in the `test` op was rejected (422); a uid precondition that does not match answers 409.
+  Not verified yet: the in-cluster e2e of all three with the worker's ServiceAccount.
+
+**Incident while verifying (test, 2026-11-24 ~21:47 CST): one real pod delete.** Checking the delete
+precondition with `kubectl delete --raw "...pods/<pod>?dryRun=All" -f <DeleteOptions body>` deleted
+`insightfinder-dailyreportworker-7fc445d554-fkspm` for real: with a body present the API server reads
+DeleteOptions from the body only and ignores the query string, so `dryRun` in the query was dropped. Its
+Deployment replaced it (new pod ready after ~90 s; 1 replica, so the worker was down for that time). The
+agent's own client had the same bug (dryRun in the query, a body with propagationPolicy/preconditions): its
+`delete_pod` dry run at proposal time would have deleted the pod. Fixed before anything shipped: every delete
+option, `dryRun` included, goes in the body (`client._delete_sync`), as kubectl's `--dry-run=server` sends it
+(seen with `-v=8`: `{"propagationPolicy":"Background","dryRun":["All"]}`); a unit test pins the body, and the
+real client's request was captured on a local HTTP server to confirm the bytes. Lesson: for DELETE, options
+belong in the body; never test a "dry run" against a live object without confirming where the server reads it.
