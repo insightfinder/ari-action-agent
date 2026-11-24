@@ -5479,3 +5479,15 @@ chart label only; pod templates unchanged, and the api/worker pods were not rest
 as `ari-k8s`: patch pods/resize yes; list statefulsets, customresourcedefinitions, namespaces, ingresses,
 jobs yes; list configmaps, helmreleases, secrets no; plain patch pods no. The agent image is still the old
 code until this branch reaches `test`.
+
+## 2026-11-24 - Deployed `query_resources` failed on import: an annotation that only Python 3.12 evaluates (II-25740)
+
+**Found in the first in-cluster run on test** (read-only, via the deployed API): every `query_resources` step
+failed with `TypeError: 'function' object is not subscriptable` at `tools/client.py` import. In class `Kube`,
+`async def core_resources(self) -> list[str]` comes after the method named `list`, so `list` there is that
+method; the worker image is Python 3.12, which evaluates annotations eagerly. All local runs used a Python
+3.15 venv (lazy annotations), so nothing caught it. The respond step reported the failure honestly (no empty
+table was shown). Fix: the annotation is a string. Verified: on a Python 3.12 venv the unfixed commit fails
+test collection (6 errors), the fixed tree passes (1081 passed, 1 pre-existing `.DS_Store` failure).
+Lesson: run the suite on 3.12, the images' version (`Dockerfile.*` FROM python:3.12-slim), not the local
+default Python.

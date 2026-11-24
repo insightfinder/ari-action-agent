@@ -176,7 +176,9 @@ class Kube:
     async def server_version(self) -> dict:
         return await asyncio.to_thread(self._server_version_sync)
 
-    async def core_resources(self) -> list[str]:
+    # The annotation is a string: inside this class `list` is the method above, so a bare `list[str]` fails
+    # at import on Python 3.12, which evaluates annotations eagerly (the worker image's version).
+    async def core_resources(self) -> "list[str]":
         return await asyncio.to_thread(self._core_resources_sync)
 
 
