@@ -39,6 +39,22 @@ tools:
     module: k8s_agent.tools.read
     function: find_autoscaler
 
+  get_pod:
+    module: k8s_agent.tools.read
+    function: get_pod
+
+  list_views:           # any catalog kind as whitelisted views; 403/404 raise typed errors (reported as gaps)
+    module: k8s_agent.tools.read
+    function: list_views
+
+  namespace_names:
+    module: k8s_agent.tools.read
+    function: namespace_names
+
+  get_resize_support:   # discovery (/api/v1 pods/resize) and /version, read live
+    module: k8s_agent.tools.read
+    function: get_resize_support
+
   list_nodes:
     module: k8s_agent.tools.read
     function: list_nodes
@@ -62,6 +78,10 @@ tools:
   wait_rollout:
     module: k8s_agent.tools.rollout
     function: wait_rollout
+
+  wait_resize:
+    module: k8s_agent.tools.rollout
+    function: wait_resize
 
   # ---- writes
   dry_run_patch:        # always dryRun=All — cannot change the cluster

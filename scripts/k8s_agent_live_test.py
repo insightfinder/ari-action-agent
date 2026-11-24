@@ -406,8 +406,8 @@ def scenario_oversized(_args):
 
 
 def scenario_high_replicas(_args):
-    """More than 50 replicas is proposed as critical (cancelled, never applied)."""
-    task, pending, note = _proposal_only("scale e2e-plain to 51 replicas", "e2e-plain")
+    """More than 30 replicas (the default threshold) is proposed as critical (cancelled, never applied)."""
+    task, pending, note = _proposal_only("scale e2e-plain to 31 replicas", "e2e-plain")
     tier = (pending or {}).get("risk_tier")
     return tier == "critical" and not note, f"risk_tier={tier} action_name={(pending or {}).get('action_name')}{note}"
 

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from common.capabilities_base import StepContext
 
 from ..stepkit import finish, options, resolved_target, untrusted_block
-from ..tools import health_rules
+from ..tools import governance, health_rules
 
 _FINDINGS_LIMIT = {"deployment": 40, "namespace": 40, "cluster": 30}
 _EVENTS_LIMIT = 15
@@ -64,13 +64,7 @@ def _belongs_to(name: str | None, deployment: str, own_pods: set[str] | frozense
     return re.fullmatch(pattern, name) is not None
 
 
-def _deployment_of(pod: dict) -> str | None:
-    """The Deployment that owns `pod`, read from its ReplicaSet owner and pod-template-hash label."""
-    owner = pod.get("owner_name")
-    template_hash = (pod.get("labels") or {}).get("pod-template-hash")
-    if pod.get("owner_kind") == "ReplicaSet" and owner and template_hash and owner.endswith(f"-{template_hash}"):
-        return owner[: -len(template_hash) - 1]
-    return None
+_deployment_of = governance.deployment_of
 
 
 def _flagged_keys(findings: list[dict], pods: list[dict]) -> set[tuple[str, str]]:

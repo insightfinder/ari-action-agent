@@ -35,6 +35,22 @@ def _mentioned(prompt: str, deployments: list[dict]) -> list[dict]:
     return hits
 
 
+# Kubernetes' safe-encoding alphabet: a Deployment's pods are `<deployment>-<pod-template-hash>-<suffix>`.
+_GENERATED = "[bcdfghjklmnpqrstvwxz2456789]"
+
+
+def _pods_mentioned(prompt: str, deployments: list[dict]) -> list[dict]:
+    """Deployments one of whose pods the request names verbatim ("resize pod checkout-7d9f5c6b8-x2k4q")."""
+    text = prompt.lower()
+    hits = []
+    for d in deployments:
+        name = (d.get("name") or "").lower()
+        pattern = rf"(?<![\w-]){re.escape(name)}-{_GENERATED}{{6,10}}-{_GENERATED}{{5}}(?![\w-])"
+        if name and re.search(pattern, text):
+            hits.append(d)
+    return hits
+
+
 def _prefer_namespace(hits: list[dict], prompt: str, default_ns: str | None) -> list[dict]:
     if len(hits) <= 1:
         return hits
@@ -95,7 +111,7 @@ async def run(ctx: StepContext) -> dict:
     known = {(d["namespace"], d["name"]) for d in deployments}
     namespaces = {d["namespace"] for d in deployments}
 
-    hits = _prefer_namespace(_mentioned(ctx.prompt, deployments), ctx.prompt, default_ns)
+    hits = _prefer_namespace(_mentioned(ctx.prompt, deployments) or _pods_mentioned(ctx.prompt, deployments), ctx.prompt, default_ns)
     # One Deployment named verbatim settles it without the model, unless the prompt uses that name for a
     # namespace: "the pods in the cert-manager namespace" is not about the cert-manager Deployment alone.
     if len(hits) == 1 and not (hits[0]["name"] in namespaces and _names_namespace(ctx.prompt, hits[0]["name"])):
@@ -104,7 +120,7 @@ async def run(ctx: StepContext) -> dict:
             {
                 "resolution": {"scope": "deployment", "namespace": hit["namespace"], "name": hit["name"]},
                 "candidates": [],
-                "reasoning": "the Deployment name appears verbatim in the request",
+                "reasoning": "the Deployment name, or one of its pods' names, appears verbatim in the request",
             }
         )
 

@@ -364,8 +364,16 @@ async def test_scale_above_threshold_is_flagged_critical_but_single_approval(clu
     llm = ScriptedLLM(_change(action="scale_replicas", replicas=60, replicas_quote="to 60"))
     result = await propose_change.run(_ctx("propose_change", "scale checkout to 60", results=_resolved("checkout"), llm=llm))
     pa = result["pending_action"]
-    assert pa["risk_tier"] == "critical" and pa["action_name"].startswith("[HIGH REPLICA COUNT > 50]")
+    assert pa["risk_tier"] == "critical" and pa["action_name"].startswith("[HIGH REPLICA COUNT > 30]")
     assert result["requires_approval"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replicas, critical", [(30, False), (31, True)])
+async def test_the_default_high_replica_threshold_is_30(cluster, replicas, critical):
+    llm = ScriptedLLM(_change(action="scale_replicas", replicas=replicas, replicas_quote=f"to {replicas}"))
+    result = await propose_change.run(_ctx("propose_change", f"scale checkout to {replicas}", results=_resolved("checkout"), llm=llm))
+    assert (result["pending_action"]["risk_tier"] == "critical") is critical
 
 
 @pytest.mark.asyncio
@@ -406,8 +414,10 @@ async def test_a_value_its_quote_does_not_state_is_refused(cluster, change, prom
 @pytest.mark.asyncio
 async def test_scale_up_that_needs_new_nodes_reports_ca_backoff(cluster):
     cluster.objects["ConfigMap"][0]["data"]["status"] = fx.CA_STATUS_BACKOFF_YAML
-    llm = ScriptedLLM(_change(action="scale_replicas", replicas=40, replicas_quote="to 40"))
-    result = await propose_change.run(_ctx("propose_change", "scale checkout to 40", results=_resolved("checkout"), llm=llm))
+    # 30: still more than the two nodes hold, and not above the default high-replica threshold (which would
+    # make the tier critical and hide what this test checks).
+    llm = ScriptedLLM(_change(action="scale_replicas", replicas=30, replicas_quote="to 30"))
+    result = await propose_change.run(_ctx("propose_change", "scale checkout to 30", results=_resolved("checkout"), llm=llm))
     pa = result["pending_action"]
     assert pa["capacity_outlook"]["unplaced"] > 0
     # Which node group would serve these pods is not known, so a group in backoff is a medium risk.
@@ -609,6 +619,26 @@ async def test_apply_scales_and_verifies(cluster):
     assert ar["persistence"]["ready_to_persist"] is True
     assert pa["persistence"]["ready_to_persist"] is False
     assert fx.CANARY not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_proposal_and_result_carry_the_target_and_the_change_marker(cluster):
+    pa = await _proposal(cluster, "scale checkout to 5", _change(action="scale_replicas", replicas=5, replicas_quote="to 5"), "checkout")
+    assert pa["target"] == {"kind": "Deployment", "namespace": "shop", "name": "checkout"}
+    assert pa["namespace"] == "shop" and pa["deployment"] == "checkout"  # the older fields stay
+    cluster.auto_rollout = True
+    ar = (await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True)))["action_result"]
+    assert ar["target"] == pa["target"] and ar["kubernetes_change"] is True and ar["deployment"] == "checkout"
+
+
+@pytest.mark.asyncio
+async def test_a_proposal_made_before_target_existed_still_applies(cluster):
+    """An approval can arrive hours after its proposal, across a deploy of this agent."""
+    pa = await _proposal(cluster, "scale checkout to 5", _change(action="scale_replicas", replicas=5, replicas_quote="to 5"), "checkout")
+    old = fx.a2a_round_trip({k: v for k, v in pa.items() if k != "target"})
+    cluster.auto_rollout = True
+    ar = (await apply_approved_change.run(_ctx("apply_approved_change", "", params=old, confirmed=True)))["action_result"]
+    assert ar["status"] == "succeeded" and ar["target"]["name"] == "checkout"
 
 
 def _writes(cluster):

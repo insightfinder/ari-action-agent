@@ -34,7 +34,9 @@ src/
 
   k8s_agent/           the Kubernetes agent kind — same shape, no opencode
     capabilities/      find_workload, check_health, propose_change, apply_approved_change
-    tools/             client.py (in-cluster ServiceAccount), read.py, write.py, rollout.py,
+    actions/           one spec per kind of change (operations, drift, verify, tier); registry in __init__.py
+    tools/             catalog.py (every kind: REST path, view, table row), client.py (in-cluster
+                        ServiceAccount, one generic request path), read.py, write.py, rollout.py,
                         views.py + redact.py (what may leave the cluster), pure rule modules
     schemas.py
     meta.py

@@ -151,6 +151,7 @@ def deployment_view(raw: dict) -> dict:
         "namespace": meta.get("namespace"),
         "generation": meta.get("generation"),
         "observed_generation": status.get("observedGeneration"),
+        "created_at": meta.get("creationTimestamp"),
         "replicas": spec.get("replicas", 1),
         "selector": dict((spec.get("selector") or {}).get("matchLabels") or {}),
         "label_selector": label_selector(spec.get("selector") or {}),
@@ -200,9 +201,13 @@ def pod_view(raw: dict) -> dict:
     status = raw.get("status") or {}
     owners = meta.get("ownerReferences") or []
     owner = owners[0] if owners else {}
+    statuses = status.get("containerStatuses") or []
     return {
         "name": meta.get("name"),
         "namespace": meta.get("namespace"),
+        # Identity across an in-place resize: the same pod keeps its uid; a replacement has a new one.
+        "uid": meta.get("uid"),
+        "qos_class": status.get("qosClass"),
         "labels": dict(meta.get("labels") or {}),
         "owner_kind": owner.get("kind"),
         "owner_name": owner.get("name"),
@@ -222,10 +227,23 @@ def pod_view(raw: dict) -> dict:
             }
             for cs in status.get("containerStatuses") or []
         ],
+        "images": {c.get("name"): c.get("image") for c in spec.get("containers") or []},
         "requests": [_resources(c)["requests"] for c in spec.get("containers") or []],
         "limits": {c.get("name"): _resources(c)["limits"] for c in spec.get("containers") or []},
         "resources": {c.get("name"): _resources(c) for c in spec.get("containers") or []},
+        # In-place resize (pods/resize): per container, what a cpu/memory resize does to it ("NotRequired" is
+        # Kubernetes' default when the field is unset), and the resources the kubelet actually applied.
+        "resize_policy": {c.get("name"): _resize_policy(c) for c in spec.get("containers") or []},
+        "status_resources": {cs.get("name"): _resources(cs) for cs in statuses if cs.get("resources") is not None},
     }
+
+
+def _resize_policy(container: dict) -> dict:
+    policy = {"cpu": "NotRequired", "memory": "NotRequired"}
+    for entry in container.get("resizePolicy") or []:
+        if entry.get("resourceName") in policy and entry.get("restartPolicy"):
+            policy[entry["resourceName"]] = entry["restartPolicy"]
+    return policy
 
 
 def node_view(raw: dict) -> dict:
@@ -246,6 +264,8 @@ def node_view(raw: dict) -> dict:
         ],
         "allocatable": {k: str(v) for k, v in (status.get("allocatable") or {}).items() if k in ("cpu", "memory")},
         "capacity": {k: str(v) for k, v in (status.get("capacity") or {}).items() if k in ("cpu", "memory")},
+        # The kubelet performs an in-place resize, so its version (not the control plane's) decides support.
+        "kubelet_version": (status.get("nodeInfo") or {}).get("kubeletVersion"),
     }
 
 
@@ -328,6 +348,7 @@ def pdb_view(raw: dict) -> dict:
     status = raw.get("status") or {}
     return {
         "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
         "selector": dict((spec.get("selector") or {}).get("matchLabels") or {}),
         "min_available": spec.get("minAvailable"),
         "max_unavailable": spec.get("maxUnavailable"),
@@ -338,3 +359,460 @@ def pdb_view(raw: dict) -> dict:
 def pvc_view(raw: dict) -> dict:
     meta = _meta(raw)
     return {"name": meta.get("name"), "access_modes": list((raw.get("spec") or {}).get("accessModes") or [])}
+
+
+# ---------------------------------------------------------------- more kinds (II-25740)
+#
+# Same rule as above: only the fields listed are copied. Nothing here copies env, args, command,
+# volume definitions, ConfigMap values or Secret anything.
+
+
+def _created(raw: dict) -> str | None:
+    return _meta(raw).get("creationTimestamp")
+
+
+def _owner(raw: dict) -> dict:
+    owners = _meta(raw).get("ownerReferences") or []
+    owner = owners[0] if owners else {}
+    return {"kind": owner.get("kind"), "name": owner.get("name")}
+
+
+def _workload_common(raw: dict, kind: str) -> dict:
+    meta = _meta(raw)
+    return {
+        "kind": kind,
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "generation": meta.get("generation"),
+        "created_at": _created(raw),
+        "labels": ownership_labels(raw),
+        "annotations": kept_annotations(raw),
+    }
+
+
+def statefulset_view(raw: dict) -> dict:
+    spec = raw.get("spec") or {}
+    status = raw.get("status") or {}
+    strategy = spec.get("updateStrategy") or {}
+    return {
+        **_workload_common(raw, "StatefulSet"),
+        "observed_generation": status.get("observedGeneration"),
+        "replicas": spec.get("replicas", 1),
+        "selector": dict((spec.get("selector") or {}).get("matchLabels") or {}),
+        "label_selector": label_selector(spec.get("selector") or {}),
+        "service_name": spec.get("serviceName"),
+        "pod_management_policy": spec.get("podManagementPolicy", "OrderedReady"),
+        "strategy": {"type": strategy.get("type", "RollingUpdate"), "partition": (strategy.get("rollingUpdate") or {}).get("partition", 0)},
+        "status": {
+            "replicas": status.get("replicas", 0),
+            "ready": status.get("readyReplicas", 0),
+            "available": status.get("availableReplicas", 0),
+            "updated": status.get("updatedReplicas", 0),
+            "current_revision": status.get("currentRevision"),
+            "update_revision": status.get("updateRevision"),
+        },
+        "volume_claim_templates": [
+            {
+                "name": (t.get("metadata") or {}).get("name"),
+                "storage": str((((t.get("spec") or {}).get("resources") or {}).get("requests") or {}).get("storage") or ""),
+                "storage_class": (t.get("spec") or {}).get("storageClassName"),
+            }
+            for t in spec.get("volumeClaimTemplates") or []
+        ],
+        "conditions": _conditions(status),
+        "template": pod_template_view(spec.get("template") or {}),
+    }
+
+
+def daemonset_view(raw: dict) -> dict:
+    spec = raw.get("spec") or {}
+    status = raw.get("status") or {}
+    strategy = spec.get("updateStrategy") or {}
+    return {
+        **_workload_common(raw, "DaemonSet"),
+        "observed_generation": status.get("observedGeneration"),
+        "selector": dict((spec.get("selector") or {}).get("matchLabels") or {}),
+        "label_selector": label_selector(spec.get("selector") or {}),
+        "strategy": {"type": strategy.get("type", "RollingUpdate"), "max_unavailable": (strategy.get("rollingUpdate") or {}).get("maxUnavailable", 1)},
+        "status": {
+            "desired": status.get("desiredNumberScheduled", 0),
+            "current": status.get("currentNumberScheduled", 0),
+            "ready": status.get("numberReady", 0),
+            "updated": status.get("updatedNumberScheduled", 0),
+            "available": status.get("numberAvailable", 0),
+            "unavailable": status.get("numberUnavailable", 0),
+            "misscheduled": status.get("numberMisscheduled", 0),
+        },
+        "conditions": _conditions(status),
+        "template": pod_template_view(spec.get("template") or {}),
+    }
+
+
+def replicaset_view(raw: dict) -> dict:
+    spec = raw.get("spec") or {}
+    status = raw.get("status") or {}
+    annotations = _meta(raw).get("annotations") or {}
+    return {
+        **_workload_common(raw, "ReplicaSet"),
+        "owner": _owner(raw),
+        "revision": annotations.get("deployment.kubernetes.io/revision"),
+        "replicas": spec.get("replicas", 0),
+        "status": {"replicas": status.get("replicas", 0), "ready": status.get("readyReplicas", 0), "available": status.get("availableReplicas", 0)},
+        "pod_template_hash": ((spec.get("template") or {}).get("metadata") or {}).get("labels", {}).get("pod-template-hash"),
+        "template": pod_template_view(spec.get("template") or {}),
+    }
+
+
+def controllerrevision_view(raw: dict) -> dict:
+    data = raw.get("data") or {}
+    template = ((data.get("spec") or {}).get("template")) or {}
+    return {
+        **_workload_common(raw, "ControllerRevision"),
+        "owner": _owner(raw),
+        "revision": raw.get("revision"),
+        "template": pod_template_view(template) if template else None,
+    }
+
+
+def job_view(raw: dict) -> dict:
+    spec = raw.get("spec") or {}
+    status = raw.get("status") or {}
+    return {
+        **_workload_common(raw, "Job"),
+        "owner": _owner(raw),
+        "completions": spec.get("completions"),
+        "parallelism": spec.get("parallelism"),
+        "backoff_limit": spec.get("backoffLimit", 6),
+        "suspend": bool(spec.get("suspend")),
+        "status": {
+            "active": status.get("active", 0),
+            "succeeded": status.get("succeeded", 0),
+            "failed": status.get("failed", 0),
+            "start_time": status.get("startTime"),
+            "completion_time": status.get("completionTime"),
+        },
+        "conditions": _conditions(status),
+        "template": pod_template_view(spec.get("template") or {}),
+    }
+
+
+def cronjob_view(raw: dict) -> dict:
+    spec = raw.get("spec") or {}
+    status = raw.get("status") or {}
+    job_spec = ((spec.get("jobTemplate") or {}).get("spec")) or {}
+    return {
+        **_workload_common(raw, "CronJob"),
+        "schedule": spec.get("schedule"),
+        "time_zone": spec.get("timeZone"),
+        "suspend": bool(spec.get("suspend")),
+        "concurrency_policy": spec.get("concurrencyPolicy", "Allow"),
+        "successful_jobs_history_limit": spec.get("successfulJobsHistoryLimit", 3),
+        "failed_jobs_history_limit": spec.get("failedJobsHistoryLimit", 1),
+        "status": {
+            "active": len(status.get("active") or []),
+            "active_jobs": [a.get("name") for a in status.get("active") or []],
+            "last_schedule_time": status.get("lastScheduleTime"),
+            "last_successful_time": status.get("lastSuccessfulTime"),
+        },
+        "template": pod_template_view(job_spec.get("template") or {}),
+    }
+
+
+def service_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    spec = raw.get("spec") or {}
+    lb = ((raw.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+    return {
+        "kind": "Service",
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "created_at": _created(raw),
+        "labels": ownership_labels(raw),
+        "type": spec.get("type", "ClusterIP"),
+        "cluster_ip": spec.get("clusterIP"),
+        "external": [i.get("hostname") or i.get("ip") for i in lb if i.get("hostname") or i.get("ip")],
+        "external_name": spec.get("externalName"),
+        "selector": dict(spec.get("selector") or {}),
+        "ports": [
+            {"name": p.get("name"), "port": p.get("port"), "target_port": p.get("targetPort"), "protocol": p.get("protocol", "TCP"), "node_port": p.get("nodePort")}
+            for p in spec.get("ports") or []
+        ],
+    }
+
+
+def endpointslice_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    endpoints = raw.get("endpoints") or []
+    ready = [e for e in endpoints if (e.get("conditions") or {}).get("ready") is not False]
+    return {
+        "kind": "EndpointSlice",
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "service": (meta.get("labels") or {}).get("kubernetes.io/service-name"),
+        "ready": len(ready),
+        "not_ready": len(endpoints) - len(ready),
+        "targets": [
+            {
+                "kind": (e.get("targetRef") or {}).get("kind"),
+                "name": (e.get("targetRef") or {}).get("name"),
+                "ready": (e.get("conditions") or {}).get("ready") is not False,
+                "node": e.get("nodeName"),
+            }
+            for e in endpoints
+        ],
+        "ports": [{"name": p.get("name"), "port": p.get("port"), "protocol": p.get("protocol", "TCP")} for p in raw.get("ports") or []],
+    }
+
+
+def ingress_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    spec = raw.get("spec") or {}
+
+    def backend(b: dict) -> dict:
+        svc = (b or {}).get("service") or {}
+        port = svc.get("port") or {}
+        return {"service": svc.get("name"), "port": port.get("number") or port.get("name")}
+
+    rules = []
+    for rule in spec.get("rules") or []:
+        for path in ((rule.get("http") or {}).get("paths")) or []:
+            rules.append({"host": rule.get("host"), "path": path.get("path", "/"), "path_type": path.get("pathType"), **backend(path.get("backend"))})
+    lb = ((raw.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+    return {
+        "kind": "Ingress",
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "created_at": _created(raw),
+        "labels": ownership_labels(raw),
+        "class": spec.get("ingressClassName") or (meta.get("annotations") or {}).get("kubernetes.io/ingress.class"),
+        "rules": rules,
+        "default_backend": backend(spec.get("defaultBackend")) if spec.get("defaultBackend") else None,
+        "tls_hosts": sorted({h for t in spec.get("tls") or [] for h in t.get("hosts") or []}),
+        "address": [i.get("hostname") or i.get("ip") for i in lb if i.get("hostname") or i.get("ip")],
+    }
+
+
+def _peer(p: dict) -> dict:
+    out = {}
+    if p.get("podSelector") is not None:
+        out["pods"] = label_selector(p["podSelector"]) or "all"
+    if p.get("namespaceSelector") is not None:
+        out["namespaces"] = label_selector(p["namespaceSelector"]) or "all"
+    if p.get("ipBlock"):
+        out["cidr"] = p["ipBlock"].get("cidr")
+        out["except"] = list(p["ipBlock"].get("except") or [])
+    return out
+
+
+def networkpolicy_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    spec = raw.get("spec") or {}
+
+    def rules(items, side):
+        return [
+            {"peers": [_peer(p) for p in r.get(side) or []] or ["any"], "ports": [{"port": p.get("port"), "protocol": p.get("protocol", "TCP")} for p in r.get("ports") or []]}
+            for r in items or []
+        ]
+
+    return {
+        "kind": "NetworkPolicy",
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "pod_selector": label_selector(spec.get("podSelector") or {}) or "all pods",
+        "policy_types": list(spec.get("policyTypes") or []),
+        "ingress": rules(spec.get("ingress"), "from"),
+        "egress": rules(spec.get("egress"), "to"),
+    }
+
+
+def configmap_view(raw: dict) -> dict:
+    """Keys only, never values: a ConfigMap is where people put credentials they should have put in a Secret
+    (test's Helm values ConfigMap holds plaintext passwords, docs/MEMORY.md 2026-10-13)."""
+    meta = _meta(raw)
+    return {
+        "kind": "ConfigMap",
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "created_at": _created(raw),
+        "labels": ownership_labels(raw),
+        "keys": sorted([*(raw.get("data") or {}).keys(), *(raw.get("binaryData") or {}).keys()]),
+        "immutable": bool(raw.get("immutable")),
+    }
+
+
+def pvc_full_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    spec = raw.get("spec") or {}
+    status = raw.get("status") or {}
+    return {
+        "kind": "PersistentVolumeClaim",
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "created_at": _created(raw),
+        "labels": ownership_labels(raw),
+        "phase": status.get("phase"),
+        "storage_class": spec.get("storageClassName"),
+        "requested": str(((spec.get("resources") or {}).get("requests") or {}).get("storage") or ""),
+        "capacity": str((status.get("capacity") or {}).get("storage") or ""),
+        "access_modes": list(spec.get("accessModes") or []),
+        "volume": spec.get("volumeName"),
+        "conditions": _conditions(status),
+    }
+
+
+def pv_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    spec = raw.get("spec") or {}
+    claim = spec.get("claimRef") or {}
+    return {
+        "kind": "PersistentVolume",
+        "name": meta.get("name"),
+        "created_at": _created(raw),
+        "capacity": str((spec.get("capacity") or {}).get("storage") or ""),
+        "access_modes": list(spec.get("accessModes") or []),
+        "reclaim_policy": spec.get("persistentVolumeReclaimPolicy"),
+        "storage_class": spec.get("storageClassName"),
+        "phase": (raw.get("status") or {}).get("phase"),
+        "claim": f"{claim.get('namespace')}/{claim.get('name')}" if claim.get("name") else None,
+    }
+
+
+def storageclass_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    annotations = meta.get("annotations") or {}
+    return {
+        "kind": "StorageClass",
+        "name": meta.get("name"),
+        "provisioner": raw.get("provisioner"),
+        "reclaim_policy": raw.get("reclaimPolicy", "Delete"),
+        "volume_binding_mode": raw.get("volumeBindingMode", "Immediate"),
+        "allow_volume_expansion": bool(raw.get("allowVolumeExpansion")),
+        "default": annotations.get("storageclass.kubernetes.io/is-default-class") == "true",
+    }
+
+
+def namespace_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    return {
+        "kind": "Namespace",
+        "name": meta.get("name"),
+        "created_at": _created(raw),
+        "phase": (raw.get("status") or {}).get("phase"),
+        "labels": dict(meta.get("labels") or {}),
+    }
+
+
+def resourcequota_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    status = raw.get("status") or {}
+    return {
+        "kind": "ResourceQuota",
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "hard": {k: str(v) for k, v in (status.get("hard") or (raw.get("spec") or {}).get("hard") or {}).items()},
+        "used": {k: str(v) for k, v in (status.get("used") or {}).items()},
+    }
+
+
+def limitrange_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    return {
+        "kind": "LimitRange",
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "limits": [
+            {
+                "type": item.get("type"),
+                **{
+                    field: {k: str(v) for k, v in (item.get(key) or {}).items()}
+                    for field, key in (("default_limit", "default"), ("default_request", "defaultRequest"), ("max", "max"), ("min", "min"))
+                    if item.get(key)
+                },
+            }
+            for item in (raw.get("spec") or {}).get("limits") or []
+        ],
+    }
+
+
+def node_full_view(raw: dict) -> dict:
+    """`node_view` plus the conditions and versions a "describe node" needs. No addresses."""
+    status = raw.get("status") or {}
+    info = status.get("nodeInfo") or {}
+    return {
+        **node_view(raw),
+        "kind": "Node",
+        "created_at": _created(raw),
+        "conditions": _conditions(status),
+        "kubelet_version": info.get("kubeletVersion"),
+        "os_image": info.get("osImage"),
+        "container_runtime": info.get("containerRuntimeVersion"),
+        "architecture": info.get("architecture"),
+        "zone": (_meta(raw).get("labels") or {}).get("topology.kubernetes.io/zone"),
+        "capacity_pods": str((status.get("capacity") or {}).get("pods") or ""),
+        "allocatable_pods": str((status.get("allocatable") or {}).get("pods") or ""),
+    }
+
+
+def crd_view(raw: dict) -> dict:
+    spec = raw.get("spec") or {}
+    names = spec.get("names") or {}
+    versions = spec.get("versions") or []
+    served = [v.get("name") for v in versions if v.get("served")]
+    storage = next((v.get("name") for v in versions if v.get("storage")), served[0] if served else None)
+    return {
+        "kind": "CustomResourceDefinition",
+        "name": _meta(raw).get("name"),
+        "group": spec.get("group"),
+        "resource_kind": names.get("kind"),
+        "plural": names.get("plural"),
+        "short_names": list(names.get("shortNames") or []),
+        "scope": spec.get("scope"),
+        "version": storage,
+        "served_versions": served,
+    }
+
+
+def _scalars(obj: dict, limit: int = 20) -> dict:
+    out = {}
+    for key, value in (obj or {}).items():
+        if isinstance(value, (str, int, float, bool)) and len(out) < limit:
+            out[key] = _message(value) if isinstance(value, str) else value
+    return out
+
+
+def custom_view(raw: dict) -> dict:
+    """Any other custom resource, read-only: identity, ownership, conditions and the top-level scalar fields
+    of spec and status (redacted, bounded). Nested spec content is never copied: a custom resource can embed
+    anything, including credentials (ExternalSecret, database operators)."""
+    meta = _meta(raw)
+    status = raw.get("status") or {}
+    return {
+        "kind": raw.get("kind"),
+        "api_version": raw.get("apiVersion"),
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "created_at": _created(raw),
+        "labels": ownership_labels(raw),
+        "spec": _scalars(raw.get("spec") or {}),
+        "status": _scalars(status),
+        "conditions": _conditions(status) if isinstance(status, dict) else [],
+    }
+
+
+def pod_metrics_view(raw: dict) -> dict:
+    meta = _meta(raw)
+    return {
+        "namespace": meta.get("namespace"),
+        "name": meta.get("name"),
+        "containers": {
+            c.get("name"): {k: str(v) for k, v in (c.get("usage") or {}).items() if k in ("cpu", "memory")}
+            for c in raw.get("containers") or []
+        },
+    }
+
+
+def node_metrics_view(raw: dict) -> dict:
+    return {
+        "name": _meta(raw).get("name"),
+        "usage": {k: str(v) for k, v in (raw.get("usage") or {}).items() if k in ("cpu", "memory")},
+    }

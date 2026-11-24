@@ -5634,6 +5634,7 @@ description ends with the footer, GitHub renders the link with its full
 query string (the test link carried parentheses on purpose), and the commit
 message on the branch has the title and summary only.
 
+<<<<<<< HEAD
 ## 2026-11-20 - A remote MCP gateway: the agents from Claude, Cursor and other AI apps (II-25648)
 
 The leader asked for the ARI agents inside Cursor and Claude Code, next to
@@ -5820,3 +5821,279 @@ to write `[ts:<ms>]` / `[dur:<ms>]` verbatim, and `humanize` turns those into
 bare 13-digit number in the 2001–2100 range also gets its date alongside.
 Probed with claude-haiku-4-5 on a getBuild payload: 3 of 3 answers used the
 markers.
+=======
+---
+
+## 2026-11-20 - k8s kind, phase 0 of full Kubernetes coverage: catalog, generic client, action registry (II-25740)
+
+Why: on stg (2026-11-19 screenshots) "list all pods with cpu and memory limit, usage for insightfinder" got
+only the unhealthy pods, and "in table format" got "the agents don't provide a table". The cause is the k8s
+kind, not MCP Service's model: `check_health` is an exception report (findings only, `container_resources`
+only for flagged workloads, usage read but used only for the >= 90% rule), and there is no listing
+capability at all. The user asked for the agent to cover Kubernetes work broadly rather than patch this one
+case, designed once so nothing is redone later.
+
+Decisions (with the user, 2026-11-20):
+- Feature branch from `origin/main`, merged into `test` and `staging` (repo convention; see why in
+  CLAUDE.local.md). Branch `II-25740-Expand-k8s-agent-capabilities`.
+- Only this repository changes. What charts / MCP Service / UIE must do is recorded in the new
+  `docs/K8S_AGENT_INTERFACE.md`, which also records every interface change from now on.
+- Boundaries kept from II-25173: no Secrets, no exec/attach/port-forward, no arbitrary apply/delete, no
+  RBAC edits, ConfigMaps keys only, any CRD read-only through a scalar-only view, every write proposed ->
+  approved -> applied once -> verified.
+- Write actions to add later: restart, rollback, set image, pause/resume rollout, delete a controller-owned
+  pod, suspend/resume/trigger CronJob, cordon/uncordon/drain node, StatefulSet scale, and `batch` (one
+  approval for one change on several targets; one approval per request is a MCP Service constraint, see
+  2026-10-13).
+- Phase 0 only for now; the user paused the rest (reads, writes, live run on test) until next week.
+
+What phase 0 changed (behaviour of the three existing actions unchanged):
+- `tools/catalog.py` (new): every kind the agent can address, with REST path, whitelisted view and table
+  row; `Container` pseudo-kind (one row per container, for usage-vs-limit tables). Secrets absent by design.
+  Path segments are validated (DNS-1123) and only declared subresources (`scale`, `eviction`, `log`) are
+  allowed, so a model-supplied name cannot steer a request path (raised by an automated security review).
+- `tools/views.py`: views for StatefulSet, DaemonSet, ReplicaSet, ControllerRevision, Job, CronJob,
+  Service, EndpointSlice (no IPs), Ingress, NetworkPolicy, ConfigMap (keys), PVC, PV, StorageClass,
+  Namespace, ResourceQuota, LimitRange, full Node (no addresses), CRD, generic custom resource, Pod/Node
+  metrics; `pod_view` gains `images`; `pdb_view` gains `namespace`. Not yet reachable from any capability.
+- `tools/client.py`: the per-kind typed-API dispatch table is gone; one request path
+  (`ApiClient.param_serialize` + `call_api`, kubernetes 37) serves get/list/patch and the new delete/create
+  (eviction) by catalog path. `pod_log` gains `since_seconds`. In kubernetes 37 a non-2xx answer is not
+  raised by `call_api`; the client raises `ApiException.from_response` itself so `.status` keeps working
+  for `api_status`, the read retries and the KEDA-404 path.
+- `k8s_agent/actions/` (new): the action registry. `scale_replicas`, `set_autoscaler_bounds`,
+  `set_resources` moved out of `propose_change` / `apply_approved_change` / `write.py` into one spec each
+  (plan, operations, drift, at_target, verify target, tier, snapshot); the planning code moved verbatim.
+  `write.py` runs a spec's `Operation`s; tool names `dry_run_patch` / `patch_workload` kept (the
+  capability registry and its tests pin which capability holds which).
+- Interface (docs/K8S_AGENT_INTERFACE.md): `pending_action.target`, `action_result.target` and
+  `action_result.kubernetes_change: true` added; nothing removed or renamed. A proposal without `target`
+  (made before this change) is still applied.
+- `tests/k8s_fixtures.FakeClient.patch` takes the `subresource` argument and records a scale patch as kind
+  `Scale` as before; `pod_log` takes `since_seconds`.
+
+**Verified:** full suite in a local Python 3.12 venv: 961 passed, 11 skipped, 3 failed. The 3 failures are the
+same as on untouched `origin/main` before any change (941 passed then): `test_a2a_agent_card` and
+`test_a2a_executor::test_publish_result_completed_with_pr_and_root_cause` pass when run alone (test-order
+pollution, pre-existing, not chased), and `test_skill_examples` trips on a local `skills/.DS_Store`. New:
+`tests/test_k8s_client.py` (18 cases) drives the real `Kube` over a stubbed HTTP transport (paths, query
+params, content types, 403/404/409/500 -> `ApiException.status`, path-injection refusals) — the first test
+of that layer, since every other test replaces `Kube` with `FakeClient`; two cases in
+`test_k8s_capabilities.py` for `target` / `kubernetes_change` and for a pre-`target` proposal.
+
+**Not verified:** nothing ran against a real API server. The generic request path in particular
+(`param_serialize` auth headers, merge/strategic patch bodies on a real apiserver, list paging) is checked
+only against the stub; the next live run on test must cover it before this ships. No image built, nothing
+deployed.
+
+## 2026-11-24 - In-place pod resize works on test; JVM workloads need `memory: RestartContainer` (II-25740 input)
+
+**Why.** Groundwork for a possible k8s-agent `resize_pod` action: change a running pod's CPU/memory without
+the rollout that `set_resources` (Deployment template patch) causes. No agent code changed.
+
+**Found (test, read-only or server dry-run).** EKS 1.36.5, every node kubelet 1.36.3 / containerd 2.2.7,
+`pods/resize` in `/api/v1`: nothing to enable. A resize goes only through the `resize` subresource; a plain
+pod patch of `resources` is Forbidden. `resizePolicy` cannot be added to a running pod (via `resize`: "only
+cpu and memory resources are mutable"), so it has to come from the pod template. The agent's ServiceAccount
+`ari-k8s` cannot `patch pods/resize`. The `insightfinder` chart sets `-XX:MaxRAMPercentage=80` and no
+`resizePolicy`, so with the default `NotRequired` a memory resize would leave the JVM's heap ceiling at 80%
+of the old limit (inferred; the `NotRequired` + JVM case was not run).
+
+**Live run (test, 2026-11-24).** test-fluxcd `6db07ad8` adds `spec.postRenderers` to the `insightfinder`
+HelmRelease (chart untouched) that sets `resizePolicy` (cpu `NotRequired`, memory `RestartContainer`) on
+`insightfinder-dailyreportworker` only; adding it rolled that Deployment once (`Recreate`, 1 replica). Then
+`kubectl patch pod ... --subresource resize` set its memory limit 3500Mi -> 4Gi. Result: same pod name, UID,
+IP and node; `restartCount` 0 -> 1; events `ResizeStarted` -> `Killing` ("resize requires restart") ->
+`Started` -> `ResizeCompleted`, about 37 s; `status.containerStatuses[0].resources` and cgroup `memory.max`
+show 4Gi; the JVM restarted (process start 06:25:44 -> 06:28:28 UTC). The image is a JRE without `jcmd`, so
+the running JVM's heap was not read; a fresh JVM in the same cgroup computes `MaxHeapSize` 2800Mi before and
+3278Mi after (80% of each limit), which is what the restarted JVM gets.
+
+**Left as is.** The Deployment template (Git) still says 3500Mi; the pod keeps 4Gi until its next
+recreation. The agent's `persistence` hint is the way to make such a change last.
+
+**Reverted the same day:** a second resize, 4Gi -> 3500Mi, also in place (same pod/UID/IP/node,
+`restartCount` 1 -> 2, JVM restarted 06:42:34 UTC, cgroup `memory.max` and fresh-JVM `MaxHeapSize` back to
+3500Mi / 2800Mi); pod and Deployment template agree again. A memory decrease with `RestartContainer` worked
+the same way as the increase. The test-fluxcd `postRenderers` patch stays (its fate is the user's call).
+
+**Rule from the user (2026-11-24):** a change to an agent in this repo also updates that agent's chart (charts
+repo, `charts/oncallari`) in the same piece of work: RBAC (mirroring `docs/examples/k8s-rbac.yaml`), env vars,
+values, `Chart.yaml` version. `docs/K8S_AGENT_INTERFACE.md` no longer lists the chart under "Needed from other
+repositories"; the RBAC section says so instead. II-25740 phase 0 needs no chart change (same reads/writes).
+
+## 2026-11-24 - `resize_pod`: in-place pod resize as a k8s action (II-25740)
+
+**What.** New action `resize_pod` (`src/k8s_agent/actions/resize_pod.py`): CPU/memory requests/limits of one
+container of ONE running pod, patched through `pods/resize` (strategic merge by container name). Same pod
+afterwards (uid checked); the Deployment template is not touched, so the persistence hint renders the
+template fields to change in Git and the lifetime notice says the resize lasts until the pod is replaced.
+`set_resources` is unchanged and still the default for "change the Deployment's CPU/memory".
+
+**Rules, all in code:** chosen only when the request itself asks for an in-place change
+(`policy.asks_in_place`: "in place", "resize ... pod", "without a restart/rollout", 原地/不重建/不重启); a
+request that merely names a pod (on-call prompts quote them from findings) is planned as `set_resources`
+even if the model picked `resize_pod`. One pod per proposal (named verbatim in the request, or the
+Deployment's only active pod; else a refusal listing the pods). Supported only if live discovery serves
+`pods/resize` AND the API server and the pod's kubelet are >= 1.35 (the user's floor; GA). prod (1.34) and
+eu (1.33) serve `pods/resize` as beta (checked read-only 2026-11-24) but are refused until the beta
+differences are checked; all re-checked at apply; memory only when the container's memory
+`resizePolicy` is `RestartContainer` (no runtime guessing; JVM heap reason in the 2026-11-24 live entry above);
+no clamp — a request increase must fit the free capacity of the pod's own node; no QoS class change; a 403 on
+the dry run becomes a refusal naming the `pods/resize` rule. Tier `low` without a restart, `medium` with one.
+Verification `rollout.wait_resize`: status resources equal the approved values, no PodResizePending/
+InProgress, same uid, container ready and not restarting again for STABILITY_SECONDS; under
+`RestartContainer` it first waits for the one expected restart, counted from the state read just before the
+write (`ActionSpec.verify` now gets that state; None on a retried attempt); new statuses
+`resize_infeasible`, `resize_deferred`, `pod_replaced`, `container_failing` (docs/K8S_AGENT_INTERFACE.md).
+
+**Generic changes this needed:** `ActionSpec` gained `resolve_target`, `target`, `verify`, `lifetime_notice`,
+`rbac_rule`; `propose_change` / `apply_approved_change` call them instead of assuming a Deployment target
+(existing actions behave as before). The extraction prompt's action enum now comes from the registry and has
+a `pod` field. `find_workload` resolves a verbatim pod name (`<deployment>-<hash>-<suffix>`) to its
+Deployment without the model. New reads `get_pod`, `get_resize_support` (client: fixed-path `/version` and
+`/api/v1`); `pod_view` gains `uid`, `qos_class`, `resize_policy`, `status_resources`; `node_view` gains
+`kubelet_version`. `governance.deployment_of` moved out of `check_health`. RBAC: `patch` on `pods/resize`
+in `docs/examples/k8s-rbac.yaml` and the oncallari chart (charts branch `II-25740-Expand-k8s-agent-capabilities`,
+0.3.14, uncommitted; `helm template` ClusterRole rules identical to the example, 13 rules).
+
+**Verified:** full suite 998 passed, 11 skipped, 1 failed (the pre-existing `skills/.DS_Store` check; 963
+passed before this change). New `tests/test_k8s_resize_pod.py` (33, incl. the routing rule, the 1.35 floor and the restart wait) and two
+client tests. Against the test
+cluster with my kubeconfig (reads and server dry-run only, the pod unchanged afterwards): the real `Kube`
+client read discovery/`/version`, a pod (404 -> None) and node kubelet versions, and dry-ran the resize
+patch; `find_workload` + `propose_change` (LLM answer scripted) on `insightfinder-dailyreportworker` proposed
+cpu 2 -> 3 as `low` (no restart) and memory 3500Mi -> 4Gi as `medium` (RestartContainer), persistence hint
+to `insightfinder/test-fluxcd`. This is also the first real-API run of the phase 0 generic request path
+(auth header, strategic patch content type, list).
+
+**Live apply on test (2026-11-24, with the user's OK):** propose -> A2A round trip -> `apply_approved_change`
+(confirmed) run locally with my kubeconfig (context `test`, LLM answer scripted) on
+`insightfinder-dailyreportworker` (memory `RestartContainer` from the test-fluxcd postRenderer): cpu limit
+2 -> 3 `succeeded` in 64 s, no restart (restartCount 2 -> 2), same uid/node; memory limit 3500Mi -> 4Gi
+`succeeded` in 169 s, one restart (2 -> 3), same uid/node, `wait_resize` waited past the restart and the JVM's
+readiness (ResizeCompleted ~36 s after the kill, then startup probes, then 52 s stable); both reverted the
+same way (memory 4Gi -> 3500Mi in 162 s, restart 3 -> 4; cpu 3 -> 2 in 63 s). Right after the cpu revert,
+image automation (test-fluxcd `2febdfb8`, insightfinder-app 5.3.1.2611240733-test) rolled the Deployment and
+replaced the pod — the lifetime notice's case; the new pod has the template's values (2 / 3500Mi) and the
+resizePolicy. Its startup probe was failing at first (restart 1), as was anomalyinsightsworker's from the same
+image rollout: not ours, not chased.
+
+**Not verified:** the in-cluster ServiceAccount: the deployed `ari-k8s` lacks `pods/resize` until chart 0.3.14 is
+published and test-fluxcd bumps it. The real model's choice between `set_resources` and `resize_pod` was not
+run (extraction scripted). `scripts/k8s_agent_live_test.py` has no resize scenario yet.
+
+**Decision (user, 2026-11-24):** no automatic switch from `set_resources` to `resize_pod`. A CPU/memory request
+for a Deployment keeps rolling its pods through the template; `resize_pod` is used only when the request
+asks for an in-place change, one pod at a time. Rejected for now: in-place by default on >= 1.35, which
+would need several pods per approval (sequential, with a half-done state to handle) and leaves the template
+stale for pods created later.
+
+## 2026-11-24 - Default high-replica threshold 50 -> 30 (II-25740)
+
+The user lowered it: a replica target above 30 is now proposed as `critical` with the "[HIGH REPLICA COUNT >
+30]" prefix (`policy.DEFAULT_HIGH_REPLICA_THRESHOLD`, `K8sOptions`, DEVELOPER_GUIDE, the live script's
+scenario now asks for 31). Callers can still pass `options.high_replica_threshold`; mcp-service does not pass
+it (checked), so 30 applies there. `test_scale_up_that_needs_new_nodes_reports_ca_backoff` asked for 40
+replicas, which now crosses the threshold and masks the CA-backoff tier it checks; it asks for 30 instead
+(still more than the fixture's two nodes hold). New boundary test: 30 not critical, 31 critical. Suite: 1000
+passed, 1 failed (pre-existing `.DS_Store`). Not run live.
+
+## 2026-11-24 - II-25740 scope: what to add next, what later, what never (user decision)
+
+Discussed with the user after `resize_pod`; written into docs/K8S_AGENT_INTERFACE.md ("Action names" and the
+new "Never (permanent boundaries)" section), which is the list to check before adding any capability.
+- Add after the phase 1 reads, in order: `flux_reconcile` (requestedAt annotation, tier low; a merged fix
+  applies without waiting for the interval, 1h on `ari-k8s`), `resize_pod` for StatefulSet pods (in-place is
+  worth most where restarts are costly), `expand_pvc` (grow only, StorageClass must allow it, growth cap, tier
+  high, irreversible).
+- Later, needs design: suspend/resume Flux (expiry/reminder; parent Kustomization re-applies a suspended
+  HelmRelease on test), KEDA pause, StatefulSet/DaemonSet template CPU/memory.
+- Never: Secrets, ConfigMap values, nested CR content, exec/attach/port-forward, create/delete of workloads,
+  Services, Ingresses, Namespaces, PVCs (only controller-owned pod delete), editing Service/Ingress/
+  NetworkPolicy/ConfigMap content, node delete/labels/taints, HelmRelease rollback, writing CRs other than
+  KEDA min/max (+ Flux reconcile annotation), RBAC, Git writes, unapproved writes, scaling to 0.
+Documentation only; no code changed for this entry.
+
+## 2026-11-24 - Phase 1: `query_resources`, tables over any readable kind (II-25740)
+
+**Why.** The stg question of 2026-11-19 ("list all pods with cpu and memory limit, usage for insightfinder")
+got only unhealthy pods, from `check_health`. This answers it completely.
+
+**What.**
+- `tools/table.py` (new): rows from each kind's view/row (`catalog.py`), plus kind `Container` (one row per
+  container of every pod not Succeeded/Failed, joined with metrics.k8s.io: request, limit, usage in Mi / m,
+  usage as % of request and limit; null when unknown, never NaN). Filter (`= != > >= < <= contains
+  not_contains`; quantities compared by value; a missing value never matches an ordering filter), stable
+  multi-key sort with missing values last, column projection that keeps identity columns, cap 200 with
+  `matched` / `returned` / `truncated`.
+- `capabilities/query_resources.py` (new): the model proposes the query; code drops (and lists under
+  `ignored`) any namespace, label selector, filter value or limit the request does not itself state; the
+  namespace is checked against a live list (refusal with close matches if it does not exist; a note if
+  namespaces may not be listed); Secrets and unknown kinds are refusals; a 403 or a kind the cluster does
+  not serve is a gap, never an empty table. Tools `list_views`, `namespace_names` (read.py, typed
+  `ReadForbidden` / `KindNotServed`).
+- Planner: `query_resources` is plannable alone (no `find_workload`); guidance, agent description, skill and
+  examples mention listings. Artifact `query_result` appended (order of the others unchanged).
+- No formatting on our side (user decision, see the follow-up below): the respond note tells the model not
+  to reproduce rows; the rows reach the caller only in the `query_result` artifact.
+- `catalog.py` docstring no longer claims a `read.custom_kind` that does not exist.
+
+**RBAC: nothing added yet.** The stg question needs only `pods` list and `metrics.k8s.io` pods, both already
+granted, so it works with the deployed RBAC. Listing the other queryable kinds needs new get/list grants
+(statefulsets, daemonsets, replicasets, controllerrevisions, jobs, cronjobs, services, endpointslices,
+ingresses, networkpolicies, persistentvolumes, namespaces, resourcequotas, limitranges, storageclasses,
+customresourcedefinitions, Flux kinds list, configmaps); until granted they come back as gaps. ConfigMaps and
+Flux kinds are sensitive (a list returns ConfigMap values; HelmRelease inline values and source URLs can hold
+credentials) and wait for the user's decision.
+
+**Verified:** suite 1053 passed, 1 failed (pre-existing `.DS_Store`); new `tests/test_k8s_query_resources.py`
+(51, incl. every queryable kind against the canary fixtures, the A2A round trip, the plan policy) and two
+`test_respond.py` cases for the appendix. Against test with my kubeconfig (read-only, model answer
+scripted): the stg sentence on `insightfinder` returned 127 container rows = kubectl's 127 containers of
+non-terminal pods; the top row's memory usage (2488Mi) matched `kubectl top pod --containers`; Deployment,
+Node, StatefulSet, Service, ConfigMap and HelmRelease listings returned rows (my kubeconfig is admin, so
+RBAC gaps did not show).
+
+**Not verified:** the real planner choosing `query_resources` and the real model's query extraction
+(scripted here); the in-cluster ServiceAccount (gaps for ungranted kinds); how mcp-service shows the
+artifact/table.
+
+**Same day, follow-up (user approved the recommendations):**
+- RBAC: get/list added for services, persistentvolumes, namespaces, resourcequotas, limitranges,
+  statefulsets, daemonsets, replicasets, controllerrevisions, jobs, cronjobs, endpointslices, ingresses,
+  networkpolicies, storageclasses, customresourcedefinitions, in `docs/examples/k8s-rbac.yaml` and the
+  oncallari chart (charts branch, still 0.3.14, uncommitted); `helm template` ClusterRole = example (20
+  rules). ConfigMaps and listing Flux kinds stay ungranted on purpose (they come back as gaps).
+- Real model run (provider/model/key from the git-ignored `scripts/.env`, never printed; planner, step
+  policy, `query_resources` and `respond`, against test with my kubeconfig): the stg sentence planned
+  `query_resources` alone with namespace insightfinder and listed every container (112 at that moment; pods
+  were rolling); "more than 80% of their memory limit" became filter `memory_usage_pct_of_limit > 80` (0 rows,
+  top was ~71%); "top 5 ... by memory usage" became sort desc + limit 5 (5 of 116, truncated); "list the
+  statefulsets" -> StatefulSet (3); "check the health of the pods" still planned find_workload +
+  check_health. The respond model summarised the query, counts and notable rows without re-typing rows,
+  and the reply ended with the code-built table (112 rows). Nothing ignored in any run.
+
+**Same day: data only, no formatting (user decision).** The user asked whether we should format at all; we
+should not. Removed before it shipped: `table.markdown()`, the derived `age` column, and the
+`common/` `AgentMeta.respond_appendix` hook that appended a Markdown table to the reply (`common/` is back to
+origin/main). What stays is data: which rows and columns, filter/sort/cap, the usage join, unit
+normalisation of usage (m / Mi). The artifact now declares itself: `schema: "k8s.query_result/v1"` and
+`column_types` (string, integer, number, boolean, timestamp, cpu, memory, storage, percent,
+integer_or_string; `table.TYPES`, `table.column_type`). Found while typing it: `deployment_view` had no
+`created_at`, so Deployment rows always had it null (phase 0 bug, ours) — added. Verified: a test holds
+every value of every queryable kind to its declared type on the fixtures (Job/CronJob added there), and
+on test with my kubeconfig all 35,537 values across all 32 kinds conformed (0 mismatches). mcp-service is
+asked (interface doc) to render the artifact rather than have a model re-type rows.
+
+**Deployed to test (2026-11-24): oncallari 0.3.14 for `ari-k8s`.** Charts PR merged and published (release
+tgz checked: `pods/resize` and the listing reads present); test-fluxcd `b0edf6f6` bumped `ari-k8s` only
+(ari-oncall/jenkins/coordinator stay on 0.3.13). The HelmRelease first failed with "no 'oncallari' chart with
+version matching '0.3.14'": its HelmRepository caches the index for 1h, so a pinned-version bump needs
+`flux reconcile source helm ari-k8s -n insightfinder` (or `reconcile helmrelease --with-source`); after that
+`ari-k8s.v26` upgraded. Rendered diff 0.3.13 -> 0.3.14 with the release's values: ClusterRole rules and the
+chart label only; pod templates unchanged, and the api/worker pods were not restarted. `kubectl auth can-i`
+as `ari-k8s`: patch pods/resize yes; list statefulsets, customresourcedefinitions, namespaces, ingresses,
+jobs yes; list configmaps, helmreleases, secrets no; plain patch pods no. The agent image is still the old
+code until this branch reaches `test`.
+>>>>>>> II-25740-Expand-k8s-agent-capabilities

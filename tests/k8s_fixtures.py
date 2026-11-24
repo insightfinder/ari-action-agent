@@ -99,36 +99,41 @@ def pod(
     limits=None,
     conditions=None,
     created=None,
+    resize_policy=None,
+    qos_class="Burstable",
 ):
     requests = requests if requests is not None else {"cpu": "500m", "memory": "1Gi"}
+    container = {
+        "name": "app",
+        "env": [{"name": "API_KEY", "value": CANARY}],
+        "resources": {"requests": requests, "limits": limits or {}},
+    }
+    if resize_policy:
+        container["resizePolicy"] = [{"resourceName": k, "restartPolicy": v} for k, v in resize_policy.items()]
+    statuses = containers or [{"name": "app", "ready": True, "restartCount": 0, "state": {"running": {"startedAt": iso(30)}}}]
+    for st in statuses:
+        if st.get("name") == "app" and "resources" not in st:
+            st["resources"] = copy.deepcopy(container["resources"])
     return {
         "metadata": {
             "name": name,
+            "uid": f"uid-{name}",
             "namespace": namespace,
             "labels": {"app": app, "pod-template-hash": TEMPLATE_HASH},
             "ownerReferences": [{"kind": owner_kind, "name": f"{app}-{TEMPLATE_HASH}"}],
             "creationTimestamp": created or iso(30),
         },
-        "spec": {
-            "nodeName": node,
-            "containers": [
-                {
-                    "name": "app",
-                    "env": [{"name": "API_KEY", "value": CANARY}],
-                    "resources": {"requests": requests, "limits": limits or {}},
-                }
-            ],
-        },
+        "spec": {"nodeName": node, "containers": [container]},
         "status": {
             "phase": phase,
+            "qosClass": qos_class,
             "conditions": conditions or [],
-            "containerStatuses": containers
-            or [{"name": "app", "ready": True, "restartCount": 0, "state": {"running": {"startedAt": iso(30)}}}],
+            "containerStatuses": statuses,
         },
     }
 
 
-def node(name, cpu="8", memory="32Gi", labels=None, taints=None, ready=True, instance_type="m5.2xlarge"):
+def node(name, cpu="8", memory="32Gi", labels=None, taints=None, ready=True, instance_type="m5.2xlarge", kubelet="v1.36.3-eks-cb19647"):
     return {
         "metadata": {
             "name": name,
@@ -139,6 +144,7 @@ def node(name, cpu="8", memory="32Gi", labels=None, taints=None, ready=True, ins
             "allocatable": {"cpu": cpu, "memory": memory},
             "capacity": {"cpu": cpu, "memory": memory},
             "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+            "nodeInfo": {"kubeletVersion": kubelet},
         },
     }
 
@@ -319,6 +325,16 @@ class FakeClient:
         # status catches up with spec and the Deployment's pods take on the
         # new container resources.
         self.auto_rollout = False
+        # When set, a real (non-dry-run) pod resize is applied at once by the "kubelet": the container status
+        # takes on the new resources, and the container restarts once under RestartContainer.
+        self.auto_resize = False
+        # What discovery and /version answer.
+        self.resize_supported = True
+        self.server_git_version = "v1.36.5-eks-91f89a9"
+        self.discovery_error: Exception | None = None
+        # Kinds whose list answers 403 (not granted) or 404 (not served by this cluster).
+        self.forbidden: set[str] = set()
+        self.not_served: set[str] = set()
 
     def _roll_out(self, dep: dict) -> None:
         spec = dep["spec"]
@@ -357,6 +373,10 @@ class FakeClient:
         return copy.deepcopy(obj)
 
     async def list(self, kind, namespace=None, label_selector=None, field_selector=None, max_items=5000):
+        if kind in self.forbidden:
+            raise api_error(403, f"{kind} is forbidden", "Forbidden")
+        if kind in self.not_served:
+            raise _not_found(kind, "")
         out = []
         for obj in self.objects.get(kind, []):
             meta = obj.get("metadata") or {}
@@ -369,8 +389,10 @@ class FakeClient:
             out.append(copy.deepcopy(obj))
         return out[:max_items]
 
-    async def patch(self, kind, name, namespace, body, content_type, dry_run):
-        target_kind = "Deployment" if kind == "Scale" else kind
+    async def patch(self, kind, name, namespace, body, content_type, dry_run, subresource=None):
+        target_kind = kind
+        # Recorded as before the generic client: a scale-subresource patch is kind "Scale".
+        kind = "Scale" if subresource == "scale" else kind
         obj = self._find(target_kind, name, namespace)
         if obj is None:
             raise _not_found(kind, name)
@@ -382,11 +404,35 @@ class FakeClient:
             obj.update(merged)
             if self.auto_rollout and target_kind == "Deployment":
                 self._roll_out(obj)
+            if self.auto_resize and target_kind == "Pod" and subresource == "resize":
+                self._resize(obj, body)
         if kind == "Scale":
             return {"metadata": {"name": name}, "spec": {"replicas": merged["spec"]["replicas"]}}
         return copy.deepcopy(merged)
 
-    async def pod_log(self, namespace, pod, container=None, previous=True, tail_lines=40, limit_bytes=8000):
+    def _resize(self, pod: dict, body: dict) -> None:
+        for change in (body.get("spec") or {}).get("containers") or []:
+            spec_c = next(c for c in pod["spec"]["containers"] if c["name"] == change["name"])
+            policy = {p["resourceName"]: p["restartPolicy"] for p in spec_c.get("resizePolicy") or []}
+            changed = {r for side in (change.get("resources") or {}).values() for r in side}
+            for st in pod["status"].get("containerStatuses") or []:
+                if st["name"] != change["name"]:
+                    continue
+                st["resources"] = copy.deepcopy(spec_c["resources"])
+                if any(policy.get(r) == "RestartContainer" for r in changed):
+                    st["restartCount"] = (st.get("restartCount") or 0) + 1
+                st["ready"] = True
+                st["state"] = {"running": {}}
+
+    async def server_version(self):
+        return {"major": "1", "minor": "36", "gitVersion": self.server_git_version}
+
+    async def core_resources(self):
+        if self.discovery_error:
+            raise self.discovery_error
+        return ["pods", "pods/log", "pods/eviction", "nodes"] + (["pods/resize"] if self.resize_supported else [])
+
+    async def pod_log(self, namespace, pod, container=None, previous=True, tail_lines=40, limit_bytes=8000, since_seconds=None):
         self.log_calls.append({"pod": pod, "container": container, "previous": previous})
         entry = self.logs.get(pod, "")
         if isinstance(entry, dict):  # {"previous": ..., "current": ...}
