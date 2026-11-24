@@ -120,6 +120,11 @@ The server address is `https://<host>/mcp`.
 - **Cursor:** Settings → MCP → Add a server, or in `~/.cursor/mcp.json`:
   `{"mcpServers": {"ari": {"url": "https://<host>/mcp"}}}`. Cursor opens the sign-in when needed.
 - **Claude Code:** `claude mcp add --transport http ari https://<host>/mcp`, then `/mcp` to sign in.
+- **Claude Code plugin:** this repository is also a plugin marketplace. Run
+  `claude plugin marketplace add insightfinder/ari-action-agent`, then
+  `claude plugin install ari@ari-agent`, and enter the gateway address when asked for `server_url`.
+  The plugin lives in [`plugins/ari`](../plugins/ari/README.md); check it with
+  `claude plugin validate --strict --profile directory plugins/ari`.
 
 ## Setting it up
 
