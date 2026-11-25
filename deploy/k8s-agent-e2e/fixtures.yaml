@@ -320,3 +320,63 @@ spec:
           resources:
             requests: {cpu: 10m, memory: 2000Gi}
             limits: {cpu: 50m, memory: 2000Gi}
+---
+# Write batch 1 (restart, rollback, pod delete). A rolling restart and a pod delete of
+# e2e-plain run against its PDB above (reported, not waited for by a delete).
+#
+# Rollback: after applying, give it a second revision with an older image, so revision 1
+# (pause:3.10) is "the previous one":
+#   kubectl -n ari-k8s-e2e set image deploy/e2e-rollback app=registry.k8s.io/pause:3.9
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: e2e-rollback, namespace: ari-k8s-e2e}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: e2e-rollback}}
+  template:
+    metadata: {labels: {app: e2e-rollback}}
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+---
+# A StatefulSet restarts its pods one at a time, highest ordinal first; a deleted pod
+# comes back under the same name with a new uid.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: e2e-sts, namespace: ari-k8s-e2e}
+spec:
+  replicas: 2
+  serviceName: e2e-sts
+  selector: {matchLabels: {app: e2e-sts}}
+  template:
+    metadata: {labels: {app: e2e-sts}}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+---
+# One tiny pod per schedulable node; a restart replaces them node by node.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: e2e-ds, namespace: ari-k8s-e2e}
+spec:
+  selector: {matchLabels: {app: e2e-ds}}
+  updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 2}}
+  template:
+    metadata: {labels: {app: e2e-ds}}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {cpu: 20m, memory: 16Mi}

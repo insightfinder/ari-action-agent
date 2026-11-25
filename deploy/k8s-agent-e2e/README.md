@@ -27,8 +27,10 @@ kubectl --context $CTX -n ari-k8s-agent create secret generic ari-k8s-agent-env 
   --from-literal=TEMPORAL_PAYLOAD_ENCRYPTION_KEY="$(openssl rand -base64 32)"
 kubectl --context $CTX apply -f <(sed "s|__IMAGE_TAG__|$TAG|g; s|__TEMPORAL_HOST__|$TEMPORAL_HOST|g" deploy/k8s-agent-e2e/agent.yaml)
 
-# 3. Fixtures
+# 3. Fixtures (e2e-rollback then gets a second revision, so its first one is "the previous")
 kubectl --context $CTX apply -f deploy/k8s-agent-e2e/fixtures.yaml
+kubectl --context $CTX -n ari-k8s-e2e rollout status deploy/e2e-rollback
+kubectl --context $CTX -n ari-k8s-e2e set image deploy/e2e-rollback app=registry.k8s.io/pause:3.9
 
 # 4. Run the scenarios (read-only + cancelled proposals; add --allow-writes to approve changes)
 kubectl --context $CTX -n ari-k8s-agent port-forward svc/ari-k8s-api 18002:80 &
@@ -67,7 +69,30 @@ read-only root filesystem, no token in the API pod). Every write scenario
 puts the fixture fields it changed back with kubectl afterwards, so the run
 can be repeated; after an interrupted run, re-apply `fixtures.yaml`.
 
-Cleanup:
+Restart, rollback and pod delete (`restart_deployment`, `restart_statefulset`,
+`restart_daemonset`, `delete_pod`, `delete_sts_pod`, `rollback`,
+`rollback_revision`) work on `e2e-plain`, `e2e-sts`, `e2e-ds` and
+`e2e-rollback`. Without `--allow-writes` they still check that the
+proposal's dry run changed nothing (the pod a delete names is still there
+with the same uid). On the test cluster the agent runs in namespace
+`insightfinder` (`ari-k8s-api` / `ari-k8s-worker`, secret `ari-k8s-secret`)
+rather than `ari-k8s-agent`; only `ari-k8s-e2e` is ever changed. Write
+scenarios belong here, not on real services: on test, image automation
+redeploys the `insightfinder` namespace many times an hour.
+
+`tests/test_k8s_live_script.py` keeps the script honest without a cluster:
+the RBAC the `rbac` scenario expects must match `docs/examples/k8s-rbac.yaml`,
+and the fixtures the scenarios name must exist here.
+
+Cleanup: the fixtures stay while a piece of work still needs live runs (they
+are reused from run to run) and are deleted once it is finished. On the test
+cluster, where the agent itself stays installed, that is only:
+
+```bash
+kubectl --context test delete namespace ari-k8s-e2e
+```
+
+Removing an agent installed from these instructions as well:
 
 ```bash
 # Chart install: helm removes its ClusterRole/Binding and kube-system Role/Binding (ari-k8s, ari-k8s-ca-status)
