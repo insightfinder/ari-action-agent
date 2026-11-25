@@ -34,7 +34,8 @@ label and email). Other fields are informational for the approver.
   pod's owning Deployment (and adds `pod` and `container`). Actions on other kinds set it and may leave
   `deployment` empty (null): `restart_rollout` of a StatefulSet or DaemonSet (`kind` is that kind), and
   `delete_pod` (`kind: "Pod"`; `deployment` is filled only for a Deployment's pod), `set_image` of a
-  StatefulSet or DaemonSet, and the CronJob actions (`kind: "CronJob"`, `deployment` null). A proposal without
+  StatefulSet or DaemonSet, the CronJob actions (`kind: "CronJob"`, `deployment` null) and the node actions
+  (`kind: "Node"`, `namespace` and `deployment` null: a node is cluster-scoped). A proposal without
   `target` (made before II-25740) is still applied.
 - Per-action fields (spread into the proposal beside the common ones; informational, the agent rebuilds the
   write from them): `restart_rollout`: `workload_kind`, `workload`, `restarted_at` (the value the template's
@@ -44,7 +45,9 @@ label and email). Other fields are informational for the approver.
   Write batch 2 (**added II-25740**): `set_image`: `workload_kind`, `workload`, `container`, `image`.
   `pause_rollout` / `resume_rollout`: `paused` (the value set), `pending_pods` (pods a resume will replace
   because the template changed while paused; 0 for a pause). `suspend_cronjob` / `resume_cronjob`: `cronjob`,
-  `suspend`.
+  `suspend`. Batch 3: `cordon_node` / `uncordon_node`: `node`, `node_uid`, `unschedulable`. `drain_node`:
+  `node`, `node_uid`, `workloads` (`Kind/namespace/name` of what the drain was approved to evict),
+  `empty_dir_workloads`, `eviction_seconds`; `before.pods_to_evict` lists the pods seen at proposal time.
 - `persistence.needed`: `false` when nothing has to change in Git (a restart, a deleted pod, an in-place
   resize back to the template's own values, a pause or resume); `reason` says why and
   `changes` is empty. `true` otherwise (a `set_image` names `image`, a CronJob suspend or resume `suspend`).
@@ -80,6 +83,13 @@ UIE (`ran`).
   change waited (`pending_pods` > 0) as a Deployment rollout, `reverted` meaning paused again.
   `suspend_cronjob` / `resume_cronjob`: `succeeded` (the value held for 45 s; `verification.active_jobs` lists
   runs active then — a resume may start one at once), `reverted`.
+- Write batch 3 statuses (II-25740). `cordon_node` / `uncordon_node`: `succeeded` (the value held for 45 s),
+  `reverted`, `node_gone` (the node was removed or replaced while watched). `drain_node`: `succeeded` (no pod it
+  evicts is left on the node), `drain_incomplete` (pods a disruption budget still held back, or that could not
+  be evicted, remain: `verification.remaining`; nothing was forced), `in_progress` (all evicted, some still
+  shutting down), `reverted` (uncordoned while watched), `node_gone`. `applied` is the drain's own summary:
+  `cordoned`, `evicted`, `gone` (already gone or replaced), `blocked` (held by a budget when the eviction window
+  ended), `failed` (with the API's error).
 
 ### `query_result`
 
@@ -119,7 +129,8 @@ kind on the test cluster conformed.
 ### Action names (`action`)
 
 `scale_replicas`, `set_autoscaler_bounds`, `set_resources`, `resize_pod`, `restart_rollout`, `rollback`,
-`delete_pod`, `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob`, `resume_cronjob` today (`k8s_agent/actions/__init__.py`, `ACTIONS`). `resize_pod` (**added II-25740**): CPU/memory of one container
+`delete_pod`, `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob`, `resume_cronjob`, `cordon_node`,
+`uncordon_node`, `drain_node` today (`k8s_agent/actions/__init__.py`, `ACTIONS`). `resize_pod` (**added II-25740**): CPU/memory of one container
 of one running pod, in place through `pods/resize` — no rollout, same pod. Chosen only when the request asks
 for an in-place change (decided in code; naming a pod is not enough). Proposed only when the API server serves
 `pods/resize` (live discovery) and both the API server and the pod's kubelet are >= 1.35; memory only when
@@ -166,9 +177,31 @@ batch 1; a refusal carries `asked_for`).
 - RBAC (oncallari chart 0.3.16): `patch` on `cronjobs` (batch). Before it, both CronJob changes are refused
   with the missing rule named; the other batch 2 actions need no new rule.
 
+Added II-25740 (write batch 3, nodes). Proposed only when the request's own words ask for it, for a node the
+request names (its full name or the part before the first dot); a node quoted beside a workload does not take
+over unless the request asks for a node action.
+- `cordon_node` / `uncordon_node`: `spec.unschedulable`, as `kubectl cordon` / `uncordon`. Tier `medium`;
+  cordoning the last schedulable node, or uncordoning a node whose taints say Cluster Autoscaler, a spot
+  termination handler or Karpenter is removing it, is `high`.
+- `drain_node`: cordon, then evict through the Eviction API with kubectl drain's default rules: DaemonSet and
+  mirror pods stay, finished pods are left, a pod no controller owns refuses the proposal, emptyDir data loss is
+  listed. Budgets are honoured: a refused eviction (429) is retried for up to `eviction_seconds` (300), never
+  forced; a pod covered by two budgets cannot be evicted at all (the API answers 500; seen on test). What is
+  approved is the node, the workloads on it and these rules: pods are listed again when the drain runs, and it
+  refuses if a workload the approver did not see is there. The agent's own worker pod is evicted last. The node
+  stays cordoned. Tier `high`.
+- `find_workload` resolves `{"scope": "node", "kind": "Node", "namespace": null, "name"}`; `check_health` of a
+  node covers the pods on it and reports `NotReady` (warning) and `Cordoned` (info). `health_report.scope.type`
+  can now be `node` (with `kind: "Node"`, `name`, `namespace` null), beside `deployment`, `workload`,
+  `namespace`, `cluster` and `unresolved`.
+- A drain's `succeeded` means no pod it evicts is left on the node, not that their replacements already run
+  elsewhere (the proposal's capacity estimate says which may stay Pending).
+- RBAC (oncallari chart 0.3.17): `patch` on `nodes` and `create` on `pods/eviction`. RBAC cannot narrow the
+  node patch to `spec.unschedulable`, so it also allows labels and taints, which this agent never changes
+  (below); the eviction grant adds nothing the existing `delete` on pods does not already allow.
+
 Planned under II-25740 (not built yet), in this order:
-- `cordon_node`, `uncordon_node`, `drain_node`, StatefulSet replica scaling, and `batch` (one approval for the
-  same change on several targets).
+- StatefulSet replica scaling, and `batch` (one approval for the same change on several targets).
 - Added 2026-11-24 (user decision), in this order: `flux_reconcile` (set `reconcile.fluxcd.io/requestedAt` on a
   HelmRelease or Kustomization so a merged fix applies now; changes no desired state, tier `low`);
   `resize_pod` for StatefulSet pods (same rules as for Deployment pods; persistence hint points at the
@@ -222,7 +255,7 @@ Recorded for their owners; not changed from this repository.
 
 | Repo | What | Why | Since |
 |---|---|---|---|
-| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `rollback`, `delete_pod`, `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob` and `resume_cronjob` ship with II-25740. | II-25740 |
+| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `rollback`, `delete_pod`, `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob`, `resume_cronjob`, `cordon_node`, `uncordon_node` and `drain_node` ship with II-25740. | II-25740 |
 | insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship. | II-25740 |
 | insightfinder-mcp-service | Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. Do not have a model re-type the rows: 100+ rows exceed its output limit and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
 | insightfinder-mcp-service | Confirm live that a follow-up chat turn ("in table format") can reach the previous turn's agent result, or that the coordinator calls the agent again. | Screenshot of 2026-11-19 (stg): the coordinator answered from memory. | II-25740 |

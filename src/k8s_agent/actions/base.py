@@ -118,6 +118,14 @@ class ActionSpec:
     def operations(self, action: dict) -> list[Operation]:
         raise NotImplementedError
 
+    # Set by a change that runs its own operations (`execute`) instead of a fixed list built up front.
+    executes_itself: bool = False
+
+    async def execute(self, action: dict, kube, dry_run: bool, run_operation) -> dict:
+        """Run the change and return its summary. Only for `executes_itself`; `run_operation(kube, op, dry_run)`
+        performs one `Operation` exactly as the write tools do."""
+        raise NotImplementedError
+
     async def build_operations(self, action: dict, kube) -> list[Operation]:
         """The operations to run, for the dry run and the real write alike. Called inside the write tools
         only, with the client: an action whose body cannot travel in the proposal (a rollback's full pod

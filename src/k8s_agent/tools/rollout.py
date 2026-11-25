@@ -760,3 +760,82 @@ async def wait_cronjob_suspend(
         if elapsed >= min(STABILITY_SECONDS, max_wait_seconds):
             return {**base, "done": True, "status": "succeeded", "stable_for_seconds": elapsed}
         await asyncio.sleep(min(poll_seconds, max(1.0, STABILITY_SECONDS - elapsed)))
+
+
+# ---------------------------------------------------------------- nodes
+
+
+def _node_gone(node: dict | None, uid: str | None) -> bool:
+    return node is None or bool(uid and node.get("uid") != uid)
+
+
+async def wait_node_schedulable(
+    node: str,
+    uid: str | None,
+    unschedulable: bool,
+    max_wait_seconds: float,
+    poll_seconds: float = POLL_SECONDS,
+) -> dict:
+    """Poll after a cordon or uncordon until `spec.unschedulable` has held for STABILITY_SECONDS (nothing
+    acknowledges it). A node removed meanwhile (Cluster Autoscaler, a spot interruption) is `node_gone`."""
+    started = time.monotonic()
+    while True:
+        view = await read.get_node(node)
+        elapsed = round(time.monotonic() - started)
+        if _node_gone(view, uid):
+            return {"done": True, "status": "node_gone", "node": node, "waited_seconds": elapsed,
+                    "detail": f"Node {node} was removed (or replaced) while watched."}
+        base = {"node": node, "unschedulable": bool(view.get("unschedulable")), "ready": view.get("ready"), "waited_seconds": elapsed}
+        if bool(view.get("unschedulable")) != unschedulable:
+            return {**base, "done": True, "status": "reverted",
+                    "detail": f"spec.unschedulable was set to {str(unschedulable).lower()}, then changed back by something else."}
+        if elapsed >= min(STABILITY_SECONDS, max_wait_seconds):
+            return {**base, "done": True, "status": "succeeded", "stable_for_seconds": elapsed}
+        await asyncio.sleep(min(poll_seconds, max(1.0, STABILITY_SECONDS - elapsed)))
+
+
+async def wait_drain(
+    node: str,
+    uid: str | None,
+    max_wait_seconds: float,
+    poll_seconds: float = POLL_SECONDS,
+) -> dict:
+    """Poll after a drain until no pod it evicts is left on the node (DaemonSet and mirror pods stay), read live.
+    Evicted pods take their termination grace period to go, so only those (already deleting) are waited for: a
+    pod still running and not deleting was not evicted (a budget held it to the end, or the eviction failed), and
+    this read-only check never evicts, so it ends `drain_incomplete` at once. The node uncordoned meanwhile is
+    `reverted`; removed meanwhile (Cluster Autoscaler takes empty nodes) is `node_gone`. `succeeded` means the node
+    is empty of them, not that their replacements already run elsewhere."""
+    started = time.monotonic()
+    while True:
+        view = await read.get_node(node)
+        elapsed = round(time.monotonic() - started)
+        if _node_gone(view, uid):
+            return {"done": True, "status": "node_gone", "node": node, "waited_seconds": elapsed,
+                    "detail": f"Node {node} was removed (or replaced) while watched; nothing of the drain is left to check there."}
+        if not view.get("unschedulable"):
+            return {"done": True, "status": "reverted", "node": node, "waited_seconds": elapsed,
+                    "detail": "The node was uncordoned while the drain was watched: new pods may land on it again."}
+        on_node = await read.list_pods_on_node(node)
+        left = governance.drain_plan(on_node)["evict"]
+        terminating = [p for p in on_node if p.get("deleting") and p.get("owner_kind") != "DaemonSet"]
+        base = {"node": node, "waited_seconds": elapsed, "remaining": sorted(f"{p['namespace']}/{p['name']}" for p in left)[:30],
+                "terminating": len(terminating)}
+        if left:
+            return {
+                **base,
+                "done": True,
+                "status": "drain_incomplete",
+                "note": "Pods a disruption budget held back (or that could not be evicted) remain on the node; it stays "
+                "cordoned. Nothing was forced.",
+            }
+        if not terminating:
+            return {**base, "done": True, "status": "succeeded"}
+        if elapsed >= max_wait_seconds:
+            return {
+                **base,
+                "done": True,
+                "status": "in_progress",
+                "note": "Every pod was evicted; some were still shutting down when the wait window ended. This is not a failure.",
+            }
+        await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))

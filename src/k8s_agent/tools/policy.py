@@ -172,6 +172,39 @@ _RESUME_CRONJOB_WORDS = re.compile(
     r"(?i)(\bresume\b|\bun-?suspend\b|\bun-?pause\b|\bre-?enable\b|\benable\b"
     rf"|取消暂停|解除暂停|{_ZH_STATE_BEFORE}(恢复|启用|重新启用){_ZH_STATE_AFTER})"
 )
+# Write batch 3 (nodes). "uncordon" is not "cordon" (no word boundary inside it); "unschedulable" is not
+# "schedulable".
+_CORDON_WORDS = re.compile(
+    r"(?i)(\bcordon\b|\bmark\b[^.\n]{0,40}\bunschedulable\b|\bstop\b[^.\n]{0,20}\bscheduling\b[^.\n]{0,20}\bon(to)?\b"
+    rf"|{_ZH_STATE_BEFORE}(封锁|禁止调度|停止调度){_ZH_STATE_AFTER})"
+)
+_UNCORDON_WORDS = re.compile(
+    r"(?i)(\bun-?cordon\b|\bmark\b[^.\n]{0,40}(?<!un)\bschedulable\b|\ballow\b[^.\n]{0,20}\bscheduling\b"
+    rf"|解除封锁|取消封锁|{_ZH_STATE_BEFORE}(恢复调度|允许调度){_ZH_STATE_AFTER})"
+)
+_DRAIN_WORDS = re.compile(
+    r"(?i)(\bdrain\b|\bevacuate\b|\bevict\b[^.\n]{0,30}\b(all|every)\b[^.\n]{0,20}\bpods?\b"
+    rf"|{_ZH_STATE_BEFORE}(排空|腾空){_ZH_STATE_AFTER}|驱逐[^。\n]{{0,10}}(所有|全部)[^。\n]{{0,6}}pod)"
+)
+
+
+def asks_cordon(prompt: str) -> bool:
+    return _asks(_CORDON_WORDS, prompt)
+
+
+def asks_uncordon(prompt: str) -> bool:
+    return _asks(_UNCORDON_WORDS, prompt)
+
+
+def asks_drain(prompt: str) -> bool:
+    return _asks(_DRAIN_WORDS, prompt)
+
+
+def asks_node_change(prompt: str) -> bool:
+    """Any of the node actions: what lets a node named in the request win over a workload also named in it."""
+    return asks_cordon(prompt) or asks_uncordon(prompt) or asks_drain(prompt)
+
+
 def asks_set_image(prompt: str) -> bool:
     """Does the request itself ask for an image change (not just quote an image from a finding)?"""
     return _asks(_SET_IMAGE_WORDS, prompt)

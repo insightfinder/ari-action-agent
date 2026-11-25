@@ -28,6 +28,7 @@ outcome is otherwise verified from cluster state (tools/rollout.py), never
 assumed from the API's acknowledgement.
 """
 
+import time
 from datetime import datetime, timedelta, timezone
 
 from common.capabilities_base import StepContext
@@ -51,7 +52,9 @@ def _require_confirmed(ctx: StepContext) -> dict:
     params = ctx.params
     target = target_of(params)
     missing = [k for k in ("id", "action", "snapshot") if not params.get(k)]
-    missing += [f"target {k}" for k in ("kind", "namespace", "name") if not target.get(k)]
+    # A node is cluster-scoped: no namespace.
+    required = ("kind", "name") if target.get("kind") == "Node" else ("kind", "namespace", "name")
+    missing += [f"target {k}" for k in required if not target.get(k)]
     if params.get("action") not in actions.ACTIONS or missing:
         raise RuntimeError(
             f"apply_approved_change: the confirmed proposal is not one this agent made (action="
@@ -91,6 +94,7 @@ async def run(ctx: StepContext) -> dict:
     # The state this attempt's write starts from (None when an earlier attempt already wrote it): a verifier
     # that expects one container restart counts it from here.
     before_write = None if already else state
+    write_seconds = 0.0
     if already:
         # An earlier attempt of this step (or someone else) already put the approved values in place.
         applied = {"already_at_target": True, "note": "the cluster already held the approved values; nothing was written again"}
@@ -98,6 +102,7 @@ async def run(ctx: StepContext) -> dict:
         # very crash loop this change fixes) must not be judged as the change's own.
         applied_at = _proposed_at(proposal)
     else:
+        write_started = time.monotonic()
         try:
             applied = await ctx.tool("patch_workload")(action)
         except Exception as exc:  # noqa: BLE001 — the API may have applied it before the call failed
@@ -106,9 +111,11 @@ async def run(ctx: StepContext) -> dict:
             if not spec.at_target(action, state):
                 raise
             applied = {"applied_despite_error": f"{type(exc).__name__}: {exc}"}
+        write_seconds = time.monotonic() - write_started
 
     try:
-        budget = (ctx.step_deadline_seconds or _DEFAULT_STEP_SECONDS) - _VERIFY_MARGIN_SECONDS
+        # A write can take a while (a drain evicts pod after pod): the verifier gets what is left of the step.
+        budget = (ctx.step_deadline_seconds or _DEFAULT_STEP_SECONDS) - _VERIFY_MARGIN_SECONDS - write_seconds
         max_wait = max(30, min((dep.get("progress_deadline_seconds") or 600) + 60, budget))
         verification = await spec.verify(
             ctx, action, proposal, before_write, applied_at.isoformat() if applied_at else None, max_wait

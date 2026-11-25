@@ -222,6 +222,14 @@ def pod_view(raw: dict) -> dict:
         "created_at": meta.get("creationTimestamp"),
         "deleting": meta.get("deletionTimestamp") is not None,
         "node_name": spec.get("nodeName"),
+        # A static pod's mirror: the kubelet owns it, an eviction cannot move it.
+        "mirror": "kubernetes.io/config.mirror" in (meta.get("annotations") or {}),
+        # Names of emptyDir volumes: their data is lost when the pod leaves the node.
+        "empty_dir": [v.get("name") for v in spec.get("volumes") or [] if "emptyDir" in v],
+        # Where the scheduler may put it again (as in a pod template view), for a drain's capacity estimate.
+        "node_selector": dict(spec.get("nodeSelector") or {}),
+        "required_node_affinity": _required_node_affinity(spec),
+        "tolerations": _tolerations(spec),
         "phase": status.get("phase"),
         "reason": status.get("reason"),
         "conditions": _conditions(status),
@@ -262,6 +270,8 @@ def node_view(raw: dict) -> dict:
     ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions") or [])
     return {
         "name": meta.get("name"),
+        # A replacement node can reuse a name (EKS names nodes by private IP): the uid tells them apart.
+        "uid": meta.get("uid"),
         "labels": labels,
         "instance_type": labels.get("node.kubernetes.io/instance-type") or labels.get("beta.kubernetes.io/instance-type"),
         "node_group": labels.get("eks.amazonaws.com/nodegroup"),

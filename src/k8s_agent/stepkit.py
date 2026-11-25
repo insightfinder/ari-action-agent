@@ -34,7 +34,7 @@ def resolved_target(ctx: StepContext) -> dict:
     if target.get("name"):
         # A Deployment keeps the scope every caller has always seen; a StatefulSet or DaemonSet is a "workload"
         # (check_health then looks at its namespace).
-        target["scope"] = "deployment" if target["kind"] == "Deployment" else "workload"
+        target["scope"] = {"Deployment": "deployment", "Node": "node"}.get(target["kind"], "workload")
     return target
 
 

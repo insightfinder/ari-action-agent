@@ -181,3 +181,56 @@ def owned_by(pod: dict, kind: str, name: str) -> bool:
     if kind == "CronJob":
         return pod.get("owner_kind") == "Job" and is_cronjob_job(pod.get("owner_name"), name)
     return workload_of(pod) == (kind, name)
+
+
+# ---------------------------------------------------------------- draining a node
+
+
+def workload_key(pod: dict) -> str | None:
+    """`Kind/namespace/name` of what owns `pod` and replaces it once it is evicted: its Deployment,
+    StatefulSet or DaemonSet, else its direct owner (a Job, a bare ReplicaSet). None for a bare pod."""
+    owner = workload_of(pod)
+    if owner:
+        return f"{owner[0]}/{pod.get('namespace')}/{owner[1]}"
+    if pod.get("owner_kind") and pod.get("owner_name"):
+        return f"{pod['owner_kind']}/{pod.get('namespace')}/{pod['owner_name']}"
+    return None
+
+
+def drain_plan(pods: list[dict]) -> dict:
+    """What a drain does with each pod on the node, by kubectl drain's default rules: a DaemonSet's pod and a
+    static pod's mirror stay (their controller would put them straight back; an eviction cannot move a mirror),
+    a finished or already deleting pod is left alone, a pod no controller owns blocks the drain (nothing would
+    recreate it), and every other pod is evicted. `empty_dir` lists the evicted pods whose emptyDir data is
+    lost."""
+    plan: dict = {"evict": [], "bare": [], "empty_dir": [], "skipped": {"daemonset": 0, "mirror": 0, "finished": 0, "deleting": 0}}
+    for pod in pods:
+        if pod.get("phase") in ("Succeeded", "Failed"):
+            plan["skipped"]["finished"] += 1
+        elif pod.get("deleting"):
+            plan["skipped"]["deleting"] += 1
+        elif pod.get("mirror"):
+            plan["skipped"]["mirror"] += 1
+        elif pod.get("owner_kind") == "DaemonSet":
+            plan["skipped"]["daemonset"] += 1
+        elif workload_key(pod) is None:
+            plan["bare"].append(pod)
+        else:
+            plan["evict"].append(pod)
+            if pod.get("empty_dir"):
+                plan["empty_dir"].append(pod)
+    return plan
+
+
+# Taints that say something else cordoned a node to remove or replace it.
+_GOING_AWAY_TAINTS = (
+    "ToBeDeletedByClusterAutoscaler",
+    "DeletionCandidateOfClusterAutoscaler",
+    "aws-node-termination-handler",
+    "karpenter.sh/disrupt",
+    "node.kubernetes.io/out-of-service",
+)
+
+
+def going_away_taints(node: dict) -> list[str]:
+    return [t["key"] for t in node.get("taints") or [] if t.get("key") and any(m in t["key"] for m in _GOING_AWAY_TAINTS)]

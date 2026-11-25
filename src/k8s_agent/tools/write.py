@@ -42,6 +42,16 @@ async def _execute(kube, op: Operation, dry_run: bool) -> dict:
 async def _run(action: dict, dry_run: bool) -> dict:
     spec = actions.get(action.get("action"))
     kube = get_client()
+    if spec.executes_itself:
+        # A change that is a process rather than a list of calls (a drain: cordon, then evict whatever is on the
+        # node, retrying what a disruption budget holds back) runs its own operations through `_execute`.
+        try:
+            return await spec.execute(action, kube, dry_run, _execute)
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — surfaced as a clean, redacted error
+            what = "dry-run" if dry_run else "run"
+            raise RuntimeError(f"{what} of {action.get('action')} failed: {safe_error(exc)}") from None
     try:
         operations = await spec.build_operations(action, kube)
     except Exception as exc:  # noqa: BLE001 — a read the operations need (a rollback's ReplicaSet) failed
@@ -52,7 +62,8 @@ async def _run(action: dict, dry_run: bool) -> dict:
             raw = await _execute(kube, op, dry_run)
         except Exception as exc:  # noqa: BLE001 — surfaced as a clean, redacted error
             what = "dry-run" if dry_run else op.verb
-            raise RuntimeError(f"{what} of {op.resource} {op.namespace}/{op.name} failed: {safe_error(exc)}") from None
+            where = f"{op.namespace}/{op.name}" if op.namespace else op.name
+            raise RuntimeError(f"{what} of {op.resource} {where} failed: {safe_error(exc)}") from None
         summary = spec.summarize(op, raw or {}, action)
         summary["dry_run"] = dry_run
         summaries.append(summary)

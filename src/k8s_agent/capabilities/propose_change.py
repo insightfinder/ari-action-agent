@@ -32,8 +32,8 @@ from ..tools import capacity, persistence, policy, quantities
 
 _SENTINEL = "CHANGE_JSON:"
 _SYSTEM = (
-    "You read a request to change a Kubernetes workload (a Deployment, StatefulSet, DaemonSet or CronJob) or one "
-    "of its pods and report exactly what it asks for. You never invent or round a number. For every number you report "
+    "You read a request to change a Kubernetes workload (a Deployment, StatefulSet, DaemonSet or CronJob), one "
+    "of its pods, or a node, and report exactly what it asks for. You never invent or round a number. For every number you report "
     "you also give the exact words of the request it came from (a verbatim quote). If the request does not ask "
     "for a concrete change, say so."
 )
@@ -49,9 +49,18 @@ def _offered(kind: str) -> list:
     return [spec for spec in actions.REGISTRY.values() if kind in spec.workload_kinds]
 
 
+def _node_context(node: dict) -> dict:
+    return {
+        "node": node["name"],
+        "cordoned": bool(node.get("unschedulable")),
+        "ready": node.get("ready"),
+        "taints": [t.get("key") for t in node.get("taints") or []],
+    }
+
+
 async def _extract(ctx: StepContext, workload: dict, autoscaler: dict | None) -> dict:
     offered = _offered(workload.get("kind") or "Deployment")
-    context = {
+    context = _node_context(workload) if workload.get("kind") == "Node" else {
         "workload": f"{workload.get('kind') or 'Deployment'} {workload['namespace']}/{workload['name']}",
         "current_replicas": workload.get("replicas"),
         "containers": [{**c, "image": i} for c, i in zip(_container_summary(workload), _images(workload))],
@@ -143,6 +152,8 @@ def _template_pod_labels(workload: dict) -> dict:
 
 
 def _example(kind: str, name: str, namespace: str) -> str:
+    if kind == "Node":
+        return f"'cordon node {name}' or 'drain node {name}'"
     if kind == "CronJob":
         return f"'suspend cronjob {name} in namespace {namespace}'"
     return f"'restart {kind.lower()} {name} in namespace {namespace}'"
@@ -154,7 +165,13 @@ def _example(kind: str, name: str, namespace: str) -> str:
 async def run(ctx: StepContext) -> dict:
     target = resolved_target(ctx)
     kind = target.get("kind") or "Deployment"
-    if target.get("scope") not in ("deployment", "workload") or not target.get("name") or not target.get("namespace"):
+    # A node is cluster-scoped: it has no namespace.
+    needs_namespace = target.get("scope") != "node"
+    if (
+        target.get("scope") not in ("deployment", "workload", "node")
+        or not target.get("name")
+        or (needs_namespace and not target.get("namespace"))
+    ):
         candidates = (ctx.results.get("find_workload") or {}).get("candidates") or []
         return refusal(
             "Which workload to change is not clear" + (f"; candidates: {', '.join(candidates)}" if candidates else "."),
@@ -168,6 +185,11 @@ async def run(ctx: StepContext) -> dict:
     if kind == "Deployment":
         workload = await ctx.tool("get_deployment")(namespace, name)
         autoscaler = await ctx.tool("find_autoscaler")(namespace, name)
+    elif kind == "Node":
+        workload = await ctx.tool("get_node")(name)
+        if workload is None:
+            return refusal(f"Node {name} no longer exists (Cluster Autoscaler may have removed it); nothing was proposed.")
+        workload = {**workload, "kind": "Node"}
     else:
         workload = await ctx.tool("get_workload")(kind, namespace, name)
     change = await _extract(ctx, workload, autoscaler)
@@ -184,7 +206,7 @@ async def run(ctx: StepContext) -> dict:
         # so a caller (an engineer, or the on-call coordinator) can ask again with one.
         return refusal(
             "The request does not ask for a concrete change this agent can make to "
-            f"{kind} {namespace}/{name}: "
+            f"{kind} {f'{namespace}/' if namespace else ''}{name}: "
             + str(change.get("reasoning") or "no change identified")
             + ". Nothing was proposed. Ask again with the exact change, for example "
             + (
@@ -196,7 +218,11 @@ async def run(ctx: StepContext) -> dict:
             )
             + _example(kind, name, namespace)
             + ".",
-            current={"kind": kind, "replicas": workload.get("replicas"), "containers": _container_summary(workload)},
+            current=(
+                {"kind": kind, **_node_context(workload)}
+                if kind == "Node"
+                else {"kind": kind, "replicas": workload.get("replicas"), "containers": _container_summary(workload)}
+            ),
         )
 
     target_obj, refused = await spec.resolve_target(ctx, workload, change)
