@@ -311,7 +311,7 @@ class AriAgentWorkflow:
                         # here, `respond` would be told this step never ran and say nothing changed.
                         results[capability] = {"status": "interrupted", "failure": _activity_failure_detail(exc)}
                     break
-                step_result = {"status": "inconclusive", "failure": _activity_failure_detail(exc)}
+                step_result = {"status": "inconclusive", "failure": _activity_failure_detail(exc), "step_error": True}
 
             results[capability] = step_result
 
@@ -329,7 +329,7 @@ class AriAgentWorkflow:
             if on_failure and step_result.get("status") in ("failed", "inconclusive"):
                 attempts = loop_attempts.get(capability, 0) + 1
                 loop_attempts[capability] = attempts
-                if attempts > on_failure["max_attempts"]:
+                if attempts > on_failure["max_attempts"] or step_result.get("step_error"):
                     # `then: continue` keeps the pipeline going with the
                     # failure recorded, instead of ending the run here.
                     #

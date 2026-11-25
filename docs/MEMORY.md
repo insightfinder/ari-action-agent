@@ -5453,3 +5453,91 @@ value was not shown either), while it shows the `displayName` of an imported
 Claude Code plugin. Its loader reads `displayName` from the manifest and from
 the marketplace entry, so the Cursor marketplace entry carries it too; the
 name a marketplace install shows is unverified until the listing exists.
+
+## 2026-11-25 - A killed `verify` no longer loops back through `generate_change` (II-25741)
+
+Ayush reported a 44-minute investigation on stg. The pipeline accounting
+for that run (`01a1f5f3`, workflow
+`oncall-ari-9eb16ca6a6a45216d0aab121acf2bb8a387006e3-0`) was:
+
+```
+   +5s   163s  generate_change  OK      {"edit": 3, "glob": 4, "grep": 12, "read": 15, "todowrite": 6}
+ +168s   855s  verify           KILLED  opencode (ari-verify) timed out after 855s
++1023s    28s  generate_change  OK      {"invalid": 1}
++1051s   855s  verify           KILLED  opencode (ari-verify) timed out after 855s
++1906s    26s  generate_change  OK      {"invalid": 1}
++1932s   653s  verify           OK      passed, {"bash": 5}
++2585s     2s  propose_pr       OK
+```
+
+All three `generate_change` results name the same single file with the same
+title, and the two after a kill made **one invalid tool call each and zero
+`edit` calls** -- the diff that shipped was the one written at +5s. 1764s of
+the 2594s run (68%) produced nothing.
+
+**Cause.** `workflow.py` folded a raised `ActivityError` into
+`{"status": "inconclusive"}` and the `on_failure` branch treated `"failed"`
+and `"inconclusive"` identically, so a kill jumped back to
+`generate_change`. `generate_change` then received, as its "previous attempt
+failed verification with" text, only
+`opencode (ari-verify) timed out after 855s (pid 16865) and was killed` --
+no test output, nothing to act on.
+
+That folding was added deliberately on 2026-09-21, to stop an
+externally-cancelled `verify` from aborting the whole pipeline. The same
+change removed the cause of those cancels (the build cache), but the folding
+stayed and now catches our own deadline.
+
+**Fix.** Two lines. The fold tags itself `"step_error": True`, and the
+exhausted branch fires on that tag as well as on the attempt count, so a
+killed step takes the path a spent loop already took. With verify's
+`then: continue` that means straight to `propose_pr` with the change
+labelled `verification: inconclusive` -- the 2026-09-21 intent (don't
+discard finished work) without the retries.
+
+A failure `verify` reports itself is untouched: `{"status": "failed"}`
+carries real test output, and so does the `inconclusive` that
+`capabilities/verify.py` returns when opencode printed no `RESULT:` line.
+Both still loop back. Of six loop fires measured on stg over seven days,
+four were exactly that and three of the four passed on retry -- the loop
+earns its keep, so the fix discriminates rather than removes.
+
+**Rate, measured 2026-11-20** over 62 `AriAgentWorkflow` executions
+(2026-11-13 to 2026-11-20, all COMPLETED). 29 ran `verify`, 37 `verify`
+activity runs in all. Killed at the deadline: 3 runs across 2 executions
+(`01a1e42b`, 890s of 1673s wasted; `01a1f5f3` above). So roughly 3% of
+executions, 7% of those that verify, about once every 3.5 days -- rare, but
+deterministic amplification once hit.
+
+**`timeout_seconds` 900 -> 1200.** The effective subprocess budget is
+`timeout_seconds - _OPENCODE_DEADLINE_MARGIN_SECONDS`, so 855s, and the
+observed durations cluster right under it: 855/855/855 killed, then 776,
+734, 718, 653, 650, 648, 640 completed, then a gap to 516 and below. **10 of
+37 runs (27%) land at 640s or above.** Both killed executions completed
+`verify` on a later attempt in 734s and 653s, inside 1155s. Raising the
+number alone has now been the response twice (480 -> 900 on 2026-10-10,
+900 -> 1200 here); the loop-back fix is what stops the cost tripling.
+
+**Tests.** `test_raised_activity_error_loops_via_on_failure_instead_of_aborting`
+asserted the removed behaviour (4 verifies, 4 generate_changes) and is now
+`test_a_killed_step_skips_the_on_failure_loop_and_ends_gracefully`.
+`test_a_build_that_really_failed_still_stops_the_pipeline` gained
+`calls["verify"] == 2`, and `test_a_verify_with_no_verdict_line_still_loops_back`
+is new -- together they pin the two paths that must keep looping.
+
+`test_the_on_failure_loop_stops_once_the_budget_is_spent` could not survive
+as written: it spent a 200s budget across *several* loop passes, and a
+killed step no longer makes passes. Measured directly, one kill leaves
+`REMAIN=72.9` of 200s, because Temporal will not schedule a retry whose
+backoff would run past `schedule_to_close` and ends the attempt at ~127s
+instead. It is now `test_the_budget_stops_the_run_after_a_killed_step`: a
+150s budget, so the single kill leaves 23s, below
+`_MIN_USEFUL_STEP_SECONDS`, and the top-of-loop check names `propose_pr` as
+the step that never got to run. Note `calls` there counts activity
+*attempts*, not loop passes -- `verify` reads 8 with a 50-attempt retry
+policy, which is why the loop-count assertion is on `generate_change`.
+
+**Open, not changed here.** `verify`'s own `retry.max_attempts` is still 1,
+so a transient kill (OOM at 2Gi, a lost worker) now gets no retry at all
+rather than a useless one. If those should be retried, that policy is the
+lever, not the `on_failure` loop.
