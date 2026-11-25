@@ -117,7 +117,11 @@ _DELETE_POD_WORDS = re.compile(
     rf"(?i)(\b{_POD_VERB}\b[^.\n]{{0,60}}\bpods?\b|\bpods?\b[^.\n]{{0,60}}\b{_POD_VERB}\b"
     rf"|{_POD_VERB_ZH}[^。\n]{{0,30}}pod|pod[^。\n]{{0,30}}{_POD_VERB_ZH})"
 )
-_NEGATION = re.compile(r"(?i)(\b(no|not|without|never|don'?t|do\s+not|avoid)\b[^.\n,;]{0,12}|(不要|不用|不必|无需|不需要|[不无没别勿])\s*)$")
+# Also what reports an attempt rather than asks for one: "we tried to upgrade it", "it failed to restart".
+_NEGATION = re.compile(
+    r"(?i)(\b(no|not|without|never|don'?t|do\s+not|avoid|didn'?t|did\s+not|can'?t|cannot|couldn'?t|won'?t|wasn'?t"
+    r"|(?:tried|failed|attempted|unable|trying)\s+to)\b[^.\n,;]{0,12}|(不要|不用|不必|无需|不需要|[不无没别勿])\s*)$"
+)
 
 
 def _asks(pattern: re.Pattern, prompt: str) -> bool:
@@ -144,9 +148,12 @@ def asks_delete_pod(prompt: str) -> bool:
 # "被暂停" / "已暂停" / "暂停了" (it is paused), "恢复了" / "恢复正常" (it recovered).
 _ZH_STATE_BEFORE = r"(?<![被已在])"
 _ZH_STATE_AFTER = r"(?!了|中|着|的|状态|正常)"
+# A change verb followed, in the same sentence, by the word image/tag/version, or by "to <reference>" (a word
+# with a digit, ":" or "@") for the verbs that name a version change. Not a bare "upgrade" ("pods fail to pull x:1.3 after the upgrade") and not
+# "use" ("the pods use image x:1.2").
 _SET_IMAGE_WORDS = re.compile(
-    r"(?i)(\b(set|change|update|switch|move|pin|deploy|roll\s*out|use|point)\b[^.\n]{0,60}\b(image|tag|version)\b"
-    r"|\b(upgrade|downgrade|bump)\b"
+    r"(?i)(\b(set|change|update|switch|move|pin|deploy|roll\s*out|point|upgrade|downgrade|bump)\b[^.\n]{0,60}\b(image|tag|version)\b"
+    r"|\b(upgrade|downgrade|bump|update|switch|move|roll\s*out|deploy)\b[^.\n]{0,60}\bto\s+[\w./@-]*[\d:@][\w./:@-]*"
     rf"|(镜像|版本|tag|标签)[^。\n]{{0,20}}{_ZH_STATE_BEFORE}(改|换|设|升级|降级|更新|切){_ZH_STATE_AFTER}"
     rf"|{_ZH_STATE_BEFORE}(改|换|设|升级|降级|更新|切){_ZH_STATE_AFTER}[^。\n]{{0,20}}(镜像|版本|tag|标签))"
 )

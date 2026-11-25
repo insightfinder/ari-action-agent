@@ -5711,3 +5711,12 @@ fix and its client test (a plain create posts to the collection), since any futu
 findings above about manual Jobs (not in `status.active`, pruned by history limits) stay as facts about
 Kubernetes. Suite on 3.12 after the removal: 1268 passed, 11 skipped, 0 failed.
 
+
+**set_image gate tightened after a security review (2026-11-25).** The review of commit `a92bd7c` found the
+image-change gate too loose: a bare "upgrade"/"bump" anywhere, or "use", counted, so "after the upgrade, pods
+fail to pull <image>" or "we tried to upgrade to <image>, why did it fail?" could reach a `set_image` proposal
+(the image is verbatim in such prompts; approval would still be needed). Now a change verb must be followed in
+the same sentence by image/tag/version, or by "to <reference>" (a word with a digit, ":" or "@"); "use" no longer
+counts. The shared negation check (all intent gates) also treats reports of an attempt as not a request:
+didn't / can't / won't / wasn't, tried / failed / attempted / unable / trying to. Regression prompts added.
+Suite on 3.12: 1273 passed, 11 skipped.

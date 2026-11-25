@@ -56,6 +56,7 @@ async def _approved(cluster, prompt, change, results=None):
         ("asks_set_image", "set the image of checkout to registry.example/checkout:1.3"),
         ("asks_set_image", "把 checkout 的镜像改成 registry.example/checkout:1.3"),
         ("asks_set_image", "upgrade checkout to version 1.3"),
+        ("asks_set_image", "bump checkout to registry.example/checkout:1.3"),
         ("asks_pause_rollout", "pause the rollout of checkout"),
         ("asks_pause_rollout", "暂停 checkout 的发布"),
         ("asks_resume_rollout", "resume the rollout of checkout"),
@@ -75,6 +76,10 @@ def test_the_request_asks_for_it(gate, prompt):
     [
         ("asks_set_image", "checkout fails to pull registry.example/checkout:1.3, why?"),
         ("asks_set_image", "don't change the image of checkout"),
+        ("asks_set_image", "after the upgrade, checkout pods fail to pull registry.example/checkout:1.3"),
+        ("asks_set_image", "we tried to upgrade checkout to registry.example/checkout:1.3 yesterday, why did it fail?"),
+        ("asks_set_image", "the checkout pods use image registry.example/checkout:1.2"),
+        ("asks_set_image", "ImagePullBackOff on registry.example/checkout:1.3"),
         ("asks_pause_rollout", "checkout is paused, why?"),
         ("asks_pause_rollout", "checkout 被暂停了吗"),
         ("asks_pause_rollout", "不要暂停 checkout"),
