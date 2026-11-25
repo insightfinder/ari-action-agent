@@ -1,4 +1,4 @@
-# ARI plugin for Claude Code
+# ARI AI Agent plugin for Claude Code
 
 Connects Claude Code to your own ARI gateway, so you can ask the open-source ARI operations agents
 to get work done from the terminal or the IDE:
@@ -13,15 +13,15 @@ merges a pull request.
 
 ## Before you install
 
-ARI is self-hosted. You need an ARI MCP gateway that your organisation runs, with its Coordinator and
-agents behind it. Deployment instructions:
+ARI is self-hosted. You need an ARI MCP gateway that your organisation runs, with its Coordinator
+and agents behind it. Deployment instructions:
 https://github.com/insightfinder/ari-action-agent/blob/main/docs/MCP_GATEWAY.md
 
 ## Install
 
 ```
 claude plugin marketplace add insightfinder/ari-action-agent
-claude plugin install ari@ari-agent
+claude plugin install ari-ai-agent@ari-ai-agent
 ```
 
 When the plugin is enabled, Claude Code asks for one setting:
@@ -30,10 +30,10 @@ When the plugin is enabled, Claude Code asks for one setting:
 |---|---|
 | `server_url` | `https://ari-mcp.example.com/mcp` |
 
-Sign in once: run `claude` in a terminal, type `/mcp`, choose `plugin:ari:ari` and Authenticate. A
-browser window opens to sign in with GitHub. The Claude desktop app shares this sign-in but does not
-offer it for plugin servers, so sign in from the terminal first and then start a new session in the app.
-Your gateway decides who may use it and who may approve changes.
+Sign in once: run `claude` in a terminal, type `/mcp`, choose `plugin:ari-ai-agent:ari` and
+Authenticate. A browser window opens to sign in with GitHub. The Claude desktop app shares this
+sign-in but does not offer it for plugin servers, so sign in from the terminal first and then start
+a new session in the app. Your gateway decides who may use it and who may approve changes.
 
 ## Use
 
@@ -44,9 +44,9 @@ Ask in plain language, for example:
 - "Use ARI to check the pods in the payments namespace."
 - "Use ARI to show the last 3 builds of the Jenkins job deploy-payments."
 
-When ARI has a change ready, Claude shows the proposal (repository, branch, files, diff link). Tell it
-to approve or decline. If the app cannot show the approval dialog, ARI returns a link: open it, sign
-in with GitHub and press Approve.
+When ARI has a change ready, Claude shows the proposal (repository, branch, files, diff link). Tell
+it to approve or decline. If the app cannot show the approval dialog, ARI returns a link: open it,
+sign in with GitHub and press Approve.
 
 ## Tools
 

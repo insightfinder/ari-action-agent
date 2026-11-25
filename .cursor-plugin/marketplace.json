@@ -1,5 +1,5 @@
 {
-  "name": "ari-agent",
+  "name": "ari-ai-agent",
   "owner": {
     "name": "InsightFinder"
   },
@@ -8,8 +8,9 @@
   },
   "plugins": [
     {
-      "name": "ari",
-      "source": "plugins/ari-cursor",
+      "name": "ari-ai-agent",
+      "displayName": "ARI AI Agent",
+      "source": "plugins/ari-ai-agent-cursor",
       "description": "Work with the ARI operations agents from Cursor: root-cause a problem in a repository and open a pull request, check or change Kubernetes workloads, and query or trigger Jenkins jobs, each change approved by a person first."
     }
   ]

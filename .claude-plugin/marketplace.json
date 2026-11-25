@@ -1,5 +1,5 @@
 {
-  "name": "ari-agent",
+  "name": "ari-ai-agent",
   "description": "Plugins for the open-source ARI agents",
   "owner": {
     "name": "InsightFinder",
@@ -7,8 +7,8 @@
   },
   "plugins": [
     {
-      "name": "ari",
-      "source": "./plugins/ari",
+      "name": "ari-ai-agent",
+      "source": "./plugins/ari-ai-agent",
       "description": "Work with the ARI operations agents from Claude Code: root-cause a problem in a repository and open a pull request, check or change Kubernetes workloads, and query or trigger Jenkins jobs, each change approved by a person first."
     }
   ]

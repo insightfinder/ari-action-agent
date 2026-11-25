@@ -122,11 +122,11 @@ The server address is `https://<host>/mcp`.
 - **Claude Code:** `claude mcp add --transport http ari https://<host>/mcp`, then `/mcp` to sign in.
 - **Claude Code plugin:** this repository is also a plugin marketplace. Run
   `claude plugin marketplace add insightfinder/ari-action-agent`, then
-  `claude plugin install ari@ari-agent`, and enter the gateway address when asked for `server_url`.
-  The plugin lives in [`plugins/ari`](../plugins/ari/README.md); check it with
-  `claude plugin validate --strict --profile directory plugins/ari`.
+  `claude plugin install ari-ai-agent@ari-ai-agent`, and enter the gateway address when asked for `server_url`.
+  The plugin lives in [`plugins/ari-ai-agent`](../plugins/ari-ai-agent/README.md); check it with
+  `claude plugin validate --strict --profile directory plugins/ari-ai-agent`.
 - **Cursor plugin:** the repository is also a Cursor plugin marketplace (`.cursor-plugin/marketplace.json`).
-  The plugin lives in [`plugins/ari-cursor`](../plugins/ari-cursor/README.md) and reads the gateway
+  The plugin lives in [`plugins/ari-ai-agent-cursor`](../plugins/ari-ai-agent-cursor/README.md) and reads the gateway
   address from the `ARI_SERVER_URL` environment variable, so each person points it at their own
   gateway. Cursor shows the approval form from the gateway inside the chat.
 

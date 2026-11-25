@@ -1,4 +1,4 @@
-# ARI plugin for Cursor
+# ARI AI Agent plugin for Cursor
 
 Connects Cursor to your own ARI gateway, so you can ask the open-source ARI operations agents to get
 work done from the editor:
@@ -13,14 +13,16 @@ merges a pull request.
 
 ## Before you install
 
-ARI is self-hosted. You need an ARI MCP gateway that your organisation runs, with its Coordinator and
-agents behind it. Deployment instructions:
+ARI is self-hosted. You need an ARI MCP gateway that your organisation runs, with its Coordinator
+and agents behind it. Deployment instructions:
 https://github.com/insightfinder/ari-action-agent/blob/main/docs/MCP_GATEWAY.md
 
 ## Set your gateway address
 
 The plugin reads the gateway address from the `ARI_SERVER_URL` environment variable. Set it once for
-your user account, then quit Cursor completely and start it again so it picks the value up.
+your user account, then quit Cursor completely and start it again from the Start menu or Dock so it
+picks the value up. A Cursor started from a terminal that was opened before the variable was set
+does not see it, and the plugin reports an invalid URL.
 
 Windows (PowerShell):
 
@@ -36,14 +38,14 @@ export ARI_SERVER_URL="https://ari-mcp.example.com/mcp"
 
 ## Install and sign in
 
-Install the plugin from the Cursor marketplace, then open Customize, Plugins, Ari and press
+Install the plugin from the Cursor marketplace, then open Customize, Plugins, ARI AI Agent and press
 Authenticate next to `ari-gateway`. A browser window opens to sign in with GitHub. Your gateway
 decides who may use it and who may approve changes.
 
 If you also added the same gateway address by hand under Customize, MCPs, remove that entry: Cursor
-hides a plugin server whose address matches a server you added yourself. If the ARI plugin for
-Claude Code is installed on the same computer, Cursor imports it too and lists a second `ari` server
-that cannot connect; use `ari-gateway`.
+hides a plugin server whose address matches a server you added yourself. If the ARI AI Agent plugin
+for Claude Code is installed on the same computer, Cursor imports it too and lists a second `ari`
+server that cannot connect; use `ari-gateway`.
 
 ## Use
 
@@ -54,9 +56,9 @@ Ask in plain language, for example:
 - "Use ARI to check the pods in the payments namespace."
 - "Use ARI to show the last 3 builds of the Jenkins job deploy-payments."
 
-When ARI has a change ready, Cursor shows the proposal (repository, branch, files, diff link). Tell it
-to approve or decline. Cursor then asks you to confirm in a form from the gateway; tick the box and
-submit.
+When ARI has a change ready, Cursor shows the proposal (repository, branch, files, diff link). Tell
+it to approve or decline. Cursor then asks you to confirm in a form from the gateway; tick the box
+and submit.
 
 ## Tools
 
@@ -71,7 +73,8 @@ submit.
 ## Privacy
 
 The plugin talks only to the gateway address you configure. What the gateway and agents store is
-decided by your own deployment. InsightFinder privacy policy: https://insightfinder.com/privacy-policy/
+decided by your own deployment. InsightFinder privacy policy:
+https://insightfinder.com/privacy-policy/
 
 ## License
 

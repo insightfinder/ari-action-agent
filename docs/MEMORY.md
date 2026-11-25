@@ -5437,3 +5437,19 @@ repository a Cursor marketplace too; the plugin is `plugins/ari-cursor`
 - Jenkins agent: "list the Jenkins jobs" was routed to the jenkins agent,
   which answered that it had no Jenkins access without calling a tool; its
   capabilities all start from a named job (inferred, agent logs not read).
+
+**Plugin rename (2026-11-25).** The PM chose the display name "ARI AI Agent".
+Plugin names must be kebab-case (`claude plugin validate`: "Plugin name
+cannot contain spaces"), so both plugins and both marketplaces are
+`ari-ai-agent`, with `"displayName": "ARI AI Agent"` in each manifest;
+directories `plugins/ari-ai-agent` and `plugins/ari-ai-agent-cursor`. Claude
+Code install: `claude plugin install ari-ai-agent@ari-ai-agent`; its server
+is `plugin:ari-ai-agent:ari`. A Cursor started from a shell that predates
+`setx ARI_SERVER_URL` logs "Connection failed: Invalid URL" for
+`ari-gateway`; starting it from the Start menu picks the variable up.
+Cursor's Plugins list ignores `displayName` for a plugin under
+`~/.cursor/plugins/local/` and title-cases the name ("Ari Ai Agent"; a probe
+value was not shown either), while it shows the `displayName` of an imported
+Claude Code plugin. Its loader reads `displayName` from the manifest and from
+the marketplace entry, so the Cursor marketplace entry carries it too; the
+name a marketplace install shows is unverified until the listing exists.
