@@ -1,5 +1,6 @@
 {
-  "name": "ari",
+  "name": "ari-ai-agent",
+  "displayName": "ARI AI Agent",
   "version": "1.0.0",
   "description": "Work with the ARI operations agents from Claude Code: root-cause a problem in a repository and open a pull request, check or change Kubernetes workloads, and query or trigger Jenkins jobs, each change approved by a person first.",
   "author": {
