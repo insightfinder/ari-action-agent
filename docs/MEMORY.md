@@ -6239,3 +6239,49 @@ option, `dryRun` included, goes in the body (`client._delete_sync`), as kubectl'
 (seen with `-v=8`: `{"propagationPolicy":"Background","dryRun":["All"]}`); a unit test pins the body, and the
 real client's request was captured on a local HTTP server to confirm the bytes. Lesson: for DELETE, options
 belong in the body; never test a "dry run" against a live object without confirming where the server reads it.
+
+**Batch 1 deployed to test (2026-11-25).** ari-action-agent `4e57836` merged into test (README table conflict
+resolved: test's rows kept, the k8s row extended); image `2611250642-test` on ari-k8s-api and ari-k8s-worker,
+worker started cleanly. oncallari 0.3.15 published; test-fluxcd `afaaf365` pins it; after reconciling the Git
+source, the `ari-k8s` HelmRepository and the HelmRelease, release v35 runs 0.3.15. Checked as the ServiceAccount
+(`kubectl auth can-i --as`): patch statefulsets/daemonsets and delete pods yes; create pods, delete deployments,
+get secrets no. Not run yet: the in-cluster e2e writes of the three actions.
+
+**Batch 1 e2e on test, first attempt (2026-11-25), stopped by cluster churn.** `restart_rollout` of
+`insightfinder-dailyreportworker`: proposal correct (tier high: strategy Recreate; dry run passed;
+`persistence.needed` false); after approval the write landed (template restartedAt `2026-11-25T07:09:48Z`).
+Verification never finished: the old pod was stuck Terminating on a NotReady node (Recreate waits for it),
+then the worker pod itself was replaced (node churn) and Temporal retried the step on the new worker; by then
+something else had set restartedAt to `2026-11-25T15:17:10+08:00` (not the agent; source not identified), so
+the retry refused with "restarted since the proposal" and wrote nothing, as designed. The other three steps
+did not run. Cause of the churn (read-only look): image automation bumped `insightfinder-app` 10 times in ~2 h;
+each bump redeploys 61 Deployments (59 `Recreate`), all JVMs start at once, spot t3a.2xlarge nodes sit at
+~100% CPU (namespace usage ~58 cores vs ~47 requested; 90m CPU reserved per node), probes fail, nodes go
+NotReady, and Cluster Autoscaler (default scale-down timings) adds and removes 2-3 nodes every ~20-30 min.
+Kubelet CPU starvation as the NotReady cause is inferred, not confirmed. Retry the e2e when the cluster is quiet.
+
+**Batch 1 write e2e passed on test (2026-11-25, image `2611250642-test`, chart 0.3.15), in `ari-k8s-e2e`.**
+At the user's request write tests now run in a dedicated namespace (fixtures `deploy/k8s-agent-e2e/fixtures.yaml`,
+batch-1 objects added: `e2e-rollback`, `e2e-sts`, `e2e-ds`), not on real services. Through the deployed API ->
+Temporal -> worker with its ServiceAccount, real model, each proposed then approved with `confirm_pending_action`:
+- restart Deployment e2e-plain: tier medium, `succeeded` in 67 s, new pods, restartedAt as approved.
+- restart StatefulSet e2e-sts: `succeeded` in 69 s (`wait_workload_rollout`), both pods new uids.
+- restart DaemonSet e2e-ds: `succeeded` in 91 s (node count moved 10 -> 9 -> 8 during the run: spot churn).
+- delete pod of e2e-plain: PDB listed as info; `succeeded` in 73 s, `replacement` named the new pod.
+- delete pod e2e-sts-1: `succeeded` in 72 s, same name, new uid.
+- rollback e2e-rollback to the previous revision (2 -> 1, pause:3.9 -> 3.10) and then to "revision 2" (3 -> 2):
+  both `succeeded` in ~68 s; the proposal carried images only; persistence listed the image change (unowned).
+`persistence.needed` false for the restarts and deletes. Every step's dry run left the cluster unchanged.
+`scripts/k8s_agent_live_test.py` gained the same scenarios (plus `health_statefulset`), its `rbac` scenario was
+updated for the new rules (it still listed `delete pods` as denied), and `tests/test_k8s_live_script.py` now
+holds the script's RBAC expectations against docs/examples/k8s-rbac.yaml and its fixtures against fixtures.yaml.
+Then `scripts/k8s_agent_live_test.py --allow-writes rbac health_statefulset restart_deployment restart_statefulset
+restart_daemonset delete_pod delete_sts_pod rollback rollback_revision` against the same agent: 9 scenarios, 0
+failed (each write 62-87 s). Fixtures: `ari-k8s-e2e` stays on test for the rest of II-25740 (later batches reuse
+it) and is deleted once every phase is built and tested (user, 2026-11-25). It was deleted once by mistake after
+this run and applied again at once.
+
+**`skills/.DS_Store` no longer fails the suite (2026-11-25).** `test_bundled_skills_directory_has_nothing_but_skills_and_its_readme`
+listed every file on disk, so a Finder `.DS_Store` (already in .gitignore) failed it on macOS checkouts. It now
+leaves out what `git check-ignore` reports (falling back to `.DS_Store`/`__pycache__` without git); an untracked,
+not-ignored stray file still fails it (checked). Full suite on 3.12: 1202 passed, 0 failed.

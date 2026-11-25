@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -35,8 +36,23 @@ def test_every_bundled_skill_follows_the_spec_without_warnings():
         assert report.ok and report.warnings == [], (report.path, report.errors, report.warnings)
 
 
+def _git_ignored(names: list[str]) -> set[str]:
+    """The entries of skills/ that .gitignore covers (a Finder `.DS_Store`, `__pycache__`): local files that
+    never reach the repository, so they say nothing about what it holds. Without git, only those two."""
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--stdin"], cwd=BUNDLED, input="\n".join(names), capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {n for n in names if n in (".DS_Store", "__pycache__")}
+    if result.returncode not in (0, 1):  # 1: nothing ignored; anything else: not a git checkout
+        return {n for n in names if n in (".DS_Store", "__pycache__")}
+    return {Path(line).name for line in result.stdout.splitlines() if line}
+
+
 def test_bundled_skills_directory_has_nothing_but_skills_and_its_readme():
-    entries = sorted(p.name for p in BUNDLED.iterdir() if p.name != "__pycache__")
+    names = [p.name for p in BUNDLED.iterdir()]
+    entries = sorted(set(names) - _git_ignored(names))
     assert entries == ["README.md", "aws-security-group-allowlist", "changelog-entry", "tls-certificate-check"]
 
 

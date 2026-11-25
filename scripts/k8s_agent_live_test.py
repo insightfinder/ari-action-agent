@@ -6,7 +6,8 @@ the fixtures in deploy/k8s-agent-e2e/fixtures.yaml (namespace
 final message's wording, which is an LLM writing for a human.
 
 Not part of `tests/`: every scenario costs real LLM tokens, and the
-`--allow-writes` scenarios change the fixture Deployments. Run by hand
+`--allow-writes` scenarios change the fixture workloads (restart, roll back
+and delete pods of them too). Run by hand
 against the test cluster only, never in CI, and only after the agent and
 fixtures from deploy/k8s-agent-e2e/ are in place.
 
@@ -823,12 +824,197 @@ def scenario_double_approve(args):
         return ok, f"sends={states} final={done['status']['state']} status={result.get('status')} writes={writes} in {elapsed:.0f}s"
 
 
+# ---------------------------------------------------------------- restart, rollback, pod delete (II-25740)
+
+RESTARTED_AT = "kubectl.kubernetes.io/restartedAt"
+
+
+def _object(kind: str, name: str) -> dict | None:
+    try:
+        return json.loads(_kubectl("-n", NAMESPACE, "get", kind, name, "-o", "json"))
+    except subprocess.CalledProcessError:
+        return None
+
+
+def _restarted_at(kind: str, name: str) -> str | None:
+    return ((_object(kind, name) or {})["spec"]["template"]["metadata"].get("annotations") or {}).get(RESTARTED_AT)
+
+
+def _restart(args, kind: str, name: str):
+    """A restart is proposed (nothing to persist), approved, verified, and the template carries the approved
+    restartedAt afterwards; without --allow-writes the dry run must leave the annotation as it was."""
+    before = _restarted_at(kind, name)
+    task, pending = _propose(f"restart the {kind} {name} in namespace {NAMESPACE}")
+    if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending:
+        return False, f"expected a proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
+    shape = (
+        pending.get("action") == "restart_rollout"
+        and (pending.get("target") or {}).get("kind") == kind.capitalize().replace("set", "Set")
+        and (pending.get("persistence") or {}).get("needed") is False
+    )
+    if not args.allow_writes:
+        state = _cancel(task["id"])
+        untouched = _restarted_at(kind, name) == before
+        return (shape and untouched) or False, f"proposal only ({pending.get('action_name')}, {state}); untouched={untouched}"
+    done, elapsed = _approve(task, pending)
+    result = _artifact(done, "action_result") or {}
+    live = _restarted_at(kind, name)
+    ok = shape and result.get("status") == "succeeded" and live == pending.get("restarted_at") and not _leaks(done)
+    return ok, f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} restartedAt={live} :: {pending.get('action_name')}"
+
+
+def scenario_restart_deployment(args):
+    """Rolling restart of e2e-plain: proposed, approved, verified, restartedAt set."""
+    return _restart(args, "deployment", "e2e-plain")
+
+
+def scenario_restart_statefulset(args):
+    """Rolling restart of the StatefulSet e2e-sts (one pod at a time), verified by its controller's status."""
+    return _restart(args, "statefulset", "e2e-sts")
+
+
+def scenario_restart_daemonset(args):
+    """Rolling restart of the DaemonSet e2e-ds (node by node), verified by its controller's status."""
+    return _restart(args, "daemonset", "e2e-ds")
+
+
+def _delete(args, pod: str, same_name: bool):
+    """A pod delete is proposed with its uid; without --allow-writes the pod must still be there with the same
+    uid (the dry run deleted nothing); approved, the old uid is gone and the agent names the replacement."""
+    uid = ((_object("pod", pod) or {}).get("metadata") or {}).get("uid")
+    if not uid:
+        return False, f"pod {pod} not found"
+    task, pending = _propose(f"delete pod {pod} in namespace {NAMESPACE}")
+    if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending:
+        return False, f"expected a proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
+    shape = pending.get("action") == "delete_pod" and pending.get("pod_uid") == uid
+    time.sleep(5)
+    still = ((_object("pod", pod) or {}).get("metadata") or {})
+    dry_run_harmless = still.get("uid") == uid and not still.get("deletionTimestamp")
+    if not args.allow_writes:
+        state = _cancel(task["id"])
+        return (shape and dry_run_harmless) or False, f"proposal only ({state}); pod untouched by the dry run={dry_run_harmless}"
+    done, elapsed = _approve(task, pending)
+    result = _artifact(done, "action_result") or {}
+    now = ((_object("pod", pod) or {}).get("metadata") or {}).get("uid")
+    replacement = (result.get("verification") or {}).get("replacement") or []
+    replaced = now != uid and (pod in replacement if same_name else bool(replacement))
+    ok = shape and dry_run_harmless and result.get("status") == "succeeded" and replaced
+    return ok, f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} replacement={replacement} uid_changed={now != uid}"
+
+
+def scenario_delete_pod(args):
+    """Delete one pod of e2e-plain: the dry run leaves it alone; approved, a new pod replaces it."""
+    pods = json.loads(_kubectl("-n", NAMESPACE, "get", "pods", "-l", "app=e2e-plain", "-o", "json"))["items"]
+    running = sorted(p["metadata"]["name"] for p in pods if p["status"].get("phase") == "Running" and not p["metadata"].get("deletionTimestamp"))
+    if not running:
+        return False, "no running e2e-plain pod"
+    return _delete(args, running[0], same_name=False)
+
+
+def scenario_delete_sts_pod(args):
+    """Delete e2e-sts-1: the StatefulSet brings it back under the same name with a new uid."""
+    return _delete(args, "e2e-sts-1", same_name=True)
+
+
+def _rollback_image() -> str:
+    return _kubectl("-n", NAMESPACE, "get", "deploy", "e2e-rollback", "-o", "jsonpath={.spec.template.spec.containers[0].image}")
+
+
+def _set_rollback_image(image: str) -> None:
+    if _rollback_image() != image:
+        _kubectl("-n", NAMESPACE, "set", "image", "deploy/e2e-rollback", f"app={image}")
+        _kubectl("-n", NAMESPACE, "rollout", "status", "deploy/e2e-rollback", "--timeout=180s")
+
+
+def _rollback(args, prompt_for):
+    """e2e-rollback is put on pause:3.9 (so pause:3.10 is the previous revision), rolled back through the
+    agent, and put back on pause:3.9 with kubectl."""
+    older, newer = "registry.k8s.io/pause:3.10", "registry.k8s.io/pause:3.9"
+    _set_rollback_image(older)
+    _set_rollback_image(newer)
+    try:
+        task, pending = _propose(prompt_for())
+        if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending:
+            return False, f"expected a proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
+        shape = pending.get("action") == "rollback" and (pending.get("images") or {}).get("app") == older and not _leaks(task)
+        if not args.allow_writes:
+            state = _cancel(task["id"])
+            untouched = _rollback_image() == newer
+            return (shape and untouched) or False, f"proposal only ({pending.get('action_name')}, {state}); untouched={untouched}"
+        done, elapsed = _approve(task, pending)
+        result = _artifact(done, "action_result") or {}
+        live = _rollback_image()
+        ok = shape and result.get("status") == "succeeded" and live == older and not _leaks(done)
+        return ok, f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} image={live} :: {pending.get('action_name')}"
+    finally:
+        if args.allow_writes:
+            _set_rollback_image(newer)
+
+
+def scenario_rollback(args):
+    """Roll e2e-rollback back to the previous revision (pause:3.10); the proposal carries images, never the template."""
+    return _rollback(args, lambda: f"roll back the deployment e2e-rollback in namespace {NAMESPACE} to the previous revision")
+
+
+def scenario_rollback_revision(args):
+    """Roll e2e-rollback back to a revision the request states by number."""
+
+    def prompt():
+        sets = json.loads(_kubectl("-n", NAMESPACE, "get", "rs", "-l", "app=e2e-rollback", "-o", "json"))["items"]
+        revision = max(
+            int(rs["metadata"]["annotations"]["deployment.kubernetes.io/revision"])
+            for rs in sets
+            if rs["spec"]["template"]["spec"]["containers"][0]["image"].endswith("pause:3.10")
+        )
+        return f"roll back the deployment e2e-rollback in namespace {NAMESPACE} to revision {revision}"
+
+    return _rollback(args, prompt)
+
+
+def scenario_health_statefulset(_args):
+    """A health check of the StatefulSet e2e-sts covers its own pods only."""
+    task, elapsed = _run(f"check the health of the statefulset e2e-sts in namespace {NAMESPACE}")
+    report = _artifact(task, "health_report") or {}
+    scope = report.get("scope") or {}
+    ok = task["status"]["state"] == "TASK_STATE_COMPLETED" and scope.get("type") == "workload" and scope.get("kind") == "StatefulSet"
+    return ok, f"{task['status']['state']} in {elapsed:.0f}s scope={scope} pods={(report.get('summary') or {}).get('pods')}"
+
+
 # ---------------------------------------------------------------- the installed chart
 
 
 def _split(env: str) -> tuple[str, str] | None:
     value = os.environ.get(env)
     return tuple(value.split("/", 1)) if value and "/" in value else None
+
+
+# What the worker's ServiceAccount must and must not be allowed to do: (verb, resource, scope[, subresource]).
+# tests/test_k8s_live_script.py holds these against docs/examples/k8s-rbac.yaml, so a new rule shows up here.
+RBAC_ALLOWED = [
+    ("list", "deployments.apps", "-A"), ("get", "deployments.apps", f"-n={NAMESPACE}"),
+    ("list", "pods", "-A"), ("get", "pods", f"-n={NAMESPACE}", "log"), ("list", "events", "-A"),
+    ("list", "nodes", ""), ("get", "persistentvolumeclaims", f"-n={NAMESPACE}"),
+    ("list", "scaledobjects.keda.sh", "-A"), ("list", "horizontalpodautoscalers.autoscaling", "-A"),
+    ("list", "poddisruptionbudgets.policy", "-A"), ("list", "pods.metrics.k8s.io", "-A"),
+    ("get", "helmreleases.helm.toolkit.fluxcd.io", "-A"), ("get", "kustomizations.kustomize.toolkit.fluxcd.io", "-A"),
+    ("get", "gitrepositories.source.toolkit.fluxcd.io", "-A"), ("get", "helmrepositories.source.toolkit.fluxcd.io", "-A"),
+    ("get", "configmaps/cluster-autoscaler-status", "-n=kube-system"),
+    ("patch", "deployments.apps", f"-n={NAMESPACE}"), ("patch", "deployments.apps", f"-n={NAMESPACE}", "scale"),
+    ("patch", "horizontalpodautoscalers.autoscaling", f"-n={NAMESPACE}"), ("patch", "scaledobjects.keda.sh", f"-n={NAMESPACE}"),
+    ("patch", "pods", f"-n={NAMESPACE}", "resize"), ("delete", "pods", f"-n={NAMESPACE}"),
+    ("patch", "statefulsets.apps", f"-n={NAMESPACE}"), ("patch", "daemonsets.apps", f"-n={NAMESPACE}"),
+    ("list", "replicasets.apps", "-A"), ("list", "statefulsets.apps", "-A"), ("list", "daemonsets.apps", "-A"),
+]
+RBAC_DENIED = [
+    ("get", "secrets", f"-n={NAMESPACE}"), ("list", "secrets", "-A"), ("create", "pods", f"-n={NAMESPACE}", "exec"),
+    ("create", "pods", f"-n={NAMESPACE}"), ("patch", "pods", f"-n={NAMESPACE}"), ("delete", "deployments.apps", f"-n={NAMESPACE}"),
+    ("update", "deployments.apps", f"-n={NAMESPACE}"), ("create", "deployments.apps", f"-n={NAMESPACE}"),
+    ("get", "configmaps/coredns", "-n=kube-system"), ("list", "configmaps", "-n=kube-system"),
+    ("create", "clusterrolebindings.rbac.authorization.k8s.io", ""), ("patch", "clusterroles.rbac.authorization.k8s.io", ""),
+    ("delete", "statefulsets.apps", f"-n={NAMESPACE}"), ("create", "pods", f"-n={NAMESPACE}", "eviction"),
+    ("watch", "pods", "-A"), ("list", "configmaps", "-A"),
+]
 
 
 def scenario_rbac(_args):
@@ -839,28 +1025,6 @@ def scenario_rbac(_args):
     namespace, deployment = worker
     sa = _kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.template.spec.serviceAccountName}")
     who = f"--as=system:serviceaccount:{namespace}:{sa}"
-    allowed = [
-        ("list", "deployments.apps", "-A"), ("get", "deployments.apps", f"-n={NAMESPACE}"),
-        ("list", "pods", "-A"), ("get", "pods", f"-n={NAMESPACE}", "log"), ("list", "events", "-A"),
-        ("list", "nodes", ""), ("get", "persistentvolumeclaims", f"-n={NAMESPACE}"),
-        ("list", "scaledobjects.keda.sh", "-A"), ("list", "horizontalpodautoscalers.autoscaling", "-A"),
-        ("list", "poddisruptionbudgets.policy", "-A"), ("list", "pods.metrics.k8s.io", "-A"),
-        ("get", "helmreleases.helm.toolkit.fluxcd.io", "-A"), ("get", "kustomizations.kustomize.toolkit.fluxcd.io", "-A"),
-        ("get", "gitrepositories.source.toolkit.fluxcd.io", "-A"), ("get", "helmrepositories.source.toolkit.fluxcd.io", "-A"),
-        ("get", "configmaps/cluster-autoscaler-status", "-n=kube-system"),
-        ("patch", "deployments.apps", f"-n={NAMESPACE}"), ("patch", "deployments.apps", f"-n={NAMESPACE}", "scale"),
-        ("patch", "horizontalpodautoscalers.autoscaling", f"-n={NAMESPACE}"), ("patch", "scaledobjects.keda.sh", f"-n={NAMESPACE}"),
-    ]
-    denied = [
-        ("get", "secrets", f"-n={NAMESPACE}"), ("list", "secrets", "-A"), ("create", "pods", f"-n={NAMESPACE}", "exec"),
-        ("create", "pods", f"-n={NAMESPACE}"), ("delete", "pods", f"-n={NAMESPACE}"), ("delete", "deployments.apps", f"-n={NAMESPACE}"),
-        ("update", "deployments.apps", f"-n={NAMESPACE}"), ("create", "deployments.apps", f"-n={NAMESPACE}"),
-        ("get", "configmaps/coredns", "-n=kube-system"), ("list", "configmaps", "-n=kube-system"),
-        ("create", "clusterrolebindings.rbac.authorization.k8s.io", ""), ("patch", "clusterroles.rbac.authorization.k8s.io", ""),
-        ("patch", "daemonsets.apps", f"-n={NAMESPACE}"), ("patch", "statefulsets.apps", f"-n={NAMESPACE}"),
-        ("watch", "pods", "-A"), ("list", "replicasets.apps", "-A"),
-    ]
-
     def can(verb, resource, scope, subresource=""):
         context = os.environ.get("KUBE_CONTEXT")
         cmd = [
@@ -872,8 +1036,8 @@ def scenario_rbac(_args):
     def name(entry):
         return f"{entry[0]} {entry[1]}" + (f"/{entry[3]}" if len(entry) > 3 else "")
 
-    missing = [name(e) for e in allowed if not can(*e)]
-    extra = [name(e) for e in denied if can(*e)]
+    missing = [name(e) for e in RBAC_ALLOWED if not can(*e)]
+    extra = [name(e) for e in RBAC_DENIED if can(*e)]
     return not missing and not extra, f"sa={sa} missing={missing} unexpectedly_allowed={extra}"
 
 
@@ -932,6 +1096,14 @@ SCENARIOS = {
     "gate_stale": scenario_gate_stale,
     "gate_replay": scenario_gate_replay,
     "double_approve": scenario_double_approve,
+    "health_statefulset": scenario_health_statefulset,
+    "restart_deployment": scenario_restart_deployment,
+    "restart_statefulset": scenario_restart_statefulset,
+    "restart_daemonset": scenario_restart_daemonset,
+    "delete_pod": scenario_delete_pod,
+    "delete_sts_pod": scenario_delete_sts_pod,
+    "rollback": scenario_rollback,
+    "rollback_revision": scenario_rollback_revision,
     "worker_restart": scenario_worker_restart,
     "resume_after_restart": scenario_resume_after_restart,
 }
