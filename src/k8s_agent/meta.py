@@ -48,8 +48,8 @@ META = AgentMeta(
         "CPU/memory — of a Deployment (rolls its pods) or of one running pod in place (no rollout, where the "
         "cluster supports in-place pod resize) —, restarts Deployments, StatefulSets and DaemonSets, rolls a "
         "Deployment back to an earlier revision, deletes a single pod for its controller to replace, changes a "
-        "container's image, pauses and resumes a Deployment's rollouts, suspends or resumes a CronJob, and cordons, uncordons "
-        "or drains a node — every "
+        "container's image, pauses and resumes a Deployment's rollouts, and suspends or resumes a CronJob — "
+        "every "
         "change proposed first and applied only after a person approves it. Deployments "
         "managed by KEDA or an HPA are scaled only through their autoscaler's min/max, and only on explicit "
         "request; CPU/memory change only on explicit request, capped by real node capacity."
@@ -68,9 +68,8 @@ META = AgentMeta(
             "only for containers whose resizePolicy restarts them); a rolling restart of a Deployment, StatefulSet "
             "or DaemonSet; a Deployment rollback to the previous (or a stated) revision; deleting one named pod "
             "that its Deployment, StatefulSet or DaemonSet replaces; a container's image; pausing or resuming a "
-            "Deployment's rollouts; suspending or resuming a CronJob; cordoning, uncordoning or draining a node (named "
-            "in the request). Restart, rollback, delete, "
-            "image, pause/resume, CronJob and node changes only when the request asks for them. Never scales anything "
+            "Deployment's rollouts; suspending or resuming a CronJob. Restart, rollback, delete, "
+            "image, pause/resume and CronJob changes only when the request asks for them. Never scales anything "
             "below 1 replica."
         ),
         tags=["kubernetes", "health", "scaling", "keda", "hpa", "restart", "rollback", "image", "cronjob"],
@@ -85,10 +84,9 @@ META = AgentMeta(
             "delete pod checkout-7d9f5c6b8-x2k4q",
             "set the image of the checkout deployment to registry.example.com/checkout:1.4.2",
             "suspend the nightly-report cronjob",
-            "drain node ip-10-1-21-112",
         ],
     ),
-    planner_description="Kubernetes agent that checks cluster health and changes workloads (scale, resources, restart, rollback, delete a pod, image, pause/resume, CronJob suspend/resume, node cordon/uncordon/drain)",
+    planner_description="Kubernetes agent that checks cluster health and changes workloads (scale, resources, restart, rollback, delete a pod, image, pause/resume, CronJob suspend/resume)",
     planner_domain_guidance="""Requests are either a listing question, a health question, a change, or a plain question.
 - A listing question ("list / show / which / table of ...": all pods with their CPU/memory limits and usage, \
 Deployments, nodes, events, PVCs, ...): plan "query_resources" alone (no "find_workload"); pass a namespace the \
@@ -98,7 +96,7 @@ everything of some kind rather than what is wrong.
 plan "find_workload" then "check_health". Read-only; never needs approval.
 - A change (scale a Deployment, change its KEDA/HPA min or max, change CPU/memory of a Deployment or, in place, \
 of one pod, restart a Deployment/StatefulSet/DaemonSet, roll a Deployment back, delete a pod, set an image, pause or \
-resume a Deployment's rollouts, suspend or resume a CronJob, cordon, uncordon or drain a node): plan \
+resume a Deployment's rollouts, suspend or resume a CronJob): plan \
 "find_workload" then "propose_change". "propose_change" works out and checks the exact change and pauses for a person's approval; \
 it decides itself whether the request is explicit enough and refuses otherwise — do not try to pre-judge that.
 - **NEVER schedule "apply_approved_change".** It runs only after a person approves a proposal, through a \
@@ -137,8 +135,7 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "watched, or container failing after the resize — and that the Deployment template still has the old "
         "values until the change is made in Git; for a rollback, reverted means the newer version came back "
         "(image automation or a Helm upgrade), and the same for an image change; for a deleted pod, which pod "
-        "replaced it; for a drain, the pods evicted, any a disruption budget still holds back (drain incomplete: "
-        "nothing was forced) and that the node stays cordoned until uncordoned — "
+        "replaced it — "
         "plus the drift notice and persistence hint (when it says nothing needs persisting, say so in one line). "
         "For a refusal: "
         "the reason, the current values it reports, and what an acceptable request would look like; a refusal means "

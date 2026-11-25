@@ -63,8 +63,7 @@ capabilities:
       a Deployment, StatefulSet or DaemonSet, a Deployment rollback to an
       earlier revision, deleting one pod a workload controller replaces, a
       container's image, pausing or resuming a Deployment's rollouts,
-      suspending or resuming a CronJob, or cordoning, uncordoning or
-      draining a node.
+      or suspending or resuming a CronJob.
       Actions without a stated value only when the request itself asks for
       them. Works out the exact change,
       checks it (autoscaler rules, replica floor of 1, node-capacity cap,
@@ -85,8 +84,6 @@ capabilities:
       - get_pod
       - get_resize_support
       - get_workload
-      - get_node
-      - list_pods_on_node
       - list_replicasets
       - dry_run_patch
     retry:
@@ -105,8 +102,7 @@ capabilities:
       reports as applied on the same pod; for a deleted pod, its replacement
       ready and stable; for a paused or resumed Deployment, the
       controller's own report; for a suspended or resumed CronJob, that
-      the value holds; for a node, that the value holds or that no pod a
-      drain evicts is left on it). Never planned directly — reachable only through
+      the value holds). Never planned directly — reachable only through
       the approval of a propose_change proposal.
     tools:
       - get_deployment
@@ -124,11 +120,6 @@ capabilities:
       - wait_workload_rollout
       - wait_paused
       - wait_cronjob_suspend
-      - wait_node_schedulable
-      - wait_drain
-      - get_node
-      - list_pods_on_node
-      - list_pdbs
       - get_flux_chain
     # A second attempt (the worker died, or a read failed, mid-step) finds the
     # approved values already in place and verifies instead of writing again.

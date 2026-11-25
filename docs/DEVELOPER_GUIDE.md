@@ -530,8 +530,8 @@ a request never carries cluster credentials.
   - without a stated number, and only when the request's own words ask for
     it (decided in code): a rolling restart, a rollback, deleting one pod,
     a container's image (the image or tag written in the request), pausing
-    or resuming a Deployment's rollouts, suspending or resuming a CronJob,
-    and cordoning, uncordoning or draining a node. Full list:
+    or resuming a Deployment's rollouts, and suspending or resuming a
+    CronJob. Full list:
     docs/K8S_AGENT_INTERFACE.md, "Action names".
 
   Never below 1 replica. Targets above `options.high_replica_threshold`
@@ -570,8 +570,7 @@ are `a2a-task:k8s`, `plan_task`, one `capability:<name>` per step (`check_health
    `action` (`scale_replicas` | `set_autoscaler_bounds` | `set_resources` |
    `resize_pod` | `restart_rollout` | `rollback` | `delete_pod` |
    `set_image` | `pause_rollout` | `resume_rollout` | `suspend_cronjob` |
-   `resume_cronjob` | `cordon_node` | `uncordon_node` | `drain_node`, see
-   docs/K8S_AGENT_INTERFACE.md;
+   `resume_cronjob`, see docs/K8S_AGENT_INTERFACE.md;
    every action that takes no stated number (a restart, rollback, pod
    delete, image, pause/resume, CronJob change) is proposed only when the
    request's own words ask for it),
@@ -651,8 +650,7 @@ including a code agent the on-call coordinator calls next:
 Worker image `ari-k8s-agent-worker` (`Dockerfile.k8s`, no shell tooling),
 API image `ari-agent-api` with `AGENT_KIND=k8s`. RBAC:
 `docs/examples/k8s-rbac.yaml` (enumerated, no Secrets, no exec, no
-create except pod evictions, no delete except pods, and node patches the
-code limits to cordon/uncordon). Set `TEMPORAL_PAYLOAD_ENCRYPTION_KEY` so request LLM keys
+create, and no delete except pods). Set `TEMPORAL_PAYLOAD_ENCRYPTION_KEY` so request LLM keys
 are encrypted in Temporal history. A temporary test-cluster deployment
 and fixtures: `deploy/k8s-agent-e2e/`; live scenarios:
 `scripts/k8s_agent_live_test.py`; sample client:

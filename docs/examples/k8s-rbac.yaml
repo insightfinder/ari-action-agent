@@ -98,15 +98,6 @@ rules:
   - apiGroups: ["batch"]
     resources: [cronjobs]
     verbs: [patch]
-  # Cordoning a node. RBAC cannot narrow this to spec.unschedulable; the
-  # agent's code never changes a node's labels or taints.
-  - apiGroups: [""]
-    resources: [nodes]
-    verbs: [patch]
-  # Draining a node: evictions honour PodDisruptionBudgets.
-  - apiGroups: [""]
-    resources: [pods/eviction]
-    verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

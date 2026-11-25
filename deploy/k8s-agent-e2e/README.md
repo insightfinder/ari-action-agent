@@ -89,15 +89,6 @@ to `pause:3.9` and kubectl puts `pause:3.10` back; `pause_resume` pauses
 and has the agent resume it (the waiting change then rolls out). The CronJob
 changes need chart 0.3.16 (`patch` on cronjobs).
 
-Node scenarios (`cordon_uncordon`, `drain`) change a real node, so on a shared
-cluster run them only with the owner's go-ahead. They pick the ready,
-schedulable node with the fewest pods outside `ari-k8s-e2e` that runs neither
-the agent nor Temporal as a suggestion, but with `--allow-writes` they run only
-on the node named in `E2E_NODE` (agreed beforehand), and kubectl uncordons it
-afterwards.
-A drain moves every non-DaemonSet pod on that node, other teams' included.
-They need chart 0.3.17 (`patch` on nodes, `create` on pods/eviction).
-
 `tests/test_k8s_live_script.py` keeps the script honest without a cluster:
 the RBAC the `rbac` scenario expects must match `docs/examples/k8s-rbac.yaml`,
 and the fixtures the scenarios name must exist here.

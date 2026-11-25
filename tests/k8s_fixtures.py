@@ -334,9 +334,6 @@ class FakeClient:
         self.deletes: list[dict] = []
         # When set, a real pod delete is followed at once by the controller's ready replacement.
         self.auto_replace = False
-        # Evictions: every call, and how the API answers some pods (name -> HTTP status, e.g. 429 for a budget).
-        self.evictions: list[dict] = []
-        self.eviction_answers: dict[str, int] = {}
         # What discovery and /version answer.
         self.resize_supported = True
         self.server_git_version = "v1.36.5-eks-91f89a9"
@@ -459,23 +456,6 @@ class FakeClient:
             if self.auto_replace and kind == "Pod":
                 self._replace_pod(obj)
         return result
-
-    async def create(self, kind, namespace, body, dry_run, name=None, subresource=None):
-        if kind != "Pod" or subresource != "eviction":
-            raise AssertionError(f"unexpected create of {kind}/{subresource}")
-        pod = self._find("Pod", name, namespace)
-        options = body.get("deleteOptions") or {}
-        self.evictions.append({"pod": f"{namespace}/{name}", "dry_run": dry_run, "body_dry_run": options.get("dryRun")})
-        if pod is None:
-            raise _not_found("Pod", name)
-        status = self.eviction_answers.get(name)
-        if status:
-            raise api_error(status, f"eviction of {name} answered {status}", "TooManyRequests" if status == 429 else "Error")
-        if (options.get("preconditions") or {}).get("uid") not in (None, pod["metadata"].get("uid")):
-            raise api_error(409, "the UID in the precondition does not match", "Conflict")
-        if not dry_run:
-            self.objects["Pod"].remove(pod)
-        return {"kind": "Status", "status": "Success", "code": 201}
 
     def _replace_pod(self, old: dict) -> None:
         """The controller creates a ready replacement at once: same name for a StatefulSet's pod, a new name

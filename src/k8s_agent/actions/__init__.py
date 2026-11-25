@@ -3,7 +3,6 @@
 from .base import ActionSpec, Operation, target_of
 from .cronjob import ResumeCronJob, SuspendCronJob
 from .delete_pod import DeletePod
-from .node import CordonNode, DrainNode, UncordonNode
 from .pause_rollout import PauseRollout, ResumeRollout
 from .resize_pod import ResizePod
 from .restart_rollout import RestartRollout
@@ -29,9 +28,6 @@ REGISTRY: dict[str, ActionSpec] = {
         ResumeRollout(),
         SuspendCronJob(),
         ResumeCronJob(),
-        CordonNode(),
-        UncordonNode(),
-        DrainNode(),
     )
 }
 ACTIONS = tuple(REGISTRY)

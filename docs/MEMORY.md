@@ -5779,3 +5779,20 @@ User: one phase at a time; node operations may be tested live on test. New `acti
   and changed nothing (still schedulable, every pod still there); as the ServiceAccount (chart 0.3.16) both
   answered 403 on `patch nodes`, which the proposal turns into the RBAC refusal. Not run yet: the real cordon and
   drain (need this image and chart 0.3.17, and the user's go-ahead on the node).
+
+**Node actions removed (user decision, 2026-11-25).** Before the live run the user asked about the `patch nodes`
+grant (RBAC cannot narrow it to `spec.unschedulable`, so labels and taints, on the Never list, would be allowed
+too). Options offered: a default-off chart flag plus a ValidatingAdmissionPolicy limiting the ServiceAccount's
+node updates to `spec.unschedulable`, or dropping the node actions. Recommended and chosen: drop them — on EKS with
+Cluster Autoscaler and spot nodes a bad node is usually replaced (instance termination, which the agent cannot
+do) rather than drained; a drain here stops several single-replica (mostly Recreate) services at once; and the
+grant needs extra machinery to be safe. The code stays in commit `80cd84c`. Removed: `actions/node.py`,
+`ActionSpec.executes_itself`/`execute`, `wait_node_schedulable`/`wait_drain`, the node intent gates, the drain
+helpers in governance, the pod-view fields only a drain used, the verifier budget change, the node branches of
+propose/apply, the RBAC rules (example manifest; the live script's `rbac` again expects `patch nodes` and
+`create pods/eviction` denied), the `cordon_uncordon`/`drain` scenarios and their tests. The charts branch
+`II-25740-k8s-agent-node-actions` (0.3.17, commit `6c65c53`, never pushed) is not needed. Kept, read-only:
+`find_workload` resolves a node the request names when no workload matches (or only the whole cluster), and
+`check_health` has a node scope (`get_node`, `list_pods_on_node`, `NotReady`/`Cordoned` findings);
+`propose_change` refuses a node target. The Never list now says nodes are not changed at all, with the reasons.
+No node was ever cordoned or drained on test (dry runs only). Suite on 3.12: 1280 passed, 11 skipped.

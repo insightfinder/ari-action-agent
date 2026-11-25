@@ -115,14 +115,6 @@ tools:
     module: k8s_agent.tools.rollout
     function: wait_paused
 
-  wait_node_schedulable:  # a node's spec.unschedulable holds (cordon / uncordon)
-    module: k8s_agent.tools.rollout
-    function: wait_node_schedulable
-
-  wait_drain:           # no pod a drain evicts is left on the node
-    module: k8s_agent.tools.rollout
-    function: wait_drain
-
   wait_cronjob_suspend: # a CronJob's spec.suspend holds
     module: k8s_agent.tools.rollout
     function: wait_cronjob_suspend
@@ -132,6 +124,6 @@ tools:
     module: k8s_agent.tools.write
     function: dry_run_patch
 
-  patch_workload:       # the real write (patch, a pod delete, a drain's evictions); listed only on apply_approved_change
+  patch_workload:       # the real write (patch, or a pod delete); listed only on apply_approved_change
     module: k8s_agent.tools.write
     function: patch_workload

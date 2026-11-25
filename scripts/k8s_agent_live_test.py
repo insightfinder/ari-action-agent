@@ -1080,122 +1080,6 @@ def scenario_health_cronjob(_args):
     return ok, f"{task['status']['state']} in {elapsed:.0f}s scope={scope} pods={(report.get('summary') or {}).get('pods')}"
 
 
-# ---------------------------------------------------------------- nodes (II-25740)
-
-# Pods whose eviction would break the run itself: the agent, its port-forwarded API, Temporal.
-_KEEP_OFF = ("ari-k8s-", "temporal")
-
-
-def _pods_by_node() -> dict:
-    pods = json.loads(_kubectl("get", "pods", "-A", "-o", "json"))["items"]
-    by_node: dict = {}
-    for p in pods:
-        node = p["spec"].get("nodeName")
-        if node and p["status"].get("phase") not in ("Succeeded", "Failed"):
-            by_node.setdefault(node, []).append(p)
-    return by_node
-
-
-def _test_node() -> tuple[str | None, str]:
-    """The node the node scenarios use: E2E_NODE if set, else the ready, schedulable node with the fewest pods
-    outside ari-k8s-e2e (DaemonSet pods not counted), never one running the agent or Temporal."""
-    by_node = _pods_by_node()
-    if os.environ.get("E2E_NODE"):
-        return os.environ["E2E_NODE"], "E2E_NODE"
-    def others(node):
-        return [p for p in by_node[node] if p["metadata"]["namespace"] != NAMESPACE
-                and (p["metadata"].get("ownerReferences") or [{}])[0].get("kind") != "DaemonSet"]
-    candidates = []
-    for node, pods in by_node.items():
-        if any(p["metadata"]["name"].startswith(_KEEP_OFF) for p in pods):
-            continue
-        if _node_field(node, "{.spec.unschedulable}") == "true":
-            continue
-        candidates.append((len(others(node)), node))
-    if not candidates:
-        return None, "every node runs the agent or Temporal, or is cordoned"
-    count, node = min(candidates)
-    return node, f"{count} pod(s) of other namespaces on it"
-
-
-def _node_field(node: str, path: str) -> str | None:
-    try:
-        return _kubectl("get", "node", node, "-o", f"jsonpath={path}")
-    except subprocess.CalledProcessError:
-        return None  # removed (Cluster Autoscaler)
-
-
-def _node_for(args) -> tuple[str | None, str]:
-    """A write changes a real node, so it runs only on the node someone named (E2E_NODE), never on one picked
-    here: the pick can change between the go-ahead and the run. Without --allow-writes the pick is used."""
-    node, why = _test_node()
-    if args.allow_writes and not os.environ.get("E2E_NODE"):
-        return None, f"set E2E_NODE to the node agreed with the cluster owner (suggested: {node}, {why})"
-    return node, why
-
-
-def _uncordon(node: str) -> None:
-    if _node_field(node, "{.spec.unschedulable}") == "true":
-        _kubectl("uncordon", node)
-
-
-def scenario_cordon_uncordon(args):
-    """Cordon the test node through the agent (the dry run leaves it schedulable), then uncordon it."""
-    node, why = _node_for(args)
-    if not node:
-        return False, why
-    try:
-        ok, _, result, note = _round_trip(args, f"cordon node {node}", "cordon_node")
-        if not ok:
-            untouched = None if ok is False else _node_field(node, "{.spec.unschedulable}") != "true"
-            return (ok if ok is False else (untouched or False)), f"{node} ({why}): {note}; untouched={untouched}"
-        cordoned = result.get("status") == "succeeded" and _node_field(node, "{.spec.unschedulable}") == "true"
-        ok2, _, result2, note2 = _round_trip(args, f"uncordon node {node}", "uncordon_node")
-        uncordoned = bool(ok2) and result2.get("status") == "succeeded" and _node_field(node, "{.spec.unschedulable}") != "true"
-        return cordoned and uncordoned, f"{node} ({why}): {note}; cordoned={cordoned}; {note2}; uncordoned={uncordoned}"
-    finally:
-        if args.allow_writes:
-            _uncordon(node)
-
-
-def scenario_drain(args):
-    """Drain the test node through the agent: the dry run evicts nothing; approved, only DaemonSet and mirror
-    pods are left on it and the e2e pods run elsewhere. kubectl uncordons it afterwards."""
-    node, why = _node_for(args)
-    if not node:
-        return False, why
-    before = {p["metadata"]["uid"] for p in _pods_by_node().get(node, [])}
-    try:
-        task, pending = _propose(f"drain node {node}")
-        if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending or pending.get("action") != "drain_node":
-            return False, f"{node}: expected a drain_node proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
-        time.sleep(5)
-        # Nothing evicted by the dry run: the node is still schedulable and no pod seen before the proposal is
-        # being deleted (a pod gone entirely may be ordinary churn on a busy cluster, so that is not counted).
-        deleting = [p for p in _pods_by_node().get(node, []) if p["metadata"]["uid"] in before and p["metadata"].get("deletionTimestamp")]
-        dry_run_harmless = _node_field(node, "{.spec.unschedulable}") != "true" and not deleting
-        note = f"{node} ({why}): {pending.get('action_name')} tier={pending.get('risk_tier')}"
-        if not args.allow_writes:
-            return (dry_run_harmless or False), f"{note}; proposal only ({_cancel(task['id'])}); dry run harmless={dry_run_harmless}"
-        done, elapsed = _approve(task, pending)
-        result = _artifact(done, "action_result") or {}
-        left = [
-            p for p in _pods_by_node().get(node, [])
-            if (p["metadata"].get("ownerReferences") or [{}])[0].get("kind") != "DaemonSet"
-            and "kubernetes.io/config.mirror" not in (p["metadata"].get("annotations") or {})
-            and not p["metadata"].get("deletionTimestamp")
-        ]
-        applied = result.get("applied") or {}
-        ok = dry_run_harmless and result.get("status") in ("succeeded", "node_gone") and not left and not _leaks(done)
-        return ok, (
-            f"{note}; {done['status']['state']} in {elapsed:.0f}s status={result.get('status')} evicted={len(applied.get('evicted') or [])} "
-            f"blocked={applied.get('blocked')} failed={len(applied.get('failed') or [])} left={[p['metadata']['name'] for p in left][:5]}"
-        )
-    finally:
-        if args.allow_writes:
-            _uncordon(node)
-
-
 # ---------------------------------------------------------------- the installed chart
 
 
@@ -1222,7 +1106,6 @@ RBAC_ALLOWED = [
     ("list", "replicasets.apps", "-A"), ("list", "statefulsets.apps", "-A"), ("list", "daemonsets.apps", "-A"),
     ("list", "cronjobs.batch", "-A"), ("get", "jobs.batch", f"-n={NAMESPACE}"),
     ("patch", "cronjobs.batch", f"-n={NAMESPACE}"),
-    ("patch", "nodes", ""), ("create", "pods", f"-n={NAMESPACE}", "eviction"),
 ]
 RBAC_DENIED = [
     ("get", "secrets", f"-n={NAMESPACE}"), ("list", "secrets", "-A"), ("create", "pods", f"-n={NAMESPACE}", "exec"),
@@ -1230,7 +1113,7 @@ RBAC_DENIED = [
     ("update", "deployments.apps", f"-n={NAMESPACE}"), ("create", "deployments.apps", f"-n={NAMESPACE}"),
     ("get", "configmaps/coredns", "-n=kube-system"), ("list", "configmaps", "-n=kube-system"),
     ("create", "clusterrolebindings.rbac.authorization.k8s.io", ""), ("patch", "clusterroles.rbac.authorization.k8s.io", ""),
-    ("delete", "statefulsets.apps", f"-n={NAMESPACE}"), ("delete", "nodes", ""),
+    ("delete", "statefulsets.apps", f"-n={NAMESPACE}"), ("create", "pods", f"-n={NAMESPACE}", "eviction"),
     ("watch", "pods", "-A"), ("list", "configmaps", "-A"),
     ("create", "jobs.batch", f"-n={NAMESPACE}"), ("delete", "jobs.batch", f"-n={NAMESPACE}"), ("patch", "jobs.batch", f"-n={NAMESPACE}"),
     ("create", "cronjobs.batch", f"-n={NAMESPACE}"),
@@ -1329,8 +1212,6 @@ SCENARIOS = {
     "pause_resume": scenario_pause_resume,
     "health_cronjob": scenario_health_cronjob,
     "suspend_resume_cronjob": scenario_suspend_resume_cronjob,
-    "cordon_uncordon": scenario_cordon_uncordon,
-    "drain": scenario_drain,
     "worker_restart": scenario_worker_restart,
     "resume_after_restart": scenario_resume_after_restart,
 }

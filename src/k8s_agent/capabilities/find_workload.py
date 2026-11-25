@@ -11,11 +11,10 @@ A Deployment resolves to `{"scope": "deployment", namespace, name}`, as it
 always has; a StatefulSet, DaemonSet or CronJob to `{"scope": "workload",
 "kind", namespace, name}` (II-25740). A node named verbatim (its full name or
 the part before the first dot, e.g. `ip-10-1-21-112`) resolves to
-`{"scope": "node", "kind": "Node", "name"}` when a sentence of the request
-asks for a node action (cordon, uncordon, drain) and names that node or says
-"node"; otherwise only when the usual resolution finds no workload (or only
-the whole cluster). On-call prompts quote node names from findings while
-asking about a workload, and "drain the queue" is not about a node.
+`{"scope": "node", "kind": "Node", "name"}` only when the usual resolution
+finds no workload (or only the whole cluster): on-call prompts quote node names
+from findings while asking about a workload. A node is only ever looked at
+(check_health); this agent does not change nodes.
 """
 
 import json
@@ -25,7 +24,6 @@ from common.capabilities_base import StepContext
 from common.llm_json import extract
 
 from ..stepkit import finish, options
-from ..tools import policy
 
 _SENTINEL = "RESOLUTION_JSON:"
 _MAX_CANDIDATES = 300
@@ -150,23 +148,6 @@ def _nodes_mentioned(prompt: str, nodes: list[dict]) -> list[dict]:
     return hits
 
 
-_SENTENCE_END = re.compile(r"[.!?;。！？；\n](?=\s|$)|[。！？；\n]")
-
-
-def _asks_node_action(prompt: str, node: dict) -> bool:
-    """A sentence that asks for a node action and is about this node (its name, or the word node / 节点)."""
-    name = (node.get("name") or "").lower()
-    forms = {name, name.split(".", 1)[0]}
-    for sentence in _SENTENCE_END.split(prompt or ""):
-        text = sentence.lower()
-        about_node = re.search(r"\bnodes?\b|节点", text) or any(
-            re.search(rf"(?<![\w.-]){re.escape(form)}(?![\w-]|\.\w)", text) for form in forms if form
-        )
-        if about_node and policy.asks_node_change(sentence):
-            return True
-    return False
-
-
 def _node_resolution(node: dict, reasoning: str) -> dict:
     return finish(
         {"resolution": {"scope": "node", "kind": "Node", "namespace": None, "name": node["name"]}, "candidates": [], "reasoning": reasoning}
@@ -182,8 +163,6 @@ async def run(ctx: StepContext) -> dict:
     hits = _prefer_namespace(_mentioned(ctx.prompt, workloads) or _pods_mentioned(ctx.prompt, workloads), ctx.prompt, default_ns)
     nodes = _nodes_mentioned(ctx.prompt, await ctx.tool("list_nodes")())
     node = nodes[0] if len(nodes) == 1 else None
-    if node and _asks_node_action(ctx.prompt, node):
-        return _node_resolution(node, "the request asks for a node action on a node it names")
     # One workload named verbatim settles it without the model, unless the prompt uses that name for a
     # namespace: "the pods in the cert-manager namespace" is not about the cert-manager Deployment alone.
     if len(hits) == 1 and not (hits[0]["name"] in namespaces and _names_namespace(ctx.prompt, hits[0]["name"])):
