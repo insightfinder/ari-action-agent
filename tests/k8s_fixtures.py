@@ -137,6 +137,7 @@ def node(name, cpu="8", memory="32Gi", labels=None, taints=None, ready=True, ins
     return {
         "metadata": {
             "name": name,
+            "uid": f"uid-{name}",
             "labels": {"node.kubernetes.io/instance-type": instance_type, **(labels or {})},
         },
         "spec": {"taints": taints or []},
@@ -308,6 +309,8 @@ def _matches_fields(obj: dict, selector: str | None) -> bool:
         if key == "type" and obj.get("type") != value:
             return False
         if key == "involvedObject.name" and (obj.get("involvedObject") or {}).get("name") != value:
+            return False
+        if key == "spec.nodeName" and (obj.get("spec") or {}).get("nodeName") != value:
             return False
     return True
 

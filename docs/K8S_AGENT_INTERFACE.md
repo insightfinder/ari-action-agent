@@ -166,9 +166,15 @@ batch 1; a refusal carries `asked_for`).
 - RBAC (oncallari chart 0.3.16): `patch` on `cronjobs` (batch). Before it, both CronJob changes are refused
   with the missing rule named; the other batch 2 actions need no new rule.
 
+Nodes (II-25740): read only. `find_workload` resolves `{"scope": "node", "kind": "Node", "namespace": null,
+"name"}` for a node the request writes out (its full name or the part before the first dot), only when no
+workload matches (on-call prompts quote node names while asking about a workload); `check_health` of a node
+covers the pods on it and reports `NotReady` (warning) and `Cordoned` (info), so `health_report.scope.type` can
+now be `node` (with `kind: "Node"`, `name`, `namespace` null). `propose_change` refuses any change to a node.
+`cordon_node`, `uncordon_node` and `drain_node` were built and declined by the user on 2026-11-25 (see "Never").
+
 Planned under II-25740 (not built yet), in this order:
-- `cordon_node`, `uncordon_node`, `drain_node`, StatefulSet replica scaling, and `batch` (one approval for the
-  same change on several targets).
+- StatefulSet replica scaling, and `batch` (one approval for the same change on several targets).
 - Added 2026-11-24 (user decision), in this order: `flux_reconcile` (set `reconcile.fluxcd.io/requestedAt` on a
   HelmRelease or Kustomization so a merged fix applies now; changes no desired state, tier `low`);
   `resize_pod` for StatefulSet pods (same rules as for Deployment pods; persistence hint points at the
@@ -195,8 +201,11 @@ Not to be added. A change to this list is a decision of its own, recorded here a
   now"): considered as `trigger_cronjob` and declined by the user on 2026-11-25.
 - Changing the content of Services, Ingresses, NetworkPolicies or ConfigMaps: networking and configuration
   change through Git.
-- Deleting nodes, or changing node labels or taints (node groups and Cluster Autoscaler own them; cordon,
-  uncordon and drain are the node actions).
+- Changing nodes at all: deleting them, their labels or taints, and also cordon, uncordon and drain. The three
+  were planned, built (commit `80cd84c`) and declined by the user on 2026-11-25: on EKS with Cluster Autoscaler
+  and spot nodes a bad node is usually replaced rather than drained, a drain on these clusters stops several
+  single-replica services at once, and `patch` on nodes cannot be narrowed by RBAC to `spec.unschedulable`.
+  Node groups, Cluster Autoscaler and people with kubectl own nodes.
 - Rolling back a HelmRelease (Flux upgrades it again; revert in Git, or roll back the Deployment).
 - Writing any custom resource other than a KEDA ScaledObject's min/max (and the Flux reconcile annotation
   above).

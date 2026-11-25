@@ -9,7 +9,12 @@ returned instead of a guess — a wrong target becomes a wrong proposal.
 
 A Deployment resolves to `{"scope": "deployment", namespace, name}`, as it
 always has; a StatefulSet, DaemonSet or CronJob to `{"scope": "workload",
-"kind", namespace, name}` (II-25740).
+"kind", namespace, name}` (II-25740). A node named verbatim (its full name or
+the part before the first dot, e.g. `ip-10-1-21-112`) resolves to
+`{"scope": "node", "kind": "Node", "name"}` only when the usual resolution
+finds no workload (or only the whole cluster): on-call prompts quote node names
+from findings while asking about a workload. A node is only ever looked at
+(check_health); this agent does not change nodes.
 """
 
 import json
@@ -132,6 +137,23 @@ def _shortlist(prompt: str, deployments: list[dict], default_ns: str | None) -> 
     return shortlist
 
 
+def _nodes_mentioned(prompt: str, nodes: list[dict]) -> list[dict]:
+    text = prompt.lower()
+    hits = []
+    for n in nodes:
+        name = (n.get("name") or "").lower()
+        short = name.split(".", 1)[0]
+        if name and any(re.search(rf"(?<![\w.-]){re.escape(form)}(?![\w-]|\.\w)", text) for form in {name, short}):
+            hits.append(n)
+    return hits
+
+
+def _node_resolution(node: dict, reasoning: str) -> dict:
+    return finish(
+        {"resolution": {"scope": "node", "kind": "Node", "namespace": None, "name": node["name"]}, "candidates": [], "reasoning": reasoning}
+    )
+
+
 async def run(ctx: StepContext) -> dict:
     default_ns = ctx.params.get("namespace") or options(ctx).get("namespace")
     workloads = await ctx.tool("list_workloads")(None)
@@ -139,6 +161,8 @@ async def run(ctx: StepContext) -> dict:
     namespaces = {w["namespace"] for w in workloads}
 
     hits = _prefer_namespace(_mentioned(ctx.prompt, workloads) or _pods_mentioned(ctx.prompt, workloads), ctx.prompt, default_ns)
+    nodes = _nodes_mentioned(ctx.prompt, await ctx.tool("list_nodes")())
+    node = nodes[0] if len(nodes) == 1 else None
     # One workload named verbatim settles it without the model, unless the prompt uses that name for a
     # namespace: "the pods in the cert-manager namespace" is not about the cert-manager Deployment alone.
     if len(hits) == 1 and not (hits[0]["name"] in namespaces and _names_namespace(ctx.prompt, hits[0]["name"])):
@@ -187,6 +211,9 @@ async def run(ctx: StepContext) -> dict:
         resolution = {"scope": "cluster", "namespace": None, "name": None}
     elif scope in ("deployment", "workload") and chosen:
         candidates = candidates or [_label(chosen)]
+    if node and ((resolution is None and not candidates) or (resolution or {}).get("scope") == "cluster"):
+        # No workload found: the node the request names is what it is about ("check node ip-10-1-21-112").
+        return _node_resolution(node, "no workload matched; the node's name appears verbatim in the request")
 
     return finish(
         {

@@ -15,7 +15,7 @@ from common.capabilities_base import StepContext
 from ..stepkit import finish, options, resolved_target, untrusted_block
 from ..tools import governance, health_rules
 
-_FINDINGS_LIMIT = {"deployment": 40, "workload": 40, "namespace": 40, "cluster": 30}
+_FINDINGS_LIMIT = {"deployment": 40, "workload": 40, "node": 40, "namespace": 40, "cluster": 30}
 _EVENTS_LIMIT = 15
 _LOG_TAILS = 5
 _RESOURCES_LIMIT = 20
@@ -103,14 +103,22 @@ async def run(ctx: StepContext) -> dict:
     target = resolved_target(ctx)
     scope = target.get("scope")
     namespace = target.get("namespace") or options(ctx).get("namespace")
-    if scope not in ("deployment", "workload", "namespace", "cluster"):
+    if scope not in ("deployment", "workload", "node", "namespace", "cluster"):
         scope = "namespace" if namespace else "cluster"
-    if scope == "cluster":
+    if scope in ("cluster", "node"):
         namespace = None
 
     gaps: list[str] = []
     workload = None
-    if scope == "deployment":
+    node = None
+    if scope == "node":
+        # The pods running on one node, in any namespace, and the node itself.
+        node = await ctx.tool("get_node")(target["name"])
+        deployments = []
+        pods = await ctx.tool("list_pods_on_node")(target["name"]) if node else []
+        if node is None:
+            gaps.append(f"node {target['name']} no longer exists (Cluster Autoscaler may have removed it)")
+    elif scope == "deployment":
         dep = await ctx.tool("get_deployment")(namespace, target["name"])
         deployments = [dep]
         pods = await ctx.tool("list_pods")(namespace, dep.get("label_selector") or dep.get("selector") or None)
@@ -130,7 +138,7 @@ async def run(ctx: StepContext) -> dict:
     except Exception as exc:  # noqa: BLE001 — events are supporting evidence
         events = []
         gaps.append(f"events could not be read: {exc}")
-    if scope in ("deployment", "workload"):
+    if scope in ("deployment", "workload", "node"):
         own_pods = {p.get("name") for p in pods}
         events = [
             e
@@ -156,6 +164,8 @@ async def run(ctx: StepContext) -> dict:
         findings.extend(health_rules.deployment_findings(dep))
     if workload is not None:
         findings.extend(health_rules.workload_findings(workload))
+    if node is not None:
+        findings.extend(health_rules.node_findings(node))
     for pod in pods:
         findings.extend(health_rules.pod_findings(pod))
     findings.extend(health_rules.usage_findings(pods, usage))
@@ -195,7 +205,7 @@ async def run(ctx: StepContext) -> dict:
             "type": scope,
             "namespace": namespace,
             "deployment": target.get("name") if scope == "deployment" else None,
-            **({"kind": target["kind"], "name": target["name"]} if scope == "workload" else {}),
+            **({"kind": target["kind"], "name": target["name"]} if scope in ("workload", "node") else {}),
         },
         "as_of": datetime.now(timezone.utc).isoformat(),
         "summary": {

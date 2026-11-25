@@ -154,6 +154,12 @@ def _example(kind: str, name: str, namespace: str) -> str:
 async def run(ctx: StepContext) -> dict:
     target = resolved_target(ctx)
     kind = target.get("kind") or "Deployment"
+    if target.get("scope") == "node":
+        # Cordon, uncordon and drain were built and then declined (user, 2026-11-25): nodes are only read.
+        return refusal(
+            f"This agent does not change nodes (cordon, uncordon, drain, labels, taints), so nothing was proposed for "
+            f"node {target.get('name')}. Use kubectl, or ask for a health check of the node."
+        )
     if target.get("scope") not in ("deployment", "workload") or not target.get("name") or not target.get("namespace"):
         candidates = (ctx.results.get("find_workload") or {}).get("candidates") or []
         return refusal(

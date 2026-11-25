@@ -152,6 +152,16 @@ def workload_findings(view: dict) -> list[dict]:
     return []
 
 
+def node_findings(node: dict) -> list[dict]:
+    """A node that is not Ready (warning) or does not take new pods (info: often on purpose)."""
+    findings = []
+    if not node.get("ready"):
+        findings.append(_finding("warning", "Node", node, "NotReady", "the node's Ready condition is not True"))
+    if node.get("unschedulable"):
+        findings.append(_finding("info", "Node", node, "Cordoned", "spec.unschedulable: new pods are not scheduled here"))
+    return findings
+
+
 def usage_findings(pods: list[dict], usage: dict) -> list[dict]:
     """Point-in-time usage against limits — a reading, not a trend.
     `usage` is keyed "namespace/pod" (see `read.get_pod_metrics`)."""

@@ -302,6 +302,21 @@ async def list_nodes() -> list[dict]:
     return [views.node_view(r) for r in await _list_dicts("Node")]
 
 
+async def get_node(name: str) -> dict | None:
+    """One node as its view, or None when there is no such node (Cluster Autoscaler removes nodes)."""
+    try:
+        return views.node_view(await _get_dict("Node", name))
+    except Exception as exc:  # noqa: BLE001
+        if api_status(exc) == 404:
+            return None
+        raise RuntimeError(f"could not read node {name}: {safe_error(exc)}") from None
+
+
+async def list_pods_on_node(node: str) -> list[dict]:
+    """Every pod bound to `node` (field selector `spec.nodeName`), as views."""
+    return [views.pod_view(r) for r in await _list_dicts("Pod", fields={"spec.nodeName": node})]
+
+
 async def get_ca_status() -> dict:
     try:
         raw = await _get_dict("ConfigMap", "cluster-autoscaler-status", "kube-system")

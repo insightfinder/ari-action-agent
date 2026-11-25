@@ -6405,3 +6405,79 @@ the same sentence by image/tag/version, or by "to <reference>" (a word with a di
 counts. The shared negation check (all intent gates) also treats reports of an attempt as not a request:
 didn't / can't / won't / wasn't, tried / failed / attempted / unable / trying to. Regression prompts added.
 Suite on 3.12: 1273 passed, 11 skipped.
+
+**Batch 2 deployed to test and e2e passed (2026-11-25).** ari-action-agent `14380ae` (merge into test, README
+table conflict resolved as before: test's rows kept, the k8s row extended); image `2611250918-test` on
+ari-k8s-api and ari-k8s-worker. oncallari 0.3.16 published; test-fluxcd `5095644d` pins it; after reconciling the
+Git source, the `ari-k8s` HelmRepository, the `apps` Kustomization (it had been waiting on a dependency, so the
+worker was still on the previous image until it was reconciled by hand) and the HelmRelease, the release runs
+0.3.16. ServiceAccount (`kubectl auth can-i --as`, ari-k8s-e2e): patch cronjobs yes, create jobs no, patch
+deployments yes, delete deployments no. `scripts/k8s_agent_live_test.py --allow-writes rbac health_cronjob
+set_image set_image_statefulset pause_resume suspend_resume_cronjob`: 6 scenarios, 0 failed — set_image of
+e2e-plain `succeeded` in 64 s and of e2e-sts in 68 s; pause 68 s, then (image changed by kubectl while paused)
+resume reported `pending_pods` 2 and its rollout `succeeded` in 62 s; suspend and resume of e2e-cron 53 s each;
+health of the CronJob resolved `kind: CronJob` (0 pods: it has never run). Fixtures were back to pause:3.10,
+unpaused, not suspended, no Jobs afterwards.
+
+## 2026-11-25 - II-25740 write batch 3: cordon_node, uncordon_node, drain_node
+
+User: one phase at a time; node operations may be tested live on test. New `actions/node.py`.
+- Target: `find_workload` resolves a node the request writes out (full name, or the part before the first dot,
+  e.g. `ip-10-1-21-112`) to `{"scope": "node", "kind": "Node", "namespace": null}` when a sentence asks for a node
+  action and names that node or says node/节点 ("drain the queue, then restart checkout; its pod is on node-a"
+  stays checkout), and otherwise only when the usual resolution finds no workload, or only the whole cluster
+  ("scale the payment workers to 5, node ... is full" stays the workers). On-call prompts quote node names while
+  asking about a workload. `health_report.scope.type` can be `node`. `stepkit`, `propose_change` (node context for the model, no
+  namespace) and `apply_approved_change` (no namespace required for a Node) follow; `check_health` gained a node
+  scope (pods on the node, `NotReady` / `Cordoned` findings). New reads `get_node` (None once removed) and
+  `list_pods_on_node` (field selector `spec.nodeName`); `node_view` gained `uid`, `pod_view` gained `mirror`,
+  `empty_dir`, `node_selector` / `required_node_affinity` / `tolerations`.
+- cordon/uncordon: merge patch `spec.unschedulable`; verified by `wait_node_schedulable` (value held 45 s;
+  `node_gone`, `reverted`). Uncordon of a node with Cluster Autoscaler / termination-handler / Karpenter taints
+  is `high`; cordoning the last schedulable node is `high`.
+- drain: a new `ActionSpec.executes_itself` / `execute` hook (the write tools call it instead of a fixed
+  operation list). Order: read the node (uid must match), list its pods, refuse before writing if a workload the
+  approver did not see, a bare pod, or unapproved emptyDir data is there; cordon; evict (policy/v1 Eviction,
+  `deleteOptions.preconditions.uid`, plus `dryRun` in the body on a dry run) the agent's own pod last; 429 is
+  retried every 10 s up to `eviction_seconds` (300), 404/409 count as gone, anything else lands in `failed`.
+  Nothing raises after the cordon. A dry run makes one pass; a 403 there becomes the RBAC refusal. Approved:
+  the node, the workloads seen on it and the rules — pods are listed again at write time (on test image
+  automation replaces pods every few minutes, so proposal-time names would all be 404 by approval). A retry
+  carries on from what is on the node. Verified by `wait_drain`, which never evicts: a pod still running and not
+  deleting ends it at once as `drain_incomplete` (otherwise a blocked drain would spend ~300 s retrying and then
+  the rest of the 900 s step waiting); it waits only for pods already shutting down. Also `succeeded` (the node is
+  empty of them — not that the replacements run yet), `in_progress`, `reverted`, `node_gone`. `apply_approved_change` now gives the verifier the step budget minus the write's time.
+  Proposal risks: emptyDir loss, budgets with 0 allowed, pods under two budgets, workloads with no ready pod
+  elsewhere, a first-fit estimate of pods that do not fit on the other nodes, the agent's own pod.
+- Eviction checked on test first (agent's client, dry run, one e2e-plain pod): dry run (query or body) leaves
+  the pod untouched; a stale uid precondition answers 409; a budget at 0 answers 429; a pod covered by two
+  budgets answers 500 "more than one PodDisruptionBudget" (a temporary second PDB, deleted after).
+- RBAC: `patch` nodes and `create` pods/eviction in docs/examples/k8s-rbac.yaml and oncallari 0.3.17 (charts
+  branch `II-25740-k8s-agent-node-actions`, from origin/main, uncommitted). RBAC cannot limit the node patch to
+  `spec.unschedulable` (labels and taints, on the Never list, become possible too; the code never sends them).
+  Eviction adds nothing beyond the existing pod delete. Live script: `rbac` expects both, and `delete nodes`
+  denied; new scenarios `cordon_uncordon` and `drain` (node chosen as the ready, schedulable node with the
+  fewest pods outside ari-k8s-e2e that runs neither the agent nor Temporal, or `E2E_NODE`; kubectl uncordons
+  afterwards; with --allow-writes they need `E2E_NODE`, the node agreed beforehand, since the pick can change).
+- Verified: suite on 3.12, 1313 passed, 11 skipped. On test with my kubeconfig (dry run only), the specs' own
+  plan + dry run on `ip-10-1-22-166` (7 non-DaemonSet pods): cordon dry run passed; drain dry run "evicted" 7
+  and changed nothing (still schedulable, every pod still there); as the ServiceAccount (chart 0.3.16) both
+  answered 403 on `patch nodes`, which the proposal turns into the RBAC refusal. Not run yet: the real cordon and
+  drain (need this image and chart 0.3.17, and the user's go-ahead on the node).
+
+**Node actions removed (user decision, 2026-11-25).** Before the live run the user asked about the `patch nodes`
+grant (RBAC cannot narrow it to `spec.unschedulable`, so labels and taints, on the Never list, would be allowed
+too). Options offered: a default-off chart flag plus a ValidatingAdmissionPolicy limiting the ServiceAccount's
+node updates to `spec.unschedulable`, or dropping the node actions. Recommended and chosen: drop them — on EKS with
+Cluster Autoscaler and spot nodes a bad node is usually replaced (instance termination, which the agent cannot
+do) rather than drained; a drain here stops several single-replica (mostly Recreate) services at once; and the
+grant needs extra machinery to be safe. The code stays in commit `80cd84c`. Removed: `actions/node.py`,
+`ActionSpec.executes_itself`/`execute`, `wait_node_schedulable`/`wait_drain`, the node intent gates, the drain
+helpers in governance, the pod-view fields only a drain used, the verifier budget change, the node branches of
+propose/apply, the RBAC rules (example manifest; the live script's `rbac` again expects `patch nodes` and
+`create pods/eviction` denied), the `cordon_uncordon`/`drain` scenarios and their tests. The charts branch
+`II-25740-k8s-agent-node-actions` (0.3.17, commit `6c65c53`, never pushed) is not needed. Kept, read-only:
+`find_workload` resolves a node the request names when no workload matches (or only the whole cluster), and
+`check_health` has a node scope (`get_node`, `list_pods_on_node`, `NotReady`/`Cordoned` findings);
+`propose_change` refuses a node target. The Never list now says nodes are not changed at all, with the reasons.
+No node was ever cordoned or drained on test (dry runs only). Suite on 3.12: 1280 passed, 11 skipped.
