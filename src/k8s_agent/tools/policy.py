@@ -100,6 +100,46 @@ def asks_in_place(prompt: str) -> bool:
     return bool(_IN_PLACE_WORDS.search(prompt or ""))
 
 
+# Requests for a change that takes no value (restart, rollback, delete). The model picks the action; these decide
+# whether the request's own words ask for it. A match right after a negation ("without a restart", "不重启",
+# "don't delete") does not count, and neither do the words health findings use ("restarted 5 times", "restart
+# count", "重启了 5 次").
+_RESTART_WORDS = re.compile(
+    r"(?i)(\brestart\b(?!\s*(?:count|policy|loop|times?)\b)|\bbounce\b|\brecycle\b|重启(?!\s*了?\s*\d+\s*次|次数|策略))"
+)
+_ROLLBACK_WORDS = re.compile(
+    r"(?i)(\broll[\s-]?back\b|\bundo\b[^.\n]{0,30}\b(rollout|deploy\w*|release|change)|\brevert\b[^.\n]{0,40}\b(previous|prior|last|earlier|old\w*|revision|version)\b|回滚|回退)"
+)
+# "restart pod X" counts: a pod is restarted by deleting it so its controller recreates it (kubectl has no other way).
+_POD_VERB = r"(?:delete|kill|remove|restart(?!\s*(?:count|policy|loop|times?)\b))"
+_POD_VERB_ZH = r"(?:删除|删掉|杀掉|干掉|重启(?!\s*了?\s*\d+\s*次|次数|策略))"
+_DELETE_POD_WORDS = re.compile(
+    rf"(?i)(\b{_POD_VERB}\b[^.\n]{{0,60}}\bpods?\b|\bpods?\b[^.\n]{{0,60}}\b{_POD_VERB}\b"
+    rf"|{_POD_VERB_ZH}[^。\n]{{0,30}}pod|pod[^。\n]{{0,30}}{_POD_VERB_ZH})"
+)
+_NEGATION = re.compile(r"(?i)(\b(no|not|without|never|don'?t|do\s+not|avoid)\b[^.\n,;]{0,12}|[不无没别勿]\s*)$")
+
+
+def _asks(pattern: re.Pattern, prompt: str) -> bool:
+    text = prompt or ""
+    return any(not _NEGATION.search(text[max(0, m.start() - 24) : m.start()]) for m in pattern.finditer(text))
+
+
+def asks_restart(prompt: str) -> bool:
+    """Does the request itself ask for a (rolling) restart?"""
+    return _asks(_RESTART_WORDS, prompt)
+
+
+def asks_rollback(prompt: str) -> bool:
+    """Does the request itself ask to roll back to an earlier revision?"""
+    return _asks(_ROLLBACK_WORDS, prompt)
+
+
+def asks_delete_pod(prompt: str) -> bool:
+    """Does the request itself ask for a pod to be deleted?"""
+    return _asks(_DELETE_POD_WORDS, prompt)
+
+
 def high_replica_threshold(options: dict) -> int:
     raw = (options or {}).get("high_replica_threshold")
     try:

@@ -328,6 +328,9 @@ class FakeClient:
         # When set, a real (non-dry-run) pod resize is applied at once by the "kubelet": the container status
         # takes on the new resources, and the container restarts once under RestartContainer.
         self.auto_resize = False
+        self.deletes: list[dict] = []
+        # When set, a real pod delete is followed at once by the controller's ready replacement.
+        self.auto_replace = False
         # What discovery and /version answer.
         self.resize_supported = True
         self.server_git_version = "v1.36.5-eks-91f89a9"
@@ -397,18 +400,70 @@ class FakeClient:
         if obj is None:
             raise _not_found(kind, name)
         self.patches.append({"kind": kind, "name": name, "namespace": namespace, "body": body, "dry_run": dry_run, "content_type": content_type})
-        merged = _deep_merge(obj, body, strategic="strategic" in content_type)
+        if "json-patch" in content_type:
+            merged = _json_patch(obj, body)
+        else:
+            merged = _deep_merge(obj, body, strategic="strategic" in content_type)
         if not dry_run:
             merged["metadata"]["generation"] = (obj["metadata"].get("generation") or 0) + 1
             obj.clear()
             obj.update(merged)
             if self.auto_rollout and target_kind == "Deployment":
                 self._roll_out(obj)
+            if self.auto_rollout and target_kind in ("StatefulSet", "DaemonSet"):
+                self._roll_out_workload(obj)
             if self.auto_resize and target_kind == "Pod" and subresource == "resize":
                 self._resize(obj, body)
         if kind == "Scale":
             return {"metadata": {"name": name}, "spec": {"replicas": merged["spec"]["replicas"]}}
         return copy.deepcopy(merged)
+
+    def _roll_out_workload(self, obj: dict) -> None:
+        spec, kind = obj["spec"], obj["kind"]
+        generation = obj["metadata"]["generation"]
+        if kind == "StatefulSet":
+            replicas = spec.get("replicas", 1)
+            obj["status"] = {
+                "observedGeneration": generation, "replicas": replicas, "readyReplicas": replicas, "availableReplicas": replicas,
+                "updatedReplicas": replicas, "currentRevision": f"rev-{generation}", "updateRevision": f"rev-{generation}",
+            }
+        else:
+            desired = (obj.get("status") or {}).get("desiredNumberScheduled", 0)
+            obj["status"] = {
+                "observedGeneration": generation, "desiredNumberScheduled": desired, "currentNumberScheduled": desired,
+                "numberReady": desired, "updatedNumberScheduled": desired, "numberAvailable": desired,
+            }
+
+    async def delete(self, kind, name, namespace, dry_run, grace_period_seconds=None, preconditions=None):
+        obj = self._find(kind, name, namespace)
+        if obj is None:
+            raise _not_found(kind, name)
+        if preconditions and preconditions.get("uid") != obj["metadata"].get("uid"):
+            raise api_error(409, f"Precondition failed: UID in precondition: {preconditions.get('uid')}, UID in object meta: {obj['metadata'].get('uid')}", "Conflict")
+        self.deletes.append({"kind": kind, "name": name, "namespace": namespace, "dry_run": dry_run, "preconditions": preconditions})
+        result = copy.deepcopy(obj)
+        result["metadata"]["deletionTimestamp"] = iso(0)
+        if not dry_run:
+            self.objects[kind].remove(obj)
+            if self.auto_replace and kind == "Pod":
+                self._replace_pod(obj)
+        return result
+
+    def _replace_pod(self, old: dict) -> None:
+        """The controller creates a ready replacement at once: same name for a StatefulSet's pod, a new name
+        otherwise; always a new uid."""
+        new = copy.deepcopy(old)
+        meta = new["metadata"]
+        owner_kind = (meta.get("ownerReferences") or [{}])[0].get("kind")
+        if owner_kind != "StatefulSet":
+            meta["name"] = f"{meta['name']}-r"
+        meta["uid"] = f"uid-{meta['name']}-new"
+        # One second later than "now" so it counts as created after the delete (second precision).
+        meta["creationTimestamp"] = (datetime.now(timezone.utc) + timedelta(seconds=1)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        for st in new["status"].get("containerStatuses") or []:
+            st.update({"ready": True, "restartCount": 0, "state": {"running": {}}})
+            st.pop("lastState", None)
+        self.objects["Pod"].append(new)
 
     def _resize(self, pod: dict, body: dict) -> None:
         for change in (body.get("spec") or {}).get("containers") or []:
@@ -438,6 +493,98 @@ class FakeClient:
         if isinstance(entry, dict):  # {"previous": ..., "current": ...}
             return entry.get("previous" if previous else "current", "")
         return entry
+
+
+def _json_patch(obj: dict, ops: list) -> dict:
+    """RFC 6902, the two operations a rollback sends: `test` (a mismatch is a 422, as from the API server) and
+    `replace`."""
+    out = copy.deepcopy(obj)
+    for op in ops:
+        keys = [k.replace("~1", "/").replace("~0", "~") for k in op["path"].lstrip("/").split("/")]
+        parent = out
+        for key in keys[:-1]:
+            parent = parent[key]
+        if op["op"] == "test":
+            if parent.get(keys[-1]) != op["value"]:
+                raise api_error(422, f"the server rejected our request due to an error in our request: test failed at {op['path']}", "Invalid")
+        elif op["op"] == "replace":
+            parent[keys[-1]] = copy.deepcopy(op["value"])
+        else:
+            raise ValueError(f"unsupported op {op['op']}")
+    return out
+
+
+def replicaset(deployment="checkout", revision=1, image="registry.example/checkout:1.1", template_hash="5c8d7f6b4", namespace="shop", replicas=0):
+    name = f"{deployment}-{template_hash}"
+    return {
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "uid": f"uid-{name}",
+            "labels": {"app": deployment, "pod-template-hash": template_hash},
+            "annotations": {"deployment.kubernetes.io/revision": str(revision)},
+            "ownerReferences": [{"kind": "Deployment", "name": deployment}],
+        },
+        "spec": {
+            "replicas": replicas,
+            "template": {
+                "metadata": {"labels": {"app": deployment, "pod-template-hash": template_hash}},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "app",
+                            "image": image,
+                            "env": [{"name": "DB_PASSWORD", "value": CANARY}],
+                            "resources": {"requests": {"cpu": "500m", "memory": "1Gi"}, "limits": {"cpu": "1", "memory": "2Gi"}},
+                        }
+                    ]
+                },
+            },
+        },
+        "status": {"replicas": replicas, "readyReplicas": replicas},
+    }
+
+
+def statefulset(name="db", namespace="shop", replicas=2, strategy="RollingUpdate", generation=3, labels=None):
+    return {
+        "kind": "StatefulSet",
+        "metadata": {"name": name, "namespace": namespace, "uid": f"uid-{name}", "generation": generation, "labels": labels or {}},
+        "spec": {
+            "replicas": replicas,
+            "serviceName": name,
+            "selector": {"matchLabels": {"app": name}},
+            "updateStrategy": {"type": strategy},
+            "template": {"metadata": {"labels": {"app": name}}, "spec": {"containers": [{"name": "db", "image": "registry.example/db:16", "env": [{"name": "PW", "value": CANARY}]}]}},
+        },
+        "status": {
+            "observedGeneration": generation, "replicas": replicas, "readyReplicas": replicas, "availableReplicas": replicas,
+            "updatedReplicas": replicas, "currentRevision": "rev-1", "updateRevision": "rev-1",
+        },
+    }
+
+
+def daemonset(name="agent", namespace="shop", desired=2, strategy="RollingUpdate", generation=4):
+    return {
+        "kind": "DaemonSet",
+        "metadata": {"name": name, "namespace": namespace, "uid": f"uid-{name}", "generation": generation, "labels": {}},
+        "spec": {
+            "selector": {"matchLabels": {"app": name}},
+            "updateStrategy": {"type": strategy, "rollingUpdate": {"maxUnavailable": 1}},
+            "template": {"metadata": {"labels": {"app": name}}, "spec": {"containers": [{"name": "agent", "image": "registry.example/agent:3"}]}},
+        },
+        "status": {
+            "observedGeneration": generation, "desiredNumberScheduled": desired, "currentNumberScheduled": desired,
+            "numberReady": desired, "updatedNumberScheduled": desired, "numberAvailable": desired,
+        },
+    }
+
+
+def owned_pod(name, owner_kind, owner, node="node-a", namespace="shop"):
+    """A pod a StatefulSet or DaemonSet owns directly."""
+    p = pod(name, namespace=namespace, app=owner, node=node, owner_kind=owner_kind)
+    p["metadata"]["ownerReferences"] = [{"kind": owner_kind, "name": owner}]
+    p["metadata"]["labels"] = {"app": owner}
+    return p
 
 
 def api_error(status: int, message: str, reason: str = "Error"):

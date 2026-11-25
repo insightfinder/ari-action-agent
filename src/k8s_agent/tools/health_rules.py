@@ -136,6 +136,17 @@ def deployment_findings(dep: dict) -> list[dict]:
     return findings
 
 
+def workload_findings(view: dict) -> list[dict]:
+    """A StatefulSet or DaemonSet with fewer ready pods than it wants."""
+    kind = view.get("kind")
+    status = view.get("status") or {}
+    desired = (status.get("desired") if kind == "DaemonSet" else view.get("replicas")) or 0
+    ready = status.get("ready") or 0
+    if ready < desired:
+        return [_finding("warning", kind, view, "ReplicasUnavailable", f"{ready}/{desired} pods ready")]
+    return []
+
+
 def usage_findings(pods: list[dict], usage: dict) -> list[dict]:
     """Point-in-time usage against limits — a reading, not a trend.
     `usage` is keyed "namespace/pod" (see `read.get_pod_metrics`)."""

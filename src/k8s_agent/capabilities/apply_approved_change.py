@@ -124,8 +124,12 @@ async def run(ctx: StepContext) -> dict:
     try:
         changed = spec.changed_object(action, state)
         chain = await ctx.tool("get_flux_chain")(changed["labels"], changed["annotations"])
+        proposed = proposal.get("persistence") or {}
         hint = persistence.build_hint(
-            chain, (proposal.get("persistence") or {}).get("changes") or [], outcome=verification.get("status")
+            chain,
+            proposed.get("changes") or [],
+            outcome=verification.get("status"),
+            nothing_to_persist=proposed.get("reason") if proposed.get("needed") is False else None,
         )
         drift_notice = spec.lifetime_notice(chain.get("ownership") or {}, chain)
     except Exception as exc:  # noqa: BLE001 — supporting information only

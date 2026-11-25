@@ -148,3 +148,22 @@ def deployment_of(pod: dict) -> str | None:
     if pod.get("owner_kind") == "ReplicaSet" and owner and template_hash and owner.endswith(f"-{template_hash}"):
         return owner[: -len(template_hash) - 1]
     return None
+
+
+# The workload kinds this agent resolves a request to (find_workload) and changes as a whole.
+WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
+
+
+def workload_of(pod: dict) -> tuple[str, str] | None:
+    """`(kind, name)` of the workload that owns `pod` (a pod view): a Deployment through its ReplicaSet, or a
+    StatefulSet or DaemonSet directly. None for a bare pod, a Job's pod or a static (mirror) pod."""
+    deployment = deployment_of(pod)
+    if deployment:
+        return "Deployment", deployment
+    if pod.get("owner_kind") in ("StatefulSet", "DaemonSet") and pod.get("owner_name"):
+        return pod["owner_kind"], pod["owner_name"]
+    return None
+
+
+def owned_by(pod: dict, kind: str, name: str) -> bool:
+    return workload_of(pod) == (kind, name)

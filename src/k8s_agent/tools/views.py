@@ -123,10 +123,16 @@ def _tolerations(spec: dict) -> list[dict]:
     ]
 
 
+# Set by `kubectl rollout restart` (and this agent's restart_rollout) on the pod template: changing it rolls the pods.
+RESTARTED_AT = "kubectl.kubernetes.io/restartedAt"
+
+
 def pod_template_view(template: dict) -> dict:
     spec = template.get("spec") or {}
+    meta = template.get("metadata") or {}
     return {
-        "labels": dict((template.get("metadata") or {}).get("labels") or {}),
+        "labels": dict(meta.get("labels") or {}),
+        "restarted_at": (meta.get("annotations") or {}).get(RESTARTED_AT),
         "node_selector": dict(spec.get("nodeSelector") or {}),
         "required_node_affinity": _required_node_affinity(spec),
         "tolerations": _tolerations(spec),
@@ -149,10 +155,12 @@ def deployment_view(raw: dict) -> dict:
         "kind": "Deployment",
         "name": meta.get("name"),
         "namespace": meta.get("namespace"),
+        "uid": meta.get("uid"),
         "generation": meta.get("generation"),
         "observed_generation": status.get("observedGeneration"),
         "created_at": meta.get("creationTimestamp"),
         "replicas": spec.get("replicas", 1),
+        "paused": bool(spec.get("paused")),
         "selector": dict((spec.get("selector") or {}).get("matchLabels") or {}),
         "label_selector": label_selector(spec.get("selector") or {}),
         "progress_deadline_seconds": spec.get("progressDeadlineSeconds", 600),
@@ -383,6 +391,7 @@ def _workload_common(raw: dict, kind: str) -> dict:
         "kind": kind,
         "name": meta.get("name"),
         "namespace": meta.get("namespace"),
+        "uid": meta.get("uid"),
         "generation": meta.get("generation"),
         "created_at": _created(raw),
         "labels": ownership_labels(raw),

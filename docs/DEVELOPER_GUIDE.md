@@ -560,7 +560,9 @@ are `a2a-task:k8s`, `plan_task`, one `capability:<name>` per step (`check_health
 1. `message/send` "scale checkout to 5 replicas" → the task ends in
    `TASK_STATE_INPUT_REQUIRED` with a `pending_action` artifact: `id`,
    `action` (`scale_replicas` | `set_autoscaler_bounds` | `set_resources` |
-   `resize_pod`, see docs/K8S_AGENT_INTERFACE.md),
+   `resize_pod` | `restart_rollout` | `rollback` | `delete_pod`, see
+   docs/K8S_AGENT_INTERFACE.md; a restart, rollback or pod delete is
+   proposed only when the request's own words ask for it),
    `action_name` (the line an approval email shows), `before`/`after`,
    `clamped`, `risk_tier`, `risks`, `capacity_outlook`, the server-side
    `dry_run` result, `drift_notice`, `persistence`, and a `snapshot` of
@@ -587,9 +589,11 @@ are `a2a-task:k8s`, `plan_task`, one `capability:<name>` per step (`check_health
    Cluster Autoscaler could not add a node for these pods, e.g. an EC2
    quota; `autoscaler_cannot_help`; or `failed_scheduling`), `reverted`
    (the approved value was put back while or after it was verified —
-   replicas, resources or the autoscaler's bounds — e.g. by a GitOps
-   reconcile or a Helm upgrade), or `verification_unavailable` (applied,
-   but the rollout could not be checked). Every value in a proposal must
+   replicas, resources, the autoscaler's bounds or a rolled-back image —
+   e.g. by a GitOps reconcile, a Helm upgrade or image automation), or
+   `verification_unavailable` (applied, but the rollout could not be
+   checked). A deleted pod is verified by its replacement: the old uid
+   gone and a new pod ready and stable. Every value in a proposal must
    be stated in the quote the model extracted it from ("3 replicas"
    cannot back 2024), and a memory value must carry a real unit: `512m`
    (Kubernetes reads it as milli-bytes) or anything under 4Mi is refused.
@@ -635,7 +639,7 @@ including a code agent the on-call coordinator calls next:
 Worker image `ari-k8s-agent-worker` (`Dockerfile.k8s`, no shell tooling),
 API image `ari-agent-api` with `AGENT_KIND=k8s`. RBAC:
 `docs/examples/k8s-rbac.yaml` (enumerated, no Secrets, no exec, no
-create/delete). Set `TEMPORAL_PAYLOAD_ENCRYPTION_KEY` so request LLM keys
+create, and no delete except pods). Set `TEMPORAL_PAYLOAD_ENCRYPTION_KEY` so request LLM keys
 are encrypted in Temporal history. A temporary test-cluster deployment
 and fixtures: `deploy/k8s-agent-e2e/`; live scenarios:
 `scripts/k8s_agent_live_test.py`; sample client:

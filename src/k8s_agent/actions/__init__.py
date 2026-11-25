@@ -1,12 +1,19 @@
 """Registry of every change this agent can propose. See `base.py`."""
 
 from .base import ActionSpec, Operation, target_of
+from .delete_pod import DeletePod
 from .resize_pod import ResizePod
+from .restart_rollout import RestartRollout
+from .rollback import Rollback
 from .scale_replicas import ScaleReplicas
 from .set_autoscaler_bounds import SetAutoscalerBounds
 from .set_resources import SetResources
 
-REGISTRY: dict[str, ActionSpec] = {spec.name: spec for spec in (ScaleReplicas(), SetAutoscalerBounds(), SetResources(), ResizePod())}
+# Order is the order the extraction prompt lists them in; new actions go last so existing names keep their place.
+REGISTRY: dict[str, ActionSpec] = {
+    spec.name: spec
+    for spec in (ScaleReplicas(), SetAutoscalerBounds(), SetResources(), ResizePod(), RestartRollout(), Rollback(), DeletePod())
+}
 ACTIONS = tuple(REGISTRY)
 
 

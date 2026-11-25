@@ -24,8 +24,7 @@ import asyncio
 import time
 from datetime import datetime
 
-from . import capacity, read
-from . import quantities
+from . import capacity, governance, quantities, read
 
 _FAILING_WAIT_REASONS = {
     "CrashLoopBackOff",
@@ -157,6 +156,13 @@ def moved_away(dep: dict, target: dict) -> str | None:
     if kind == "replicas":
         if dep.get("replicas") != target.get("replicas"):
             return f"spec.replicas is {dep.get('replicas')} again, not the approved {target.get('replicas')}"
+        return None
+    if kind == "images":
+        # A rollback: image automation or a Helm upgrade rolling forward again puts the newer image back.
+        current = {c.get("name"): c.get("image") for c in (dep.get("template") or {}).get("containers") or []}
+        for container, image in (target.get("images") or {}).items():
+            if current.get(container) != image:
+                return f"container {container} runs image {current.get(container)} again, not the rolled-back {image}"
         return None
     if kind != "resources":
         return None
@@ -460,6 +466,183 @@ async def wait_resize(
                 "note": (
                     "The resize was accepted but had not been reported as applied when the wait window "
                     f"({int(max_wait_seconds)}s) ended" + (f" ({note})" if note else "") + "; check the pod again later."
+                ),
+            }
+        await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
+
+
+# ---------------------------------------------------------------- a deleted pod, a StatefulSet or DaemonSet rollout
+
+
+def _pod_ready(pod: dict) -> bool:
+    containers = pod.get("containers") or []
+    return pod.get("phase") == "Running" and not pod.get("deleting") and bool(containers) and all(c.get("ready") for c in containers)
+
+
+def desired_pods(view: dict) -> int:
+    if view.get("kind") == "DaemonSet":
+        return (view.get("status") or {}).get("desired") or 0
+    return view.get("replicas") or 0
+
+
+async def _scheduling(namespace: str, pending: list[dict]) -> dict | None:
+    if not pending:
+        return None
+    events = await read.list_scheduling_events(namespace)
+    ca = await read.get_ca_status()
+    scheduling = capacity.classify_pending(pending, events, ca)
+    scheduling["pending_pods"] = len(pending)
+    scheduling["node_groups"] = capacity.node_group_summary(ca)
+    return scheduling
+
+
+async def wait_pod_replaced(
+    namespace: str,
+    pod: str,
+    uid: str,
+    workload_kind: str,
+    workload: str,
+    applied_at: str | None,
+    max_wait_seconds: float,
+    poll_seconds: float = POLL_SECONDS,
+) -> dict:
+    """Poll after a pod was deleted until its controller has replaced it.
+
+    Succeeded needs positive evidence, because a delete bumps no generation and the workload's counts can
+    look complete before anything happened: the pod with `uid` is gone (a StatefulSet's replacement reuses
+    the name, so the uid decides), a pod of the workload created after the delete is ready, and the new pods
+    stay up without a restart for STABILITY_SECONDS. The workload's other pods are reported (`ready` of
+    `desired`) but not waited for: one deleted pod does not mend a sibling that is itself failing.
+    """
+    applied = _parse(applied_at)
+    started = time.monotonic()
+    stable_since: float | None = None
+    baseline: dict = {}
+    while True:
+        current = await read.get_pod(namespace, pod)
+        old_gone = current is None or current.get("uid") != uid
+        view = await read.get_workload(workload_kind, namespace, workload)
+        pods = await read.list_pods(namespace, selector=view.get("label_selector") or view.get("selector") or None, active_only=True)
+        own = [p for p in pods if governance.owned_by(p, workload_kind, workload)]
+        new = [p for p in _new_pods(own, applied) if p.get("uid") != uid]
+        elapsed = round(time.monotonic() - started)
+        base = {"pod": pod, "replacement": sorted(p.get("name") for p in new), "waited_seconds": elapsed}
+        failing = _failing(new)
+        if failing:
+            return {**base, "done": True, "status": "new_pods_failing", "failing": failing[:10]}
+        scheduling = await _scheduling(namespace, _pending(new))
+        if scheduling and scheduling.get("stop_waiting"):
+            return {**base, "done": True, "status": "unschedulable", "scheduling": scheduling}
+        desired = desired_pods(view)
+        ready = sum(1 for p in own if _pod_ready(p))
+        if stable_since is not None:
+            restarted = _restarted_since(baseline, new)
+            if restarted:
+                return {
+                    **base,
+                    "done": True,
+                    "status": "new_pods_failing",
+                    "failing": restarted[:10],
+                    "detail": f"the replacement restarted within {round(time.monotonic() - stable_since)}s of becoming ready",
+                }
+        if old_gone and any(_pod_ready(p) for p in new):
+            if stable_since is None:
+                stable_since, baseline = time.monotonic(), _restart_counts(new)
+            observed = time.monotonic() - stable_since
+            if observed >= STABILITY_SECONDS:
+                return {**base, "done": True, "status": "succeeded", "ready": ready, "desired": desired, "stable_for_seconds": round(observed)}
+        else:
+            stable_since = None
+        if elapsed >= max_wait_seconds:
+            if scheduling and scheduling.get("cause") == "failed_scheduling":
+                return {**base, "done": True, "status": "unschedulable", "scheduling": scheduling}
+            return {
+                **base,
+                "done": True,
+                "status": "in_progress",
+                "ready": ready,
+                "desired": desired,
+                "note": (
+                    f"The pod was deleted, but when the wait window ({int(max_wait_seconds)}s) ended "
+                    + ("it was still terminating (graceful shutdown or a finalizer)" if not old_gone else "its replacement was not ready yet")
+                    + ". This is not a failure; check the pod's workload again later."
+                ),
+            }
+        await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
+
+
+def workload_rolled_out(view: dict) -> bool:
+    """A StatefulSet or DaemonSet has finished rolling out its current template."""
+    status = view.get("status") or {}
+    if (view.get("observed_generation") or 0) < (view.get("generation") or 0):
+        return False
+    desired = desired_pods(view)
+    if view.get("kind") == "StatefulSet":
+        partition = (view.get("strategy") or {}).get("partition") or 0
+        updated_ok = (status.get("updated") or 0) >= max(desired - partition, 0)
+        revision_ok = partition > 0 or status.get("current_revision") == status.get("update_revision")
+        return updated_ok and revision_ok and (status.get("ready") or 0) == desired
+    return all((status.get(k) or 0) == desired for k in ("updated", "ready", "available"))
+
+
+async def wait_workload_rollout(
+    kind: str,
+    namespace: str,
+    name: str,
+    applied_at: str | None,
+    max_wait_seconds: float,
+    poll_seconds: float = POLL_SECONDS,
+) -> dict:
+    """Poll a StatefulSet or DaemonSet after a template change (a restart) until its controller reports the
+    rollout complete, then watch the new pods for STABILITY_SECONDS. A StatefulSet replaces one pod at a time
+    and waits for each to be ready, so a long one often ends `in_progress`: not a failure."""
+    applied = _parse(applied_at)
+    started = time.monotonic()
+    stable_since: float | None = None
+    baseline: dict = {}
+    while True:
+        view = await read.get_workload(kind, namespace, name)
+        pods = await read.list_pods(namespace, selector=view.get("label_selector") or view.get("selector") or None, active_only=True)
+        new = _new_pods([p for p in pods if governance.owned_by(p, kind, name)], applied)
+        elapsed = round(time.monotonic() - started)
+        counts = {"desired": desired_pods(view), **{k: (view.get("status") or {}).get(k) for k in ("updated", "ready")}}
+        base = {"replicas": counts, "waited_seconds": elapsed}
+        failing = _failing(new)
+        if failing:
+            return {**base, "done": True, "status": "new_pods_failing", "failing": failing[:10]}
+        scheduling = await _scheduling(namespace, _pending(new))
+        if scheduling and scheduling.get("stop_waiting"):
+            return {**base, "done": True, "status": "unschedulable", "scheduling": scheduling}
+        if stable_since is not None:
+            restarted = _restarted_since(baseline, new)
+            if restarted:
+                return {
+                    **base,
+                    "done": True,
+                    "status": "new_pods_failing",
+                    "failing": restarted[:10],
+                    "detail": f"new pods restarted within {round(time.monotonic() - stable_since)}s of becoming ready",
+                }
+        if workload_rolled_out(view):
+            if stable_since is None:
+                stable_since, baseline = time.monotonic(), _restart_counts(new)
+            observed = time.monotonic() - stable_since
+            if observed >= STABILITY_SECONDS:
+                return {**base, "done": True, "status": "succeeded", "stable_for_seconds": round(observed)}
+        else:
+            stable_since = None
+        if elapsed >= max_wait_seconds:
+            if scheduling and scheduling.get("cause") == "failed_scheduling":
+                return {**base, "done": True, "status": "unschedulable", "scheduling": scheduling}
+            return {
+                **base,
+                "done": True,
+                "status": "in_progress",
+                "note": (
+                    f"The restart is applied but the {kind} had not finished rolling out when the wait window "
+                    f"({int(max_wait_seconds)}s) ended"
+                    + ("; a StatefulSet replaces its pods one at a time" if kind == "StatefulSet" else "")
+                    + ". This is not a failure; check it again later."
                 ),
             }
         await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))

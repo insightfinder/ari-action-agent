@@ -24,8 +24,10 @@ class Operation:
     namespace: str | None
     resource: str
     body: dict | None = None
-    patch_type: str | None = None  # "merge" | "strategic" (patch only)
+    patch_type: str | None = None  # "merge" | "strategic" | "json" (patch only)
     subresource: str | None = None
+    # delete only: e.g. {"uid": ...}, so the API server deletes that very object or answers 409.
+    preconditions: dict | None = None
 
 
 def extracted_int(value) -> int | None:
@@ -58,7 +60,10 @@ class ActionSpec:
     """The parts of a change that differ from one kind of change to the next."""
 
     name: str = ""
+    # Kinds of the object the change lands on (the proposal's `target.kind`).
     target_kinds: tuple[str, ...] = ()
+    # Kinds of workload `find_workload` resolves the request to for which this action is offered to the model.
+    workload_kinds: tuple[str, ...] = ("Deployment",)
     # One line for the extraction prompt: what this action is, in the request's terms.
     prompt_line: str = ""
     # Whether planning needs the node list and every active pod (the node-capacity cap).
@@ -70,13 +75,19 @@ class ActionSpec:
     # instead. Decided in code, never by the model.
     fallback: str | None = None
 
+    # Said when `accepts` is False and there is no fallback: the request does not itself ask for this change.
+    not_asked: str = ""
+
     def accepts(self, prompt: str) -> bool:
+        """Whether the request's own words ask for this kind of change, decided in code. The model's choice of
+        action alone is never enough for a change that does not take a quoted value (a restart, a rollback, a
+        delete): an on-call prompt quoting "restarted 5 times" is not a request to restart."""
         return True
 
-    async def resolve_target(self, ctx, dep: dict, change: dict) -> tuple[dict | None, dict | None]:
-        """`(target, None)` or `(None, refusal)`. `find_workload` resolves a Deployment; an action on
-        something inside it (a pod) narrows it down here."""
-        return {"kind": "Deployment", "namespace": dep["namespace"], "name": dep["name"]}, None
+    async def resolve_target(self, ctx, workload: dict, change: dict) -> tuple[dict | None, dict | None]:
+        """`(target, None)` or `(None, refusal)`. `find_workload` resolves a workload (its view is `workload`);
+        an action on something inside it (a pod) narrows it down here."""
+        return {"kind": workload.get("kind") or "Deployment", "namespace": workload["namespace"], "name": workload["name"]}, None
 
     async def load_state(self, ctx, target: dict) -> dict:
         raise NotImplementedError
@@ -95,12 +106,23 @@ class ActionSpec:
         """One plain sentence on how long the change lasts."""
         return governance.drift_notice(ownership, chain)
 
+    def lifetime_risk(self, ownership: dict) -> str | None:
+        """The level the lifetime notice is listed at among the proposal's risks (None: not listed). A change
+        to a GitOps- or Helm-owned object that the next reconcile or upgrade can undo is a `medium` risk."""
+        return "medium" if (ownership or {}).get("class") != "unowned" else None
+
     def plan(self, ctx, state: dict, change: dict, env: dict):
         """`((action, facts), None)` or `(None, refusal)`."""
         raise NotImplementedError
 
     def operations(self, action: dict) -> list[Operation]:
         raise NotImplementedError
+
+    async def build_operations(self, action: dict, kube) -> list[Operation]:
+        """The operations to run, for the dry run and the real write alike. Called inside the write tools
+        only, with the client: an action whose body cannot travel in the proposal (a rollback's full pod
+        template holds env values) reads it here, so it never reaches a step result or an artifact."""
+        return self.operations(action)
 
     def summarize(self, op: Operation, raw: dict, action: dict) -> dict:
         meta = raw.get("metadata") or {}
@@ -138,7 +160,7 @@ class DeploymentAction(ActionSpec):
     async def load_state(self, ctx, target: dict) -> dict:
         dep = await ctx.tool("get_deployment")(target["namespace"], target["name"])
         autoscaler = await ctx.tool("find_autoscaler")(target["namespace"], target["name"])
-        return {"deployment": dep, "autoscaler": autoscaler}
+        return {"deployment": dep, "workload": dep, "autoscaler": autoscaler}
 
     def snapshot(self, state: dict) -> dict:
         dep = state["deployment"]

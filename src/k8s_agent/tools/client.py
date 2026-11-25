@@ -19,7 +19,7 @@ Everything else in this package talks to the cluster only through
 API's own JSON shape) — which is also what the tests' fake implements.
 A kind name resolves to its REST path through `catalog.py`, so there is no
 per-kind dispatch table here: one generic request path serves every kind,
-subresource (`scale`, `eviction`) and verb.
+subresource (`scale`, `eviction`, `resize`) and verb.
 """
 
 import asyncio
@@ -41,6 +41,8 @@ _PAGE_SIZE = 500
 
 PATCH_MERGE = "application/merge-patch+json"
 PATCH_STRATEGIC = "application/strategic-merge-patch+json"
+# RFC 6902: replaces a whole subtree (a rollback's pod template) and can `test` a value first.
+PATCH_JSON = "application/json-patch+json"
 
 # Flux source kind -> kinds to try, newest API version first.
 FLUX_SOURCES = {
@@ -122,12 +124,21 @@ class Kube:
         k = _kind(kind)
         return self._request("PATCH", k.path(namespace, name, subresource), self._write_query(dry_run), body, content_type)
 
-    def _delete_sync(self, kind, name, namespace, dry_run, grace_period_seconds) -> dict:
+    def _delete_sync(self, kind, name, namespace, dry_run, grace_period_seconds, preconditions) -> dict:
         k = _kind(kind)
-        query = self._write_query(dry_run, field_manager=False)
+        # Every option goes in the DeleteOptions body, dryRun included. With a body present the API server
+        # ignores the query string, so `?dryRun=All` beside a body deletes for real (found live on test,
+        # 2026-11-24); kubectl's --dry-run=server sends it in the body too.
+        body: dict = {"kind": "DeleteOptions", "apiVersion": "v1", "propagationPolicy": "Background"}
+        if dry_run:
+            body["dryRun"] = ["All"]
         if grace_period_seconds is not None:
-            query.append(("gracePeriodSeconds", int(grace_period_seconds)))
-        return self._request("DELETE", k.path(namespace, name), query, {"propagationPolicy": "Background"})
+            body["gracePeriodSeconds"] = int(grace_period_seconds)
+        if preconditions:
+            # The API server deletes only the object with this uid: a pod name a StatefulSet has already
+            # reused for a new pod answers 409 instead of deleting the new one.
+            body["preconditions"] = dict(preconditions)
+        return self._request("DELETE", k.path(namespace, name), [], body)
 
     def _create_sync(self, kind, namespace, body, dry_run, name, subresource) -> dict:
         k = _kind(kind)
@@ -164,8 +175,10 @@ class Kube:
     async def patch(self, kind, name: str, namespace: str | None, body: dict, content_type: str, dry_run: bool, subresource: str | None = None) -> dict:
         return await asyncio.to_thread(self._patch_sync, kind, name, namespace, body, content_type, dry_run, subresource)
 
-    async def delete(self, kind, name: str, namespace: str | None, dry_run: bool, grace_period_seconds: int | None = None) -> dict:
-        return await asyncio.to_thread(self._delete_sync, kind, name, namespace, dry_run, grace_period_seconds)
+    async def delete(
+        self, kind, name: str, namespace: str | None, dry_run: bool, grace_period_seconds: int | None = None, preconditions: dict | None = None
+    ) -> dict:
+        return await asyncio.to_thread(self._delete_sync, kind, name, namespace, dry_run, grace_period_seconds, preconditions)
 
     async def create(self, kind, namespace: str | None, body: dict, dry_run: bool, name: str | None = None, subresource: str | None = None) -> dict:
         return await asyncio.to_thread(self._create_sync, kind, namespace, body, dry_run, name, subresource)
