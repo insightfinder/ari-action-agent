@@ -1080,6 +1080,63 @@ def scenario_health_cronjob(_args):
     return ok, f"{task['status']['state']} in {elapsed:.0f}s scope={scope} pods={(report.get('summary') or {}).get('pods')}"
 
 
+# ---------------------------------------------------------------- nodes: read only (II-25740)
+
+
+def _e2e_node() -> str | None:
+    """The node an e2e-plain pod runs on (E2E_NODE overrides): only read here, never changed."""
+    if os.environ.get("E2E_NODE"):
+        return os.environ["E2E_NODE"]
+    pods = json.loads(_kubectl("-n", NAMESPACE, "get", "pods", "-l", "app=e2e-plain", "-o", "json"))["items"]
+    nodes = sorted(p["spec"].get("nodeName") for p in pods if p["spec"].get("nodeName"))
+    return nodes[0] if nodes else None
+
+
+def scenario_health_node(_args):
+    """A health check of a node named by its short name (ip-x-x-x-x) resolves to that node and covers its pods."""
+    node = _e2e_node()
+    if not node:
+        return False, "no e2e-plain pod is scheduled"
+    task, elapsed = _run(f"check the health of node {node.split('.', 1)[0]}")
+    report = _artifact(task, "health_report") or {}
+    scope = report.get("scope") or {}
+    pods = (report.get("summary") or {}).get("pods") or 0
+    ok = task["status"]["state"] == "TASK_STATE_COMPLETED" and scope.get("type") == "node" and scope.get("name") == node and pods > 0
+    return ok, f"{task['status']['state']} in {elapsed:.0f}s scope={scope} pods={pods}"
+
+
+def scenario_refuse_node_change(_args):
+    """A request to cordon a node gets no proposal and leaves the node as it was. The planner usually answers it
+    without planning a change at all (cordon is not among the agent's changes); when propose_change does run, it
+    refuses a node target."""
+    node = _e2e_node()
+    if not node:
+        return False, "no e2e-plain pod is scheduled"
+    before = _kubectl("get", "node", node, "-o", "jsonpath={.spec.unschedulable}")
+    task, elapsed = _run(f"cordon node {node}")
+    refusal = _artifact(task, "refusal") or {}
+    after = _kubectl("get", "node", node, "-o", "jsonpath={.spec.unschedulable}")
+    reply = json.dumps((task["status"].get("message") or {}).get("parts") or [])
+    ok = task["status"]["state"] == "TASK_STATE_COMPLETED" and _artifact(task, "pending_action") is None and before == after
+    return ok, (
+        f"{task['status']['state']} in {elapsed:.0f}s refusal={json.dumps(refusal)[:120]} reply={reply[:140]} "
+        f"unschedulable {before!r}->{after!r}"
+    )
+
+
+def scenario_node_beside_workload(_args):
+    """A restart that also quotes the pod's node still targets the Deployment (the proposal is cancelled)."""
+    node = _e2e_node()
+    if not node:
+        return False, "no e2e-plain pod is scheduled"
+    prompt = f"restart the deployment e2e-plain in namespace {NAMESPACE}, its pod on node {node.split('.', 1)[0]} is stuck"
+    task, pending = _propose(prompt)
+    state = _cancel(task["id"]) if task["status"]["state"] == "TASK_STATE_INPUT_REQUIRED" else task["status"]["state"]
+    target = (pending or {}).get("target") or {}
+    ok = (pending or {}).get("action") == "restart_rollout" and target.get("kind") == "Deployment" and target.get("name") == "e2e-plain"
+    return ok, f"proposal {(pending or {}).get('action')} target={target} ({state})"
+
+
 # ---------------------------------------------------------------- the installed chart
 
 
@@ -1212,6 +1269,9 @@ SCENARIOS = {
     "pause_resume": scenario_pause_resume,
     "health_cronjob": scenario_health_cronjob,
     "suspend_resume_cronjob": scenario_suspend_resume_cronjob,
+    "health_node": scenario_health_node,
+    "refuse_node_change": scenario_refuse_node_change,
+    "node_beside_workload": scenario_node_beside_workload,
     "worker_restart": scenario_worker_restart,
     "resume_after_restart": scenario_resume_after_restart,
 }

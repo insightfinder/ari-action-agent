@@ -89,6 +89,11 @@ to `pause:3.9` and kubectl puts `pause:3.10` back; `pause_resume` pauses
 and has the agent resume it (the waiting change then rolls out). The CronJob
 changes need chart 0.3.16 (`patch` on cronjobs).
 
+Nodes are only read: `health_node` checks the node an e2e-plain pod runs on
+(by its short name), `refuse_node_change` checks that "cordon node ..." is
+refused without a proposal or a dry run, and `node_beside_workload` that a
+restart quoting the pod's node still targets the Deployment.
+
 `tests/test_k8s_live_script.py` keeps the script honest without a cluster:
 the RBAC the `rbac` scenario expects must match `docs/examples/k8s-rbac.yaml`,
 and the fixtures the scenarios name must exist here.

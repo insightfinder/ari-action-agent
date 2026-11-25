@@ -5796,3 +5796,19 @@ propose/apply, the RBAC rules (example manifest; the live script's `rbac` again 
 `check_health` has a node scope (`get_node`, `list_pods_on_node`, `NotReady`/`Cordoned` findings);
 `propose_change` refuses a node target. The Never list now says nodes are not changed at all, with the reasons.
 No node was ever cordoned or drained on test (dry runs only). Suite on 3.12: 1280 passed, 11 skipped.
+
+**Read-only nodes deployed to test and checked live (2026-11-25).** Merge into test `c3ada4a` (no conflicts);
+images ari-k8s-agent-worker `2611251021-test`, ari-agent-api `2611251022-test`. New read-only live scenarios
+`health_node` (the node an e2e-plain pod runs on, asked by its short name), `refuse_node_change` ("cordon node
+...": no proposal, node unchanged) and `node_beside_workload` (a restart that also quotes the pod's node still
+targets e2e-plain; the proposal is cancelled). Run: `rbac`, `health_statefulset`, `health_node` (resolved
+ip-10-1-19-145, 31 pods), `node_beside_workload` passed at once. `health` failed only because `ari-k8s-e2e` held
+the batch-1 fixtures alone (no e2e-crash/oom/badimage): the full fixtures.yaml was applied (and e2e-rollback put
+back on its second revision, pause:3.9), after which `health` passed (crash, OOM and image findings). The first
+`refuse_node_change` failed on its own check: that time the planner answered "cordon node ..." directly
+("Cordoning a node is not one of the changes this agent can make"), with no propose_change step and so no
+`refusal` artifact; the scenario now passes when no proposal is made, the task completes and the node is
+unchanged. Its rerun went through propose_change, which refused with "This agent does not change nodes"; both
+paths seen. Final: 6 scenarios, 0 failed (health and refuse_node_change on the rerun). The product-facing
+capability list for PMs is a Claude Docs doc ("ARI Kubernetes agent: what you can ask"), test capabilities only
+plus a Planned section.
