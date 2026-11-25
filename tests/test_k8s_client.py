@@ -138,6 +138,17 @@ async def test_eviction_is_a_create_on_the_pod_subresource(kube):
     assert call["query"]["dryRun"] == ["All"] and "fieldManager" not in call["query"]
 
 
+async def test_a_plain_create_posts_to_the_collection(kube):
+    # The name is in the body; POST .../jobs/<name> would answer 405.
+    kube_, t = kube
+    body = {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "report-manual-x2k4q", "namespace": "shop"}}
+    await kube_.create("Job", "shop", body, True, name="report-manual-x2k4q")
+    call = t.calls[0]
+    assert call["method"] == "POST" and call["path"] == "/apis/batch/v1/namespaces/shop/jobs"
+    assert call["query"]["dryRun"] == ["All"] and call["query"]["fieldManager"] == ["ari-k8s-agent"]
+    assert call["body"] == body
+
+
 async def test_delete_is_background_propagation(kube):
     kube_, t = kube
     await kube_.delete("Pod", "p1", "shop", False)

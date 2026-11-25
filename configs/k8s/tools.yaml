@@ -11,11 +11,11 @@ tools:
     module: k8s_agent.tools.read
     function: list_deployments
 
-  list_workloads:       # {kind, namespace, name} of every Deployment, StatefulSet and DaemonSet
+  list_workloads:       # {kind, namespace, name} of every Deployment, StatefulSet, DaemonSet and CronJob
     module: k8s_agent.tools.read
     function: list_workloads
 
-  get_workload:         # one Deployment, StatefulSet or DaemonSet as its view
+  get_workload:         # one Deployment, StatefulSet, DaemonSet or CronJob as its view
     module: k8s_agent.tools.read
     function: get_workload
 
@@ -99,9 +99,17 @@ tools:
     module: k8s_agent.tools.rollout
     function: wait_pod_replaced
 
-  wait_workload_rollout:  # a StatefulSet or DaemonSet rollout (a restart)
+  wait_workload_rollout:  # a StatefulSet or DaemonSet rollout (a restart, an image change)
     module: k8s_agent.tools.rollout
     function: wait_workload_rollout
+
+  wait_paused:          # a Deployment paused or resumed (controller's Progressing condition)
+    module: k8s_agent.tools.rollout
+    function: wait_paused
+
+  wait_cronjob_suspend: # a CronJob's spec.suspend holds
+    module: k8s_agent.tools.rollout
+    function: wait_cronjob_suspend
 
   # ---- writes
   dry_run_patch:        # always dryRun=All — cannot change the cluster

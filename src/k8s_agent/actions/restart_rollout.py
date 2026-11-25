@@ -25,6 +25,64 @@ def workload_pods(view: dict) -> int:
     return view.get("replicas") or 0
 
 
+def rollout_blocked(w: dict, what: str) -> str | None:
+    """Why the workload's controller would not roll out a template change (`what`, e.g. "a restart"), or None."""
+    ref = f"{w['kind']} {w['namespace']}/{w['name']}"
+    if w.get("kind") == "Deployment" and w.get("paused"):
+        return f"{ref} is paused (spec.paused), so its controller would not roll out {what}. Resume it first."
+    if (w.get("strategy") or {}).get("type") == "OnDelete":
+        return (
+            f"{ref} uses the OnDelete update strategy: {what} would change its template but replace no pod until "
+            "each pod is deleted by hand, so it is not proposed."
+        )
+    return None
+
+
+def rollout_effects(w: dict) -> tuple[list[dict], list[str]]:
+    """`(risks, notes)` of rolling every pod of the workload under its own update strategy."""
+    kind = w["kind"]
+    strategy = (w.get("strategy") or {}).get("type")
+    risks: list[dict] = []
+    notes: list[str] = []
+    if kind == "Deployment":
+        if strategy == "Recreate":
+            risks.append(
+                {
+                    "level": "high",
+                    "message": "Strategy Recreate: every pod is stopped before the new ones start, so the "
+                    "Deployment serves nothing until the new pods are ready.",
+                }
+            )
+        else:
+            s = w.get("strategy") or {}
+            notes.append(
+                f"Rolling update: up to {s.get('max_surge')} extra and {s.get('max_unavailable')} unavailable pods "
+                "at a time, as the Deployment's own strategy sets."
+            )
+    elif kind == "StatefulSet":
+        partition = (w.get("strategy") or {}).get("partition") or 0
+        notes.append(
+            "A StatefulSet replaces its pods one at a time, highest ordinal first, each after the previous one "
+            "is ready; each keeps its name and its PersistentVolumeClaims."
+        )
+        if partition:
+            notes.append(f"Update partition {partition}: only pods with an ordinal of {partition} or more are replaced.")
+        if workload_pods(w) == 1:
+            risks.append(
+                {
+                    "level": "high",
+                    "message": "The StatefulSet has one pod: it is stopped before its replacement starts, so the "
+                    "StatefulSet serves nothing until the new pod is ready.",
+                }
+            )
+    else:
+        notes.append(
+            "A DaemonSet replaces its pods node by node; while a node's pod is replaced that node runs without "
+            "it (maxUnavailable {}).".format((w.get("strategy") or {}).get("max_unavailable"))
+        )
+    return risks, notes
+
+
 class RestartRollout(ActionSpec):
     name = "restart_rollout"
     workload_kinds = governance.WORKLOAD_KINDS
@@ -56,59 +114,15 @@ class RestartRollout(ActionSpec):
     def plan(self, ctx, state, change, env):
         w = state["workload"]
         kind, ref = w["kind"], f"{w['kind']} {w['namespace']}/{w['name']}"
-        strategy = (w.get("strategy") or {}).get("type")
-        if kind == "Deployment" and w.get("paused"):
-            return None, refusal(
-                f"{ref} is paused (spec.paused), so its controller would not roll out a restart. Resume it first."
-            )
-        if strategy == "OnDelete":
-            return None, refusal(
-                f"{ref} uses the OnDelete update strategy: changing its template restarts nothing until each pod "
-                "is deleted by hand. Ask for a specific pod to be deleted instead."
-            )
+        blocked = rollout_blocked(w, "a restart")
+        if blocked:
+            return None, refusal(blocked + (" Ask for a specific pod to be deleted instead." if "OnDelete" in blocked else ""))
         pods = workload_pods(w)
         if pods < 1:
             return None, refusal(f"{ref} has no pods to restart.")
 
         restarted_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        risks: list[dict] = []
-        notes: list[str] = []
-        if kind == "Deployment":
-            if strategy == "Recreate":
-                risks.append(
-                    {
-                        "level": "high",
-                        "message": "Strategy Recreate: every pod is stopped before the new ones start, so the "
-                        "Deployment serves nothing until the new pods are ready.",
-                    }
-                )
-            else:
-                s = w.get("strategy") or {}
-                notes.append(
-                    f"Rolling update: up to {s.get('max_surge')} extra and {s.get('max_unavailable')} unavailable pods "
-                    "at a time, as the Deployment's own strategy sets."
-                )
-        elif kind == "StatefulSet":
-            partition = (w.get("strategy") or {}).get("partition") or 0
-            notes.append(
-                "A StatefulSet replaces its pods one at a time, highest ordinal first, each after the previous one "
-                "is ready; each keeps its name and its PersistentVolumeClaims."
-            )
-            if partition:
-                notes.append(f"Update partition {partition}: only pods with an ordinal of {partition} or more restart.")
-            if pods == 1:
-                risks.append(
-                    {
-                        "level": "high",
-                        "message": "The StatefulSet has one pod: it is stopped before its replacement starts, so the "
-                        "StatefulSet serves nothing until the new pod is ready.",
-                    }
-                )
-        else:
-            notes.append(
-                "A DaemonSet replaces its pods node by node; while a node's pod is replaced that node runs without "
-                "it (maxUnavailable {}).".format((w.get("strategy") or {}).get("max_unavailable"))
-            )
+        risks, notes = rollout_effects(w)
         action = {
             "action": "restart_rollout",
             "namespace": w["namespace"],

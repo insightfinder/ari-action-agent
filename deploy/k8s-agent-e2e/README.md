@@ -80,6 +80,15 @@ rather than `ari-k8s-agent`; only `ari-k8s-e2e` is ever changed. Write
 scenarios belong here, not on real services: on test, image automation
 redeploys the `insightfinder` namespace many times an hour.
 
+Image, pause/resume and CronJob scenarios (`set_image`,
+`set_image_statefulset`, `pause_resume`, `health_cronjob`,
+`suspend_resume_cronjob`) work on `e2e-plain`, `e2e-sts` and the CronJob
+`e2e-cron`, which fires only once a year. `set_image*` move container `app`
+to `pause:3.9` and kubectl puts `pause:3.10` back; `pause_resume` pauses
+`e2e-plain` through the agent, changes its image with kubectl while paused,
+and has the agent resume it (the waiting change then rolls out). The CronJob
+changes need chart 0.3.16 (`patch` on cronjobs).
+
 `tests/test_k8s_live_script.py` keeps the script honest without a cluster:
 the RBAC the `rbac` scenario expects must match `docs/examples/k8s-rbac.yaml`,
 and the fixtures the scenarios name must exist here.

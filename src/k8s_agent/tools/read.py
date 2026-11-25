@@ -66,10 +66,10 @@ async def get_deployment(namespace: str, name: str) -> dict:
 
 
 async def list_workloads(namespace: str | None = None) -> list[dict]:
-    """`{kind, namespace, name}` of every Deployment, StatefulSet and DaemonSet. Deployments must be readable;
-    a StatefulSet or DaemonSet list the ServiceAccount may not read (a chart older than 0.3.14) is left out."""
+    """`{kind, namespace, name}` of every Deployment, StatefulSet, DaemonSet and CronJob. Deployments must be
+    readable; a list the ServiceAccount may not read (a chart older than 0.3.14) is left out."""
     out = [{"kind": "Deployment", **d} for d in await list_deployments(namespace)]
-    for kind in ("StatefulSet", "DaemonSet"):
+    for kind in ("StatefulSet", "DaemonSet", "CronJob"):
         try:
             raws = await _list_dicts(kind, namespace=namespace)
         except Exception as exc:  # noqa: BLE001
@@ -81,8 +81,8 @@ async def list_workloads(namespace: str | None = None) -> list[dict]:
 
 
 async def get_workload(kind: str, namespace: str, name: str) -> dict:
-    """One Deployment, StatefulSet or DaemonSet as its view."""
-    if kind not in governance.WORKLOAD_KINDS:
+    """One Deployment, StatefulSet, DaemonSet or CronJob as its view."""
+    if kind not in governance.RESOLVABLE_KINDS:
         raise ValueError(f"not a workload kind: {kind!r}")
     if kind == "Deployment":
         return await get_deployment(namespace, name)

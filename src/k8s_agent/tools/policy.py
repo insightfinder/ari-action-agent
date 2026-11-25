@@ -117,7 +117,11 @@ _DELETE_POD_WORDS = re.compile(
     rf"(?i)(\b{_POD_VERB}\b[^.\n]{{0,60}}\bpods?\b|\bpods?\b[^.\n]{{0,60}}\b{_POD_VERB}\b"
     rf"|{_POD_VERB_ZH}[^。\n]{{0,30}}pod|pod[^。\n]{{0,30}}{_POD_VERB_ZH})"
 )
-_NEGATION = re.compile(r"(?i)(\b(no|not|without|never|don'?t|do\s+not|avoid)\b[^.\n,;]{0,12}|[不无没别勿]\s*)$")
+# Also what reports an attempt rather than asks for one: "we tried to upgrade it", "it failed to restart".
+_NEGATION = re.compile(
+    r"(?i)(\b(no|not|without|never|don'?t|do\s+not|avoid|didn'?t|did\s+not|can'?t|cannot|couldn'?t|won'?t|wasn'?t"
+    r"|(?:tried|failed|attempted|unable|trying)\s+to)\b[^.\n,;]{0,12}|(不要|不用|不必|无需|不需要|[不无没别勿])\s*)$"
+)
 
 
 def _asks(pattern: re.Pattern, prompt: str) -> bool:
@@ -138,6 +142,101 @@ def asks_rollback(prompt: str) -> bool:
 def asks_delete_pod(prompt: str) -> bool:
     """Does the request itself ask for a pod to be deleted?"""
     return _asks(_DELETE_POD_WORDS, prompt)
+
+
+# Write batch 2. Chinese verbs are not counted where they describe a state rather than ask for a change:
+# "被暂停" / "已暂停" / "暂停了" (it is paused), "恢复了" / "恢复正常" (it recovered).
+_ZH_STATE_BEFORE = r"(?<![被已在])"
+_ZH_STATE_AFTER = r"(?!了|中|着|的|状态|正常)"
+# A change verb followed, in the same sentence, by the word image/tag/version, or by "to <reference>" (a word
+# with a digit, ":" or "@") for the verbs that name a version change. Not a bare "upgrade" ("pods fail to pull x:1.3 after the upgrade") and not
+# "use" ("the pods use image x:1.2").
+_SET_IMAGE_WORDS = re.compile(
+    r"(?i)(\b(set|change|update|switch|move|pin|deploy|roll\s*out|point|upgrade|downgrade|bump)\b[^.\n]{0,60}\b(image|tag|version)\b"
+    r"|\b(upgrade|downgrade|bump|update|switch|move|roll\s*out|deploy)\b[^.\n]{0,60}\bto\s+[\w./@-]*[\d:@][\w./:@-]*"
+    rf"|(镜像|版本|tag|标签)[^。\n]{{0,20}}{_ZH_STATE_BEFORE}(改|换|设|升级|降级|更新|切){_ZH_STATE_AFTER}"
+    rf"|{_ZH_STATE_BEFORE}(改|换|设|升级|降级|更新|切){_ZH_STATE_AFTER}[^。\n]{{0,20}}(镜像|版本|tag|标签))"
+)
+_PAUSE_ROLLOUT_WORDS = re.compile(
+    rf"(?i)(\bpause\b|\bfreeze\b[^.\n]{{0,30}}\b(rollouts?|deploy\w*)\b|\bhold\b[^.\n]{{0,20}}\brollouts?\b|{_ZH_STATE_BEFORE}(暂停|冻结){_ZH_STATE_AFTER})"
+)
+_RESUME_ROLLOUT_WORDS = re.compile(
+    r"(?i)(\bresume\b|\bun-?pause\b|\bcontinue\b[^.\n]{0,30}\brollouts?\b"
+    rf"|取消暂停|解除暂停|{_ZH_STATE_BEFORE}恢复{_ZH_STATE_AFTER}|继续(发布|滚动|部署|rollout))"
+)
+_SUSPEND_CRONJOB_WORDS = re.compile(
+    r"(?i)(\bsuspend\b|\bpause\b|\bdisable\b|\bstop\b[^.\n]{0,20}\b(schedul\w*|running|runs?|it)\b"
+    rf"|{_ZH_STATE_BEFORE}(暂停|挂起|停用|禁用|停掉){_ZH_STATE_AFTER})"
+)
+_RESUME_CRONJOB_WORDS = re.compile(
+    r"(?i)(\bresume\b|\bun-?suspend\b|\bun-?pause\b|\bre-?enable\b|\benable\b"
+    rf"|取消暂停|解除暂停|{_ZH_STATE_BEFORE}(恢复|启用|重新启用){_ZH_STATE_AFTER})"
+)
+def asks_set_image(prompt: str) -> bool:
+    """Does the request itself ask for an image change (not just quote an image from a finding)?"""
+    return _asks(_SET_IMAGE_WORDS, prompt)
+
+
+def asks_pause_rollout(prompt: str) -> bool:
+    return _asks(_PAUSE_ROLLOUT_WORDS, prompt)
+
+
+def asks_resume_rollout(prompt: str) -> bool:
+    return _asks(_RESUME_ROLLOUT_WORDS, prompt)
+
+
+def asks_suspend_cronjob(prompt: str) -> bool:
+    return _asks(_SUSPEND_CRONJOB_WORDS, prompt)
+
+
+def asks_resume_cronjob(prompt: str) -> bool:
+    return _asks(_RESUME_CRONJOB_WORDS, prompt)
+
+
+# An image reference as Kubernetes takes it: no whitespace, at most one digest, no empty path segment.
+_IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-/:@+]{0,254}")
+_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}")
+# A match must not continue into a longer reference: "app:1.2" is not stated by "app:1.2.3" or "evil.io/app:1.2".
+# A sentence-final period is allowed ("... to nginx:1.25.").
+_REF_BEFORE = r"(?<![\w./:@-])"
+_REF_AFTER = r"(?![\w/:@-]|\.\w)"
+
+
+def valid_image(image) -> bool:
+    return (
+        isinstance(image, str)
+        and _IMAGE.fullmatch(image) is not None
+        and "//" not in image
+        and image.count("@") <= 1
+        and not image.endswith((":", "/", "@"))
+    )
+
+
+def states_image(prompt: str, image: str) -> bool:
+    """The request writes this exact image reference, not as part of a longer one."""
+    return valid_image(image) and re.search(rf"{_REF_BEFORE}{re.escape(image)}{_REF_AFTER}", prompt or "") is not None
+
+
+def states_tag(prompt: str, tag: str) -> bool:
+    """The request writes this tag as a tag: right after "tag"/"version"/"版本" or after `name:`. A bare number
+    elsewhere in the request ("3 replicas") is not a tag."""
+    if not isinstance(tag, str) or _TAG.fullmatch(tag) is None:
+        return False
+    t = re.escape(tag)
+    labelled = rf"(?i)(?:\btag\b|\bversion\b|版本|标签)[^\n]{{0,15}}?(?<![\w.:-]){t}{_REF_AFTER}"
+    attached = rf"[\w-]:{t}{_REF_AFTER}"
+    return bool(re.search(labelled, prompt or "") or re.search(attached, prompt or ""))
+
+
+def split_image(image: str) -> tuple[str, str | None]:
+    """`(repository, tag or None)`. The tag is after the last ":" of the last path segment, so a registry port
+    (`registry:5000/app`) is not taken for one; a digest (`@sha256:...`) is dropped from the repository."""
+    name = image.split("@", 1)[0]
+    head, _, last = name.rpartition("/")
+    if ":" in last:
+        last, tag = last.split(":", 1)
+        return (f"{head}/{last}" if head else last), tag
+    return name, None
 
 
 def high_replica_threshold(options: dict) -> int:

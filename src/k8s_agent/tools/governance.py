@@ -10,6 +10,7 @@ Two separate questions with separate consequences:
   change, but decides what the user must be told about it lasting.
 """
 
+import re
 from datetime import datetime, timedelta, timezone
 
 KEDA_GENERATED_HPA_PREFIX = "keda-hpa-"
@@ -165,5 +166,18 @@ def workload_of(pod: dict) -> tuple[str, str] | None:
     return None
 
 
+# What find_workload resolves a request to: the workloads above, plus a CronJob (suspend, resume).
+RESOLVABLE_KINDS = (*WORKLOAD_KINDS, "CronJob")
+
+
+def is_cronjob_job(job: str | None, cronjob: str) -> bool:
+    """Whether a Job name is one `cronjob` makes on its schedule: `<cronjob>-<minutes since epoch>`. Read from
+    the name: a pod view carries its Job, not the Job's own owner. A Job someone made by hand
+    (`kubectl create job --from=cronjob/...`) has a name of their choosing and is not counted."""
+    return bool(job) and re.fullmatch(rf"{re.escape(cronjob)}-\d{{8,}}", job) is not None
+
+
 def owned_by(pod: dict, kind: str, name: str) -> bool:
+    if kind == "CronJob":
+        return pod.get("owner_kind") == "Job" and is_cronjob_job(pod.get("owner_name"), name)
     return workload_of(pod) == (kind, name)

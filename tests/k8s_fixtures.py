@@ -342,6 +342,11 @@ class FakeClient:
     def _roll_out(self, dep: dict) -> None:
         spec = dep["spec"]
         replicas = spec.get("replicas", 1)
+        if spec.get("paused"):
+            # A paused Deployment rolls nothing; the controller only reports that it is paused.
+            dep["status"]["observedGeneration"] = dep["metadata"]["generation"]
+            dep["status"]["conditions"] = [{"type": "Progressing", "status": "Unknown", "reason": "DeploymentPaused"}]
+            return
         dep["status"] = {
             "observedGeneration": dep["metadata"]["generation"],
             "replicas": replicas,
@@ -597,3 +602,40 @@ def api_error(status: int, message: str, reason: str = "Error"):
 
 def _not_found(kind, name):
     return api_error(404, f"{kind} {name} not found", "NotFound")
+
+
+def cronjob(name="report", namespace="shop", suspend=False, active=None, concurrency="Allow", starting_deadline=None, labels=None):
+    spec = {
+        "schedule": "0 2 * * *",
+        "suspend": suspend,
+        "concurrencyPolicy": concurrency,
+        "jobTemplate": {
+            "metadata": {"labels": {"team": "data"}},
+            "spec": {
+                "backoffLimit": 1,
+                "template": {
+                    "metadata": {"labels": {"app": name}},
+                    "spec": {
+                        "restartPolicy": "Never",
+                        "containers": [{"name": "run", "image": "registry.example/report:5", "env": [{"name": "TOKEN", "value": CANARY}]}],
+                    },
+                },
+            },
+        },
+    }
+    if starting_deadline is not None:
+        spec["startingDeadlineSeconds"] = starting_deadline
+    return {
+        "kind": "CronJob",
+        "metadata": {"name": name, "namespace": namespace, "uid": f"uid-{name}", "generation": 2, "labels": labels or {}},
+        "spec": spec,
+        "status": {"active": [{"kind": "Job", "name": j} for j in active or []], "lastScheduleTime": iso(600)},
+    }
+
+
+def job_pod(name, job, namespace="shop"):
+    """A pod of a Job (a CronJob's run)."""
+    p = pod(name, namespace=namespace, app="report", owner_kind="Job")
+    p["metadata"]["ownerReferences"] = [{"kind": "Job", "name": job}]
+    p["metadata"]["labels"] = {"job-name": job}
+    return p

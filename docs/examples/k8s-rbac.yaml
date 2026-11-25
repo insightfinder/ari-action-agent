@@ -94,6 +94,10 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [delete]
+  # Suspending or resuming a CronJob.
+  - apiGroups: ["batch"]
+    resources: [cronjobs]
+    verbs: [patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

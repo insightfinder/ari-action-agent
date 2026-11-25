@@ -33,15 +33,21 @@ label and email). Other fields are informational for the approver.
   `kind: "Deployment"`, except `resize_pod`, which sets `kind: "Pod"` and still fills `deployment` with the
   pod's owning Deployment (and adds `pod` and `container`). Actions on other kinds set it and may leave
   `deployment` empty (null): `restart_rollout` of a StatefulSet or DaemonSet (`kind` is that kind), and
-  `delete_pod` (`kind: "Pod"`; `deployment` is filled only for a Deployment's pod). A proposal without
+  `delete_pod` (`kind: "Pod"`; `deployment` is filled only for a Deployment's pod), `set_image` of a
+  StatefulSet or DaemonSet, and the CronJob actions (`kind: "CronJob"`, `deployment` null). A proposal without
   `target` (made before II-25740) is still applied.
 - Per-action fields (spread into the proposal beside the common ones; informational, the agent rebuilds the
   write from them): `restart_rollout`: `workload_kind`, `workload`, `restarted_at` (the value the template's
   `kubectl.kubernetes.io/restartedAt` gets). `rollback`: `from_revision`, `to_revision`, `replicaset`,
   `replicaset_uid`, `images` (container -> image of the target revision; the pod template itself is never in
   the proposal). `delete_pod`: `workload_kind`, `workload`, `pod`, `pod_uid`. **Added II-25740.**
+  Write batch 2 (**added II-25740**): `set_image`: `workload_kind`, `workload`, `container`, `image`.
+  `pause_rollout` / `resume_rollout`: `paused` (the value set), `pending_pods` (pods a resume will replace
+  because the template changed while paused; 0 for a pause). `suspend_cronjob` / `resume_cronjob`: `cronjob`,
+  `suspend`.
 - `persistence.needed`: `false` when nothing has to change in Git (a restart, a deleted pod, an in-place
-  resize back to the template's own values); `reason` says why and `changes` is empty. `true` otherwise.
+  resize back to the template's own values, a pause or resume); `reason` says why and
+  `changes` is empty. `true` otherwise (a `set_image` names `image`, a CronJob suspend or resume `suspend`).
   **Added II-25740.**
 - `before`, `after`, `requested`, `clamped`, `node_cap`, `risk_tier` (low/medium/high/critical), `risks`,
   `notes`, `capacity_outlook`, `dry_run`, `ownership`, `drift_notice`, `persistence`,
@@ -68,6 +74,12 @@ UIE (`ran`).
   replacement is ready and stable; `verification.replacement` names it), `in_progress`, `new_pods_failing`,
   `unschedulable`. A pod that was already gone or replaced when the approval arrived counts as done:
   `applied.already_at_target` is true and nothing is deleted.
+- Write batch 2 statuses (II-25740). `set_image`: as a restart of the same kind, plus `reverted` (another
+  image came back while watched). `pause_rollout`: `succeeded` (the controller reports DeploymentPaused and the
+  value held), `in_progress`, `reverted`. `resume_rollout`: the same when no pod is replaced; when a template
+  change waited (`pending_pods` > 0) as a Deployment rollout, `reverted` meaning paused again.
+  `suspend_cronjob` / `resume_cronjob`: `succeeded` (the value held for 45 s; `verification.active_jobs` lists
+  runs active then — a resume may start one at once), `reverted`.
 
 ### `query_result`
 
@@ -107,7 +119,7 @@ kind on the test cluster conformed.
 ### Action names (`action`)
 
 `scale_replicas`, `set_autoscaler_bounds`, `set_resources`, `resize_pod`, `restart_rollout`, `rollback`,
-`delete_pod` today (`k8s_agent/actions/__init__.py`, `ACTIONS`). `resize_pod` (**added II-25740**): CPU/memory of one container
+`delete_pod`, `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob`, `resume_cronjob` today (`k8s_agent/actions/__init__.py`, `ACTIONS`). `resize_pod` (**added II-25740**): CPU/memory of one container
 of one running pod, in place through `pods/resize` — no rollout, same pod. Chosen only when the request asks
 for an in-place change (decided in code; naming a pod is not enough). Proposed only when the API server serves
 `pods/resize` (live discovery) and both the API server and the pod's kubelet are >= 1.35; memory only when
@@ -129,9 +141,33 @@ carries `asked_for` with the action the model picked.
 - `find_workload` now also resolves StatefulSets and DaemonSets (`{"scope": "workload", "kind", ...}` in its
   step result; a Deployment keeps `{"scope": "deployment", ...}`).
 
+Added II-25740 (write batch 2). Each is proposed only when the request's own words ask for it (code, as in
+batch 1; a refusal carries `asked_for`).
+- `set_image`: one container's image in a Deployment, StatefulSet or DaemonSet, as `kubectl set image`
+  (strategic merge patch by container name). The image is the request's own words: a full reference written
+  verbatim, or a tag written as a tag ("tag 1.4", "version 1.4", "app:1.4") put on the current repository.
+  The container must exist; with one container it need not be named. Refused for a paused Deployment, an
+  `OnDelete` strategy or the image already running. Tier `medium`; `high` when the repository changes, under
+  `Recreate`, or for a one-pod StatefulSet. Whether the image exists cannot be checked before it rolls out.
+- `pause_rollout` / `resume_rollout`: a Deployment's `spec.paused`, as `kubectl rollout pause` / `resume`.
+  A pause replaces no pod; while paused, template changes (image automation, Helm upgrades) wait. A resume
+  rolls out whatever waited (`pending_pods`, read from the Deployment's status). Tier `medium`.
+- `suspend_cronjob` / `resume_cronjob`: a CronJob's `spec.suspend`. A resume without
+  `startingDeadlineSeconds` may start one run at once for the latest schedule missed while suspended (a
+  `medium` risk). A chart or manifest usually sets `suspend`, so a Helm upgrade or reconcile puts it back
+  (drift notice, persistence hint). Tier `medium`.
+- Not added: `trigger_cronjob` (run a CronJob now, i.e. create a Job from it). Built and then removed on
+  2026-11-25 by user decision: the agent does not re-run CronJobs; whoever needs a run outside the schedule uses
+  `kubectl create job --from=cronjob/<name>`. It would have needed `create` on jobs and an exception to the
+  "Never" list below.
+- `find_workload` also resolves CronJobs (`{"scope": "workload", "kind": "CronJob", ...}`, also from a
+  scheduled run's pod name); `check_health` of a CronJob covers its runs' pods and reports a suspended one
+  (`Suspended`, info).
+- RBAC (oncallari chart 0.3.16): `patch` on `cronjobs` (batch). Before it, both CronJob changes are refused
+  with the missing rule named; the other batch 2 actions need no new rule.
+
 Planned under II-25740 (not built yet), in this order:
-- `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob`, `resume_cronjob`, `trigger_cronjob`,
-  `cordon_node`, `uncordon_node`, `drain_node`, StatefulSet replica scaling, and `batch` (one approval for the
+- `cordon_node`, `uncordon_node`, `drain_node`, StatefulSet replica scaling, and `batch` (one approval for the
   same change on several targets).
 - Added 2026-11-24 (user decision), in this order: `flux_reconcile` (set `reconcile.fluxcd.io/requestedAt` on a
   HelmRelease or Kustomization so a merged fix applies now; changes no desired state, tier `low`);
@@ -155,7 +191,8 @@ Not to be added. A change to this list is a decision of its own, recorded here a
   resources (top-level scalars only).
 - exec / attach / port-forward into pods.
 - Creating or deleting workloads, Services, Ingresses, Namespaces or PVCs (deleting a controller-owned pod,
-  which its controller replaces, is the only delete).
+  which its controller replaces, is the only delete). This includes creating a Job from a CronJob ("run it
+  now"): considered as `trigger_cronjob` and declined by the user on 2026-11-25.
 - Changing the content of Services, Ingresses, NetworkPolicies or ConfigMaps: networking and configuration
   change through Git.
 - Deleting nodes, or changing node labels or taints (node groups and Cluster Autoscaler own them; cordon,
@@ -185,7 +222,7 @@ Recorded for their owners; not changed from this repository.
 
 | Repo | What | Why | Since |
 |---|---|---|---|
-| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `rollback` and `delete_pod` ship with II-25740. | II-25740 |
+| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `rollback`, `delete_pod`, `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob` and `resume_cronjob` ship with II-25740. | II-25740 |
 | insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship. | II-25740 |
 | insightfinder-mcp-service | Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. Do not have a model re-type the rows: 100+ rows exceed its output limit and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
 | insightfinder-mcp-service | Confirm live that a follow-up chat turn ("in table format") can reach the previous turn's agent result, or that the coordinator calls the agent again. | Screenshot of 2026-11-19 (stg): the coordinator answered from memory. | II-25740 |
