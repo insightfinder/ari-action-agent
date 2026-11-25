@@ -64,7 +64,7 @@ async def _run_workflow(plan: dict, execute_step, config: dict | None = None) ->
 
 
 @pytest.mark.asyncio
-async def test_raised_activity_error_loops_via_on_failure_instead_of_aborting():
+async def test_a_killed_step_skips_the_on_failure_loop_and_ends_gracefully():
     calls = {"generate_change": 0, "verify": 0}
     plan = {
         "steps": [
@@ -105,11 +105,8 @@ async def test_raised_activity_error_loops_via_on_failure_instead_of_aborting():
 
     result = await _run_workflow(plan, execute_step)
 
-    # on_failure.max_attempts=3: verify is tried 4 times total (the 4th
-    # attempt exceeds max_attempts and gives up), looping back to
-    # generate_change each time rather than aborting on the first failure.
-    assert calls["verify"] == 4
-    assert calls["generate_change"] == 4
+    assert calls["verify"] == 1, "a killed step carries no test output, so looping back is waste"
+    assert calls["generate_change"] == 1
     assert result["status"] == "failed"
     assert "final:failed" in result["message"]
 
@@ -210,7 +207,7 @@ async def test_the_budget_caps_a_step_across_all_of_its_retries():
 
 
 @pytest.mark.asyncio
-async def test_the_on_failure_loop_stops_once_the_budget_is_spent():
+async def test_the_budget_stops_the_run_after_a_killed_step():
     # The loop's own `max_attempts: 3` bounds how many times it repeats,
     # not how long those repeats take -- exactly the gap that let
     # 9b32a817 run 45m56s. Budget and backoff are sized here so the clock
@@ -222,12 +219,13 @@ async def test_the_on_failure_loop_stops_once_the_budget_is_spent():
             _step(
                 "verify",
                 retry={"max_attempts": 50, "backoff_seconds": 1},
-                on_failure={"goto": "generate_change", "max_attempts": 3, "then": "fail_needs_human"},
+                on_failure={"goto": "generate_change", "max_attempts": 3, "then": "continue"},
             ),
+            _step("propose_pr"),
         ],
         "rationale": "test",
     }
-    calls = {"generate_change": 0, "verify": 0}
+    calls = {"generate_change": 0, "verify": 0, "propose_pr": 0}
     reason = {}
 
     @activity.defn(name="execute_step")
@@ -245,17 +243,16 @@ async def test_the_on_failure_loop_stops_once_the_budget_is_spent():
     # sleep past an activity's schedule_to_close, so a backoff longer than
     # the budget's remainder ends that attempt without the clock moving,
     # and the budget would never actually be spent.
-    result = await _run_workflow(plan, execute_step, config={"options": {"pipeline_budget_seconds": 200}})
+    result = await _run_workflow(plan, execute_step, config={"options": {"pipeline_budget_seconds": 150}})
 
     assert result["status"] == "failed"
     # The run must end because the clock ran out, not because the loop hit
     # its own attempt cap -- and must say which, since the two call for
     # completely different follow-up.
     assert "budget" in reason["text"], reason
-    assert "generate_change" in reason["text"], "must name the step that never got to run"
-    # Without the budget this loop runs generate_change 4 times (see the
-    # on_failure test above).
-    assert calls["generate_change"] < 4
+    assert "propose_pr" in reason["text"], "must name the step that never got to run"
+    assert calls["generate_change"] == 1, "a killed step must not loop back and spend the budget again"
+    assert calls["propose_pr"] == 0
 
 
 @pytest.mark.asyncio
@@ -369,7 +366,7 @@ async def test_exhausted_on_failure_with_then_continue_still_reaches_the_later_s
 
     result = await _run_workflow(plan, execute_step)
 
-    assert calls["verify"] == 4, "the retry loop itself must be unchanged"
+    assert calls["verify"] == 1, "a killed step goes straight to the exhausted branch"
     assert calls["propose_pr"] == 1, "the step after the exhausted loop must still run"
     assert result["status"] == "needs_approval"
 
@@ -464,6 +461,7 @@ async def test_a_build_that_really_failed_still_stops_the_pipeline():
 
     result = await _run_workflow(plan, execute_step)
 
+    assert calls["verify"] == 2, "a reported failure carries test output, so it must still loop back"
     assert calls["propose_pr"] == 0
     assert result["status"] == "failed"
 
@@ -515,6 +513,57 @@ async def test_a_verify_that_never_finished_lets_the_pipeline_continue():
 
     result = await _run_workflow(plan, execute_step)
 
-    assert calls["verify"] == 2
+    assert calls["verify"] == 1
+    assert calls["propose_pr"] == 1
+    assert result["status"] == "needs_approval"
+@pytest.mark.asyncio
+async def test_a_verify_with_no_verdict_line_still_loops_back():
+    calls = {"generate_change": 0, "verify": 0, "propose_pr": 0}
+    plan = {
+        "steps": [
+            {
+                "capability": "generate_change",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": None,
+                "timeout_seconds": None,
+                "confirmed": False,
+            },
+            {
+                "capability": "verify",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": {"goto": "generate_change", "max_attempts": 1, "then": "continue"},
+                "timeout_seconds": 5,
+                "confirmed": False,
+            },
+            {
+                "capability": "propose_pr",
+                "params": {},
+                "retry": {"max_attempts": 1, "backoff_seconds": 0},
+                "on_failure": None,
+                "timeout_seconds": None,
+                "confirmed": False,
+            },
+        ],
+        "rationale": "test",
+    }
+
+    @activity.defn(name="execute_step")
+    async def execute_step(payload: dict) -> dict:
+        capability = payload["capability"]
+        calls[capability] = calls.get(capability, 0) + 1
+        if capability == "verify":
+            return {"status": "inconclusive", "failure": "mvn test output that never printed a verdict line"}
+        if capability == "propose_pr":
+            return {"pending_action": {"id": "p1"}, "requires_approval": True}
+        if capability == "respond":
+            return {"message": f"final:{payload['params'].get('pipeline_status')}"}
+        return {"status": "ok"}
+
+    result = await _run_workflow(plan, execute_step)
+
+    assert calls["verify"] == 2, "verify's own inconclusive carries opencode output worth retrying"
+    assert calls["generate_change"] == 2
     assert calls["propose_pr"] == 1
     assert result["status"] == "needs_approval"
