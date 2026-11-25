@@ -11,8 +11,8 @@ capabilities:
   find_workload:
     module: k8s_agent.capabilities.find_workload
     description: >
-      Resolves which workload (Deployment, StatefulSet or DaemonSet) the
-      request is about (or that it is about a whole namespace or the whole
+      Resolves which workload (Deployment, StatefulSet, DaemonSet or
+      CronJob) the request is about (or that it is about a whole namespace or the whole
       cluster). The answer must exist in the live cluster; ambiguous matches
       come back as candidates instead of a guess. Read-only. Almost always
       the first step. Optional param: `namespace`.
@@ -25,8 +25,8 @@ capabilities:
   check_health:
     module: k8s_agent.capabilities.check_health
     description: >
-      Pod-level health for the resolved Deployment (or StatefulSet or
-      DaemonSet), namespace or cluster:
+      Pod-level health for the resolved Deployment (or StatefulSet,
+      DaemonSet or CronJob), namespace or cluster:
       pending/unschedulable pods, crash loops with the previous container's
       termination reason (OOMKilled vs probe failure), image pull failures,
       restarts, warning events, usage near limits, replicas unavailable.
@@ -61,8 +61,10 @@ capabilities:
       CPU/memory of one running pod in place (no rollout; needs Kubernetes
       in-place pod resize, read live from the cluster), a rolling restart of
       a Deployment, StatefulSet or DaemonSet, a Deployment rollback to an
-      earlier revision, or deleting one pod a workload controller replaces.
-      Restart, rollback and delete only when the request itself asks for
+      earlier revision, deleting one pod a workload controller replaces, a
+      container's image, pausing or resuming a Deployment's rollouts,
+      or suspending or resuming a CronJob.
+      Actions without a stated value only when the request itself asks for
       them. Works out the exact change,
       checks it (autoscaler rules, replica floor of 1, node-capacity cap,
       capacity and Cluster Autoscaler outlook, pre-flight risks), dry-runs
@@ -98,7 +100,9 @@ capabilities:
       cluster state (rollout progress, failing new pods, pods that cannot be
       scheduled and why; for an in-place pod resize, the values the kubelet
       reports as applied on the same pod; for a deleted pod, its replacement
-      ready and stable). Never planned directly — reachable only through
+      ready and stable; for a paused or resumed Deployment, the
+      controller's own report; for a suspended or resumed CronJob, that
+      the value holds). Never planned directly — reachable only through
       the approval of a propose_change proposal.
     tools:
       - get_deployment
@@ -114,6 +118,8 @@ capabilities:
       - wait_resize
       - wait_pod_replaced
       - wait_workload_rollout
+      - wait_paused
+      - wait_cronjob_suspend
       - get_flux_chain
     # A second attempt (the worker died, or a read failed, mid-step) finds the
     # approved values already in place and verifies instead of writing again.

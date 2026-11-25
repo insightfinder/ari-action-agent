@@ -95,5 +95,18 @@ def test_the_statefulset_fixture_has_the_pod_the_delete_scenario_names():
     assert _fixtures()[("StatefulSet", "e2e-sts")]["spec"]["replicas"] >= 2  # e2e-sts-1
 
 
+def test_the_cronjob_fixture_never_fires_on_its_own_and_its_job_ends():
+    cron = _fixtures()[("CronJob", "e2e-cron")]
+    assert cron["metadata"]["namespace"] == live.NAMESPACE and cron["spec"]["schedule"] == "0 0 1 1 *"
+    job = cron["spec"]["jobTemplate"]["spec"]
+    assert job["template"]["spec"]["restartPolicy"] == "Never" and job["template"]["spec"]["containers"][0]["name"] == "run"
+
+
+def test_the_image_scenarios_start_from_the_fixture_images():
+    for kind, name in (("Deployment", "e2e-plain"), ("StatefulSet", "e2e-sts")):
+        [container] = _fixtures()[(kind, name)]["spec"]["template"]["spec"]["containers"]
+        assert container["name"] == "app" and container["image"] == live.PAUSE_OLD
+
+
 def test_every_scenario_says_what_it_checks():
     assert all((fn.__doc__ or "").strip() for fn in live.SCENARIOS.values())

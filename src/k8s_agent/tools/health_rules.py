@@ -137,9 +137,14 @@ def deployment_findings(dep: dict) -> list[dict]:
 
 
 def workload_findings(view: dict) -> list[dict]:
-    """A StatefulSet or DaemonSet with fewer ready pods than it wants."""
+    """A StatefulSet or DaemonSet with fewer ready pods than it wants; a suspended CronJob (info: it may be on
+    purpose, but no scheduled run starts)."""
     kind = view.get("kind")
     status = view.get("status") or {}
+    if kind == "CronJob":
+        if view.get("suspend"):
+            return [_finding("info", kind, view, "Suspended", f"no scheduled run starts (schedule {view.get('schedule')!r})")]
+        return []
     desired = (status.get("desired") if kind == "DaemonSet" else view.get("replicas")) or 0
     ready = status.get("ready") or 0
     if ready < desired:

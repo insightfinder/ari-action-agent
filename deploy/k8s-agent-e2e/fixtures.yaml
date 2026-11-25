@@ -380,3 +380,28 @@ spec:
           resources:
             requests: {cpu: 5m, memory: 8Mi}
             limits: {cpu: 20m, memory: 16Mi}
+---
+# A CronJob that fires only once a year, for suspend and resume. Its Job (should
+# it ever run) prints one line and exits.
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: e2e-cron, namespace: ari-k8s-e2e}
+spec:
+  schedule: "0 0 1 1 *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata: {labels: {app: e2e-cron}}
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: run
+              image: busybox:1.36
+              command: ["sh", "-c", "echo e2e-cron ran; sleep 5"]
+              resources:
+                requests: {cpu: 5m, memory: 8Mi}
+                limits: {cpu: 20m, memory: 16Mi}

@@ -1,5 +1,5 @@
-"""Turns the request into a concrete workload — a Deployment, StatefulSet or
-DaemonSet — (or a namespace/cluster scope for a health check).
+"""Turns the request into a concrete workload — a Deployment, StatefulSet,
+DaemonSet or CronJob — (or a namespace/cluster scope for a health check).
 
 The answer must exist in the cluster: a workload the model names that is
 not in the live list is discarded, never passed on. When a single
@@ -8,8 +8,8 @@ the model at all. When the match is genuinely ambiguous, candidates are
 returned instead of a guess — a wrong target becomes a wrong proposal.
 
 A Deployment resolves to `{"scope": "deployment", namespace, name}`, as it
-always has; a StatefulSet or DaemonSet to `{"scope": "workload", "kind",
-namespace, name}` (II-25740).
+always has; a StatefulSet, DaemonSet or CronJob to `{"scope": "workload",
+"kind", namespace, name}` (II-25740).
 """
 
 import json
@@ -23,7 +23,8 @@ from ..stepkit import finish, options
 _SENTINEL = "RESOLUTION_JSON:"
 _MAX_CANDIDATES = 300
 _SYSTEM = (
-    "You map a request about a Kubernetes cluster onto the workloads (Deployments, StatefulSets, DaemonSets) "
+    "You map a request about a Kubernetes cluster onto the workloads (Deployments, StatefulSets, DaemonSets, "
+    "CronJobs) "
     "that actually exist. You never invent a namespace or workload name: every value you return must appear in "
     "the list you are given. If more than one workload plausibly matches, say so instead of choosing."
 )
@@ -44,11 +45,12 @@ _GENERATED = "[bcdfghjklmnpqrstvwxz2456789]"
 
 
 # A pod's name after its workload's: `<deployment>-<pod-template-hash>-<suffix>`, `<statefulset>-<ordinal>`,
-# `<daemonset>-<suffix>`.
+# `<daemonset>-<suffix>`, `<cronjob>-<scheduled minute>-<suffix>` (a scheduled run's pod).
 _POD_SUFFIX = {
     "Deployment": rf"-{_GENERATED}{{6,10}}-{_GENERATED}{{5}}",
     "StatefulSet": r"-\d+",
     "DaemonSet": rf"-{_GENERATED}{{5}}",
+    "CronJob": rf"-\d{{8,}}-{_GENERATED}{{5}}",
 }
 
 
@@ -153,15 +155,16 @@ async def run(ctx: StepContext) -> dict:
         f"Request:\n{ctx.prompt}\n\n"
         f"Default namespace (if the request names none): {default_ns or 'none'}\n"
         f"Namespaces that have workloads: {json.dumps(sorted(namespaces))}\n"
-        "Candidate workloads (namespace/name; a StatefulSet or DaemonSet has its kind in parentheses): "
+        "Candidate workloads (namespace/name; a StatefulSet, DaemonSet or CronJob has its kind in parentheses): "
         f"{json.dumps([_label(w) for w in shortlist])}\n\n"
         "Decide what the request is about: one workload, a whole namespace, or the whole cluster. "
         f"End your response with a line reading exactly '{_SENTINEL}' followed by ONLY a JSON object:\n"
         '{"scope": "deployment" | "workload" | "namespace" | "cluster", '
-        '"kind": "Deployment" | "StatefulSet" | "DaemonSet" | null, "namespace": "<namespace or null>", '
+        '"kind": "Deployment" | "StatefulSet" | "DaemonSet" | "CronJob" | null, "namespace": "<namespace or null>", '
         '"name": "<workload name or null>", "confident": true|false, '
         '"candidates": ["<candidate exactly as listed>", ...], "reasoning": "<one line>"}\n'
-        'Use scope "deployment" for a Deployment and "workload" (with its kind) for a StatefulSet or DaemonSet.'
+        'Use scope "deployment" for a Deployment and "workload" (with its kind) for a StatefulSet, DaemonSet or '
+        "CronJob."
     )
     raw = await ctx.tool("llm_complete")(ctx.config["llm"], _SYSTEM, user_prompt)
     try:
@@ -171,7 +174,7 @@ async def run(ctx: StepContext) -> dict:
 
     scope = parsed.get("scope") if parsed.get("scope") in ("deployment", "workload", "namespace", "cluster") else None
     namespace, name = parsed.get("namespace"), parsed.get("name")
-    kind = parsed.get("kind") if parsed.get("kind") in ("StatefulSet", "DaemonSet") and scope == "workload" else "Deployment"
+    kind = parsed.get("kind") if parsed.get("kind") in ("StatefulSet", "DaemonSet", "CronJob") and scope == "workload" else "Deployment"
     chosen = by_label.get(_label({"kind": kind, "namespace": namespace, "name": name})) if namespace and name else None
     candidates = [c for c in parsed.get("candidates") or [] if isinstance(c, str) and c in by_label]
 

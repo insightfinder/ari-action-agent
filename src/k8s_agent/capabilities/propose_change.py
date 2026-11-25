@@ -32,13 +32,17 @@ from ..tools import capacity, persistence, policy, quantities
 
 _SENTINEL = "CHANGE_JSON:"
 _SYSTEM = (
-    "You read a request to change a Kubernetes workload (a Deployment, StatefulSet or DaemonSet) or one of its "
-    "pods and report exactly what it asks for. You never invent or round a number. For every number you report "
+    "You read a request to change a Kubernetes workload (a Deployment, StatefulSet, DaemonSet or CronJob) or one "
+    "of its pods and report exactly what it asks for. You never invent or round a number. For every number you report "
     "you also give the exact words of the request it came from (a verbatim quote). If the request does not ask "
     "for a concrete change, say so."
 )
 def _container_summary(workload: dict) -> list[dict]:
     return [{"name": c["name"], "resources": c["resources"]} for c in workload["template"]["containers"]]
+
+
+def _images(workload: dict) -> list[str | None]:
+    return [c.get("image") for c in workload["template"]["containers"]]
 
 
 def _offered(kind: str) -> list:
@@ -50,7 +54,9 @@ async def _extract(ctx: StepContext, workload: dict, autoscaler: dict | None) ->
     context = {
         "workload": f"{workload.get('kind') or 'Deployment'} {workload['namespace']}/{workload['name']}",
         "current_replicas": workload.get("replicas"),
-        "containers": _container_summary(workload),
+        "containers": [{**c, "image": i} for c, i in zip(_container_summary(workload), _images(workload))],
+        **({"paused": bool(workload.get("paused"))} if "paused" in workload else {}),
+        **({"suspended": bool(workload.get("suspend")), "schedule": workload.get("schedule")} if "suspend" in workload else {}),
         "autoscaler": (
             {"kind": autoscaler.get("kind"), "name": autoscaler.get("name"), "min": autoscaler.get("min"), "max": autoscaler.get("max")}
             if autoscaler
@@ -68,6 +74,8 @@ async def _extract(ctx: StepContext, workload: dict, autoscaler: dict | None) ->
         '"min": <int or null>, "min_quote": "<verbatim or null>", "max": <int or null>, "max_quote": "<verbatim or null>", '
         '"container": "<container name or null>", "pod": "<pod name exactly as written in the request, or null>", '
         '"revision": <revision number to roll back to, or null for the previous one>, "revision_quote": "<verbatim or null>", '
+        '"image": "<full image reference exactly as written in the request, or null>", '
+        '"tag": "<image tag or version exactly as written, when the request gives only that, or null>", '
         '"resources": {"requests": {"cpu": {"value": "<quantity>", "quote": "<verbatim>"}, "memory": {...}}, '
         '"limits": {"cpu": {...}, "memory": {...}}}, '
         '"reasoning": "<one line>"}\n'
@@ -134,6 +142,12 @@ def _template_pod_labels(workload: dict) -> dict:
     return {**(workload["template"].get("labels") or {}), **(workload.get("selector") or {})}
 
 
+def _example(kind: str, name: str, namespace: str) -> str:
+    if kind == "CronJob":
+        return f"'suspend cronjob {name} in namespace {namespace}'"
+    return f"'restart {kind.lower()} {name} in namespace {namespace}'"
+
+
 # ------------------------------------------------------------------ run
 
 
@@ -180,7 +194,8 @@ async def run(ctx: StepContext) -> dict:
                 if kind == "Deployment"
                 else ""
             )
-            + f"'restart {kind.lower()} {name} in namespace {namespace}'.",
+            + _example(kind, name, namespace)
+            + ".",
             current={"kind": kind, "replicas": workload.get("replicas"), "containers": _container_summary(workload)},
         )
 

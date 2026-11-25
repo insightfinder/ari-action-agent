@@ -526,7 +526,13 @@ a request never carries cluster credentials.
     values** (a plain "scale X to 5" on a managed Deployment is refused,
     with its current min/max);
   - CPU and/or memory requests/limits of one container — **only the fields
-    the request states values for**.
+    the request states values for**;
+  - without a stated number, and only when the request's own words ask for
+    it (decided in code): a rolling restart, a rollback, deleting one pod,
+    a container's image (the image or tag written in the request), pausing
+    or resuming a Deployment's rollouts, and suspending or resuming a
+    CronJob. Full list:
+    docs/K8S_AGENT_INTERFACE.md, "Action names".
 
   Never below 1 replica. Targets above `options.high_replica_threshold`
   (default 30) are proposed with `risk_tier: critical`. CPU/memory values
@@ -562,9 +568,12 @@ are `a2a-task:k8s`, `plan_task`, one `capability:<name>` per step (`check_health
 1. `message/send` "scale checkout to 5 replicas" → the task ends in
    `TASK_STATE_INPUT_REQUIRED` with a `pending_action` artifact: `id`,
    `action` (`scale_replicas` | `set_autoscaler_bounds` | `set_resources` |
-   `resize_pod` | `restart_rollout` | `rollback` | `delete_pod`, see
-   docs/K8S_AGENT_INTERFACE.md; a restart, rollback or pod delete is
-   proposed only when the request's own words ask for it),
+   `resize_pod` | `restart_rollout` | `rollback` | `delete_pod` |
+   `set_image` | `pause_rollout` | `resume_rollout` | `suspend_cronjob` |
+   `resume_cronjob`, see docs/K8S_AGENT_INTERFACE.md;
+   every action that takes no stated number (a restart, rollback, pod
+   delete, image, pause/resume, CronJob change) is proposed only when the
+   request's own words ask for it),
    `action_name` (the line an approval email shows), `before`/`after`,
    `clamped`, `risk_tier`, `risks`, `capacity_outlook`, the server-side
    `dry_run` result, `drift_notice`, `persistence`, and a `snapshot` of

@@ -142,9 +142,10 @@ class Kube:
 
     def _create_sync(self, kind, namespace, body, dry_run, name, subresource) -> dict:
         k = _kind(kind)
-        # An eviction is a create on the pod's subresource; fieldManager is not a parameter there.
+        # An eviction is a create on the pod's subresource; fieldManager is not a parameter there. A plain
+        # create POSTs to the collection (the name is in the body): `.../jobs/<name>` would answer 405.
         query = self._write_query(dry_run, field_manager=subresource is None)
-        return self._request("POST", k.path(namespace, name, subresource), query, body)
+        return self._request("POST", k.path(namespace, name if subresource else None, subresource), query, body)
 
     # Fixed paths only: neither takes a value that could become part of a request path.
     def _server_version_sync(self) -> dict:

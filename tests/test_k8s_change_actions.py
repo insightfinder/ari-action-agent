@@ -29,6 +29,10 @@ _RESTARTED_AT = "kubectl.kubernetes.io/restartedAt"
 
 @pytest.fixture
 def cluster(monkeypatch):
+    return build_cluster(monkeypatch)
+
+
+def build_cluster(monkeypatch):
     fake = fx.FakeClient(base._cluster(), logs={})
     monkeypatch.setattr(read, "get_client", lambda: fake)
     monkeypatch.setattr(write, "get_client", lambda: fake)

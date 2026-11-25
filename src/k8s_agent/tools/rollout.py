@@ -153,6 +153,11 @@ def moved_away(dep: dict, target: dict) -> str | None:
     Deployment (a GitOps reconcile, a Helm upgrade, a person) can put its own value back while the
     rollout is watched; the rollout then never completes, and that is not "still in progress"."""
     kind = target.get("kind")
+    if kind == "paused":
+        if bool(dep.get("paused")) != bool(target.get("paused")):
+            state = "paused" if dep.get("paused") else "not paused"
+            return f"the Deployment is {state} again"
+        return None
     if kind == "replicas":
         if dep.get("replicas") != target.get("replicas"):
             return f"spec.replicas is {dep.get('replicas')} again, not the approved {target.get('replicas')}"
@@ -592,16 +597,29 @@ async def wait_workload_rollout(
     applied_at: str | None,
     max_wait_seconds: float,
     poll_seconds: float = POLL_SECONDS,
+    target: dict | None = None,
 ) -> dict:
-    """Poll a StatefulSet or DaemonSet after a template change (a restart) until its controller reports the
-    rollout complete, then watch the new pods for STABILITY_SECONDS. A StatefulSet replaces one pod at a time
-    and waits for each to be ready, so a long one often ends `in_progress`: not a failure."""
+    """Poll a StatefulSet or DaemonSet after a template change (a restart, an image) until its controller
+    reports the rollout complete, then watch the new pods for STABILITY_SECONDS. A StatefulSet replaces one pod
+    at a time and waits for each to be ready, so a long one often ends `in_progress`: not a failure. With
+    `target` (`{"kind": "images", ...}`), an approved value put back while watched ends it as `reverted`."""
     applied = _parse(applied_at)
     started = time.monotonic()
     stable_since: float | None = None
     baseline: dict = {}
     while True:
         view = await read.get_workload(kind, namespace, name)
+        moved = moved_away(view, target) if target else None
+        if moved:
+            return {
+                "done": True,
+                "status": "reverted",
+                "detail": (
+                    f"The change was applied, then undone: {moved}. Something that manages this {kind}, most "
+                    "likely a GitOps reconcile or a Helm upgrade, restored its own value."
+                ),
+                "waited_seconds": round(time.monotonic() - started),
+            }
         pods = await read.list_pods(namespace, selector=view.get("label_selector") or view.get("selector") or None, active_only=True)
         new = _new_pods([p for p in pods if governance.owned_by(p, kind, name)], applied)
         elapsed = round(time.monotonic() - started)
@@ -639,10 +657,106 @@ async def wait_workload_rollout(
                 "done": True,
                 "status": "in_progress",
                 "note": (
-                    f"The restart is applied but the {kind} had not finished rolling out when the wait window "
+                    f"The change is applied but the {kind} had not finished rolling out when the wait window "
                     f"({int(max_wait_seconds)}s) ended"
                     + ("; a StatefulSet replaces its pods one at a time" if kind == "StatefulSet" else "")
                     + ". This is not a failure; check it again later."
                 ),
             }
         await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
+
+
+# ---------------------------------------------------------------- a paused or resumed Deployment, a CronJob
+
+
+async def wait_paused(
+    namespace: str,
+    name: str,
+    paused: bool,
+    max_wait_seconds: float,
+    poll_seconds: float = POLL_SECONDS,
+) -> dict:
+    """Poll after `spec.paused` was set until the Deployment controller has acted on it: it has observed the
+    new generation and its Progressing condition says `DeploymentPaused` (or, resumed, no longer does). A
+    Deployment whose rollout had already timed out keeps `ProgressDeadlineExceeded` through a pause (the
+    controller never overwrites it; seen on test, 2026-11-25), so that counts too. The value must then hold for
+    STABILITY_SECONDS: something that manages the Deployment may put its own back. A resume that has a template
+    change to roll out is verified by `wait_rollout` instead."""
+    started = time.monotonic()
+    held_since: float | None = None
+    while True:
+        dep = await read.get_deployment(namespace, name)
+        elapsed = round(time.monotonic() - started)
+        progressing = next((c for c in dep.get("conditions") or [] if c.get("type") == "Progressing"), None) or {}
+        base = {"paused": bool(dep.get("paused")), "progressing_reason": progressing.get("reason"), "waited_seconds": elapsed}
+        if bool(dep.get("paused")) != paused:
+            return {
+                **base,
+                "done": True,
+                "status": "reverted",
+                "detail": (
+                    f"spec.paused was set to {str(paused).lower()}, then changed back. Something that manages this "
+                    "Deployment, a person or a GitOps reconcile, restored its own value."
+                ),
+            }
+        observed = (dep.get("observed_generation") or 0) >= (dep.get("generation") or 0)
+        reason = progressing.get("reason")
+        if paused:
+            acted = observed and reason in ("DeploymentPaused", "ProgressDeadlineExceeded", None)
+        else:
+            acted = observed and reason != "DeploymentPaused"
+        if acted:
+            held_since = held_since if held_since is not None else time.monotonic()
+            held = time.monotonic() - held_since
+            if held >= STABILITY_SECONDS:
+                return {**base, "done": True, "status": "succeeded", "stable_for_seconds": round(held)}
+        else:
+            held_since = None
+        if elapsed >= max_wait_seconds:
+            return {
+                **base,
+                "done": True,
+                "status": "in_progress",
+                "note": (
+                    f"spec.paused is {str(paused).lower()}, but when the wait window ({int(max_wait_seconds)}s) ended "
+                    "the Deployment controller had not reported it yet. This is not a failure; check again later."
+                ),
+            }
+        await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
+
+
+async def wait_cronjob_suspend(
+    namespace: str,
+    name: str,
+    suspend: bool,
+    max_wait_seconds: float,
+    poll_seconds: float = POLL_SECONDS,
+) -> dict:
+    """Poll after a CronJob's `spec.suspend` was set until it has held for STABILITY_SECONDS. No controller
+    acknowledges a suspend, so holding is the evidence: a GitOps reconcile or a person may put the old value
+    back. Jobs already running are reported (`active_jobs`); a suspend does not stop them. A resume may start
+    a run at once for a schedule missed while suspended; it shows here as an active Job."""
+    started = time.monotonic()
+    while True:
+        cj = await read.get_workload("CronJob", namespace, name)
+        elapsed = round(time.monotonic() - started)
+        status = cj.get("status") or {}
+        base = {
+            "suspend": bool(cj.get("suspend")),
+            "active_jobs": status.get("active_jobs") or [],
+            "last_schedule_time": status.get("last_schedule_time"),
+            "waited_seconds": elapsed,
+        }
+        if bool(cj.get("suspend")) != suspend:
+            return {
+                **base,
+                "done": True,
+                "status": "reverted",
+                "detail": (
+                    f"spec.suspend was set to {str(suspend).lower()}, then changed back. Something that manages this "
+                    "CronJob, most likely a GitOps reconcile or a Helm upgrade, restored its own value."
+                ),
+            }
+        if elapsed >= min(STABILITY_SECONDS, max_wait_seconds):
+            return {**base, "done": True, "status": "succeeded", "stable_for_seconds": elapsed}
+        await asyncio.sleep(min(poll_seconds, max(1.0, STABILITY_SECONDS - elapsed)))

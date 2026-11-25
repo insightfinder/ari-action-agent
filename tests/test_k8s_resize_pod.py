@@ -243,7 +243,10 @@ async def test_the_extraction_prompt_offers_every_registered_action_and_a_pod_fi
     llm = ScriptedLLM(_CPU_LIMIT)
     await propose_change.run(_ctx("propose_change", "resize pod checkout-1 in place: cpu limit 2", results=_resolved("checkout"), llm=llm))
     prompt = llm.prompts[0]
-    assert all(f'"{name}"' in prompt for name in actions.REGISTRY) and '"pod":' in prompt
+    # Every action a Deployment can take; the CronJob-only ones are offered only for a CronJob.
+    offered = [name for name, spec in actions.REGISTRY.items() if "Deployment" in spec.workload_kinds]
+    assert all(f'"{name}"' in prompt for name in offered) and '"pod":' in prompt
+    assert not any(f'"{name}"' in prompt for name in actions.REGISTRY if name not in offered)
 
 
 async def test_qos_class():

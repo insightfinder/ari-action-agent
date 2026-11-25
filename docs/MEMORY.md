@@ -5616,3 +5616,98 @@ this run and applied again at once.
 listed every file on disk, so a Finder `.DS_Store` (already in .gitignore) failed it on macOS checkouts. It now
 leaves out what `git check-ignore` reports (falling back to `.DS_Store`/`__pycache__` without git); an untracked,
 not-ignored stray file still fails it (checked). Full suite on 3.12: 1202 passed, 0 failed.
+
+## 2026-11-25 - II-25740 write batch 2: set_image, pause/resume rollout, CronJob suspend/resume (trigger built, then removed)
+
+Branch `II-25740-Expand-k8s-agent-capabilities` (batch 1 already merged into test). Six new actions, each
+proposed only when the request's own words ask for it (code gates in `tools/policy.py`, with Chinese
+state-description exclusions such as 被暂停/已恢复/恢复正常/告警触发 and longer negations 不要/不用/无需, which also
+apply to the batch 1 gates now):
+- `set_image` (Deployment/StatefulSet/DaemonSet, `actions/set_image.py`): strategic merge on one container by
+  name. The image must be written in the request verbatim and not as part of a longer reference (`app:1.2` is
+  not stated by `app:1.2.3` or `evil.io/app:1.2`; a sentence-final period is fine), or a tag written as a tag
+  ("tag 1.4", "version 1.4", "name:1.4"), put on the current repository (registry ports kept). The container
+  must exist in the live template (a strategic merge with an unknown name would add a container); a different
+  repository is a `high` risk. Restart's strategy refusals/risks were factored into
+  `restart_rollout.rollout_blocked` / `rollout_effects` and are shared. STS/DS verification passes the image
+  target to `wait_workload_rollout`, which now reports `reverted` too.
+- `pause_rollout` / `resume_rollout` (`actions/pause_rollout.py`): `spec.paused`. Checked on test first
+  (2026-11-25, e2e-plain): while paused, a template change leaves `status.updatedReplicas` unset (0) with
+  Progressing `DeploymentPaused`; with the template back to the current ReplicaSet's, `updatedReplicas` is
+  the replica count again; after resume the reason went straight to `NewReplicaSetAvailable`. So "a resume
+  will replace pods" = replicas - updated (or all, when the controller has not observed the latest
+  generation): `pending_pods`. Verified by new `rollout.wait_paused` (controller condition + value held), or
+  `wait_rollout` when pods roll.
+- CronJob: `find_workload` / `get_workload` / `list_workloads` resolve CronJobs (`governance.RESOLVABLE_KINDS`;
+  `WORKLOAD_KINDS` unchanged, so restart/delete are not offered for one). `check_health` of a CronJob takes
+  the pods of its Jobs by name (`<cronjob>-<minutes>` scheduled, `<cronjob>-manual-<5>` ours;
+  `governance.is_cronjob_job`) and reports `Suspended` (info). `cronjob_view` gained
+  `starting_deadline_seconds`; `_owner` in views gained `uid`.
+- `suspend_cronjob` / `resume_cronjob` (`actions/cronjob.py`): merge patch `spec.suspend`; persistence names the
+  `suspend` field (charts set it; a Helm upgrade puts it back). Resume without `startingDeadlineSeconds` lists
+  "may start one run at once" (Kubernetes documents it for unsuspend). Verified by `wait_cronjob_suspend`
+  (value held for 45 s; no controller acknowledges a suspend).
+- `trigger_cronjob`: creates a Job from the CronJob's own `jobTemplate`, built in `build_operations` (template
+  never in the proposal: env values), with a uid check of the CronJob. Body mirrors
+  `kubectl create job --from=cronjob/...` as checked on test with `--dry-run=client -o yaml`: annotation
+  `cronjob.kubernetes.io/instantiate: manual`, ownerReference to the CronJob with `controller: true` and no
+  `blockOwnerDeletion`. Name `<cronjob>-manual-<5 chars>` fixed at proposal time, so a retried apply finds the
+  Job (owned by the approved CronJob uid, read through the new `ActionSpec.load_apply_state` hook and `get_job`
+  tool) and only verifies. `summarize` returns metadata only. Verified by `wait_job`: `succeeded` (Complete),
+  `job_failed`, `new_pods_failing`, `unschedulable`, `in_progress`, `job_missing`.
+- Bug found before use: `Kube._create_sync` put the object name in the path, so a plain create would POST to
+  `.../jobs/<name>` (405); only the eviction (a subresource create) had used it. Now the name goes in the path
+  only with a subresource; a client test pins `POST /apis/batch/v1/namespaces/shop/jobs`.
+- RBAC: `patch` cronjobs and `create` jobs (batch): docs/examples/k8s-rbac.yaml and oncallari 0.3.16 (charts
+  branch `II-25740-k8s-agent-cronjob-actions`, from origin/main, uncommitted). `create jobs` cannot be limited
+  by RBAC to "from a CronJob"; the ServiceAccount could already run any pod spec through its existing `patch`
+  on deployments/statefulsets/daemonsets, so the grant adds no new class of power; what the agent creates is
+  limited in code. The "Never" list in K8S_AGENT_INTERFACE.md now records the Job carve-out.
+- Interface: K8S_AGENT_INTERFACE.md (fields, statuses, action names, mcp-service follow-up list), DEVELOPER_GUIDE,
+  README, meta (planner/agent card), capabilities.yaml descriptions and tool lists, tools.yaml.
+- e2e: fixture CronJob `e2e-cron` (fires once a year; busybox echo) applied to `ari-k8s-e2e` on test;
+  live scenarios `set_image`, `set_image_statefulset`, `pause_resume`, `health_cronjob`,
+  `suspend_resume_cronjob`, `trigger_cronjob`; RBAC lists in the script updated; tests hold them.
+
+Verified: suite on Python 3.12 — 1278 passed, 11 skipped (one existing test changed openly:
+`test_the_extraction_prompt_offers_every_registered_action...` now expects the Deployment's actions only, since
+CronJob actions are offered for CronJobs only). On test, with my kubeconfig and impersonating
+`system:serviceaccount:insightfinder:ari-k8s` (chart 0.3.15), the specs' own plans + server dry runs of
+set_image (Deployment, StatefulSet), pause_rollout, suspend_cronjob and trigger_cronjob: all passed as admin
+and changed nothing (generation, paused, suspend, image unchanged; no Job created by the dry-run create); as the
+ServiceAccount the first three passed and the CronJob two answered 403 naming the missing rule (the proposal
+then refuses with the rule).
+
+Review fixes and live checks (same day, after an advisor review):
+- The run-now gate allowed 30 characters between "run" and "now", so the live scenario's own prompt and the
+  refusal's example ("run cronjob <name> in namespace <ns> now") were refused. It now allows 100 but only where
+  "run" is the verb asked for (clause start, or after please / can you / to / and ...), so "its last run failed
+  now" does not count. A test runs every refusal example and every live-script prompt through its own gate.
+- `resume_rollout` approved as "replaces no pod" now refuses when the template changed while paused after the
+  proposal (image automation on test does this several times an hour), and its verifier picks `wait_rollout`
+  from the state the write starts from, not only from the proposal.
+- Checked on test (temporary Deployment `e2e-stuck` in ari-k8s-e2e, deleted after): pausing a Deployment
+  whose rollout already hit `ProgressDeadlineExceeded` keeps that reason (never `DeploymentPaused`), and so does
+  resuming it. `wait_paused` accepts it.
+- Checked on test with three `kubectl create job --from=cronjob/e2e-cron` Jobs (the agent's body): the CronJob
+  controller does not put manual Jobs in `status.active` (it records `UnexpectedJob` events), so
+  `concurrencyPolicy` does not hold back a scheduled run beside a manual one (the proposal says so for
+  Forbid/Replace); `successfulJobsHistoryLimit` 2 did prune the oldest manual Job. Probe Jobs deleted.
+- Known gap, not fixed: a retried trigger apply whose first Job is already gone (deleted, `ttlSecondsAfterFinished`,
+  or pruned by a history limit of 0) cannot see that the run happened and starts a second one.
+- Suite on 3.12 after the fixes: 1281 passed, 11 skipped.
+Not verified yet: the in-cluster e2e (needs this branch's image and chart 0.3.16).
+
+**`trigger_cronjob` removed (user decision, 2026-11-25).** Asked what creating Jobs was for (re-running a
+CronJob outside its schedule, e.g. a failed `insightfinder-keda-discovery-sync` run, the only CronJob on stg and
+prod), the user decided the agent does not do this; a run outside the schedule stays a person's
+`kubectl create job --from=cronjob/<name>`. Removed: `TriggerCronJob`, `asks_trigger_cronjob`, the `get_job` /
+`wait_job` tools, the `load_apply_state` hook, the manual Job naming helpers (`is_cronjob_job` now matches
+scheduled runs `<cronjob>-<minutes>` only), the owner `uid` added to views, the fake client's create, the
+`trigger_cronjob` live scenario and its tests. RBAC: no `create` on jobs anywhere (example manifest, oncallari
+0.3.16, which now adds only `patch` on cronjobs; the live script's `rbac` scenario expects `create jobs` denied).
+The "Never" list is unchanged apart from recording the declined `trigger_cronjob`. Kept: the `_create_sync` path
+fix and its client test (a plain create posts to the collection), since any future create needs it. The live
+findings above about manual Jobs (not in `status.active`, pruned by history limits) stay as facts about
+Kubernetes. Suite on 3.12 after the removal: 1268 passed, 11 skipped, 0 failed.
+

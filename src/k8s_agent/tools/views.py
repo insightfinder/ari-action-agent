@@ -515,6 +515,7 @@ def cronjob_view(raw: dict) -> dict:
         "time_zone": spec.get("timeZone"),
         "suspend": bool(spec.get("suspend")),
         "concurrency_policy": spec.get("concurrencyPolicy", "Allow"),
+        "starting_deadline_seconds": spec.get("startingDeadlineSeconds"),
         "successful_jobs_history_limit": spec.get("successfulJobsHistoryLimit", 3),
         "failed_jobs_history_limit": spec.get("failedJobsHistoryLimit", 1),
         "status": {

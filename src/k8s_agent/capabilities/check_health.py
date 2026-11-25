@@ -115,7 +115,8 @@ async def run(ctx: StepContext) -> dict:
         deployments = [dep]
         pods = await ctx.tool("list_pods")(namespace, dep.get("label_selector") or dep.get("selector") or None)
     elif scope == "workload":
-        # A StatefulSet or DaemonSet: its own pods, never widened to the namespace.
+        # A StatefulSet, DaemonSet or CronJob: its own pods (a CronJob's are its Jobs'), never widened to the
+        # namespace.
         workload = await ctx.tool("get_workload")(target["kind"], namespace, target["name"])
         deployments = []
         selected = await ctx.tool("list_pods")(namespace, workload.get("label_selector") or workload.get("selector") or None)
@@ -131,7 +132,12 @@ async def run(ctx: StepContext) -> dict:
         gaps.append(f"events could not be read: {exc}")
     if scope in ("deployment", "workload"):
         own_pods = {p.get("name") for p in pods}
-        events = [e for e in events if _belongs_to((e.get("involved") or {}).get("name"), target["name"], own_pods)]
+        events = [
+            e
+            for e in events
+            if _belongs_to((e.get("involved") or {}).get("name"), target["name"], own_pods)
+            or (target.get("kind") == "CronJob" and governance.is_cronjob_job((e.get("involved") or {}).get("name"), target["name"]))
+        ]
     if not events:
         gaps.append(
             "No Warning events in the last 60 minutes. Events expire (about an hour by default), so this "
