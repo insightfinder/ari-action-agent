@@ -83,3 +83,23 @@ async def test_a_change_to_a_node_is_refused(cluster):
     llm = ScriptedLLM(_change(action="cordon_node"))
     result = await propose_change.run(_ctx("propose_change", "drain node node-a", results=_NODE, llm=llm))
     assert "does not change nodes" in result["refusal"]["reason"] and not cluster.patches and llm.prompts == []
+
+
+async def test_nodes_are_not_listed_when_a_workload_is_named(cluster, monkeypatch):
+    listed = []
+    original = cluster.list
+
+    async def recording(kind, *args, **kwargs):
+        listed.append(kind)
+        return await original(kind, *args, **kwargs)
+
+    monkeypatch.setattr(cluster, "list", recording)
+    result = await find_workload.run(_ctx("find_workload", "scale checkout to 3", llm=ScriptedLLM()))
+    assert result["resolution"]["name"] == "checkout" and "Node" not in listed
+
+
+async def test_a_failed_node_list_does_not_block_the_resolution(cluster):
+    cluster.forbidden.add("Node")
+    llm = ScriptedLLM('RESOLUTION_JSON: {"scope": "deployment", "namespace": "shop", "name": "checkout", "confident": true}')
+    result = await find_workload.run(_ctx("find_workload", "why is the shop front slow", llm=llm, options={"namespace": "shop"}))
+    assert result["resolution"]["name"] == "checkout"

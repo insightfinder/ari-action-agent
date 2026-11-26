@@ -101,39 +101,66 @@ def asks_in_place(prompt: str) -> bool:
 
 
 # Requests for a change that takes no value (restart, delete). The model picks the action; these decide
-# whether the request's own words ask for it. A match right after a negation ("without a restart", "不重启",
-# "don't delete") does not count, and neither do the words health findings use ("restarted 5 times", "restart
-# count", "重启了 5 次").
-_RESTART_WORDS = re.compile(
-    r"(?i)(\brestart\b(?!\s*(?:count|policy|loop|times?)\b)|\bbounce\b|\brecycle\b|重启(?!\s*了?\s*\d+\s*次|次数|策略))"
+# whether the request's own words ask for it. A verb right after a negation ("without a restart", "不重启",
+# "don't delete") does not count, and neither do the words health findings and questions use: "restarted 5
+# times", "restart count", "restart failed", "重启了很多次", "一直在重启", "why does it restart?".
+_RESTART_EN = r"\brestart\b(?!\s*(?:count|policy|loop|times?|fail(?:ed|ing|ures?)?|errors?)\b)"
+_RESTART_ZH = (
+    r"重启(?!\s*了?\s*(?:\d+|很多|好多|多|好几|几|数|若干|[一二两三四五六七八九十百千]+)\s*[次回遍]"
+    r"|\s*次数|\s*策略|\s*失败|\s*不了)"
 )
+_RESTART_WORDS = (re.compile(rf"(?i)(?P<verb>{_RESTART_EN}|\bbounce\b|\brecycle\b|{_RESTART_ZH})"),)
 # "restart pod X" counts: a pod is restarted by deleting it so its controller recreates it (kubectl has no other way).
-_POD_VERB = r"(?:delete|kill|remove|restart(?!\s*(?:count|policy|loop|times?)\b))"
-_POD_VERB_ZH = r"(?:删除|删掉|杀掉|干掉|重启(?!\s*了?\s*\d+\s*次|次数|策略))"
-_DELETE_POD_WORDS = re.compile(
-    rf"(?i)(\b{_POD_VERB}\b[^.\n]{{0,60}}\bpods?\b|\bpods?\b[^.\n]{{0,60}}\b{_POD_VERB}\b"
-    rf"|{_POD_VERB_ZH}[^。\n]{{0,30}}pod|pod[^。\n]{{0,30}}{_POD_VERB_ZH})"
+_POD_VERB = rf"(?P<verb>\b(?:delete|kill|remove)\b|{_RESTART_EN})"
+_POD_VERB_ZH = rf"(?P<verb>删除|删掉|杀掉|干掉|{_RESTART_ZH})"
+# One pattern per word order, so the check below looks at the words right before the verb itself
+# ("pod x 不要删掉": the negation sits between the pod and the verb).
+_DELETE_POD_WORDS = (
+    re.compile(rf"(?i){_POD_VERB}[^.\n]{{0,60}}\bpods?\b"),
+    re.compile(rf"(?i)\bpods?\b[^.\n]{{0,60}}{_POD_VERB}"),
+    re.compile(rf"(?i){_POD_VERB_ZH}[^。\n]{{0,30}}pod"),
+    re.compile(rf"(?i)pod[^。\n]{{0,30}}{_POD_VERB_ZH}"),
 )
 # Also what reports an attempt rather than asks for one: "we tried to upgrade it", "it failed to restart".
 _NEGATION = re.compile(
     r"(?i)(\b(no|not|without|never|don'?t|do\s+not|avoid|didn'?t|did\s+not|can'?t|cannot|couldn'?t|won'?t|wasn'?t"
     r"|(?:tried|failed|attempted|unable|trying)\s+to)\b[^.\n,;]{0,12}|(不要|不用|不必|无需|不需要|[不无没别勿])\s*)$"
 )
+# Right before the verb: it describes what happens or asks about it ("keeps", "does it", "一直在", "为什么").
+# A question word counts only when no "and", "then" or comma stands between it and the verb: "check why it
+# fails and restart checkout" still asks for a restart.
+_REPORTED = re.compile(
+    r"(?i)((?:\bwhy\b|\bhow\s+(?:often|many|come)\b)(?:(?!\band\b|\bthen\b|,).)*$"
+    r"|\b(?:does|did)\s+(?:it|they|the\s+[\w-]+|[\w.-]+)\s*$"
+    r"|(?:为什么|为何|怎么)(?:(?!然后|并且|再|和|，|,).)*$"
+    r"|(?:一直|不停地?|不断地?|反复|频繁|持续|总是|老是|经常|正在|(?<!现)在|又|会)\s*$)"
+)
+_SENTENCE_END = re.compile(r"[.?!。？！\n]")
 
 
-def _asks(pattern: re.Pattern, prompt: str) -> bool:
+def _asks(patterns, prompt: str, reported: bool = False) -> bool:
+    """Whether one of `patterns` matches where the words right before its verb (named group `verb`, else the
+    match) are not a negation, nor (with `reported`) a report of or a question about it."""
     text = prompt or ""
-    return any(not _NEGATION.search(text[max(0, m.start() - 24) : m.start()]) for m in pattern.finditer(text))
+    for pattern in patterns:
+        for m in pattern.finditer(text):
+            at = m.start("verb") if "verb" in pattern.groupindex else m.start()
+            before = text[max(0, at - 24) : at]
+            before = _SENTENCE_END.split(before)[-1]
+            if _NEGATION.search(before) or (reported and _REPORTED.search(before)):
+                continue
+            return True
+    return False
 
 
 def asks_restart(prompt: str) -> bool:
     """Does the request itself ask for a (rolling) restart?"""
-    return _asks(_RESTART_WORDS, prompt)
+    return _asks(_RESTART_WORDS, prompt, reported=True)
 
 
 def asks_delete_pod(prompt: str) -> bool:
     """Does the request itself ask for a pod to be deleted?"""
-    return _asks(_DELETE_POD_WORDS, prompt)
+    return _asks(_DELETE_POD_WORDS, prompt, reported=True)
 
 
 # A disk (PVC) size change: the request names a disk and asks for it to be larger (or smaller, which is refused).
@@ -157,9 +184,14 @@ def names_disk(prompt: str) -> bool:
     return bool(_DISK_WORDS.search(text))
 
 
-def asks_disk_size_change(prompt: str) -> bool:
-    """Does the request itself ask for a disk's size to change, and nothing about CPU, memory or replicas?"""
-    return names_disk(prompt) and not _NOT_A_DISK_SIZE.search(prompt or "") and _asks(_SIZE_CHANGE_WORDS, prompt)
+def asks_disk_size_change(prompt: str, names: list[str] | None = None) -> bool:
+    """Does the request itself ask for a disk's size to change, and nothing about CPU, memory or replicas?
+    `names` (the PVC and workload names the request is about) are left out first: a PVC called
+    `redis-data-redis-replicas-0` is not a request about replicas."""
+    text = prompt or ""
+    for name in sorted({n for n in names or [] if n}, key=len, reverse=True):
+        text = re.sub(rf"(?i)(?<![\w-]){re.escape(name)}(?![\w-])", " ", text)
+    return names_disk(text) and not _NOT_A_DISK_SIZE.search(text) and _asks((_SIZE_CHANGE_WORDS,), text)
 
 
 # A storage size as people write it: 20Gi, 20 GiB, 500G, 1.5TB. Units are required, so a PVC name's ordinal

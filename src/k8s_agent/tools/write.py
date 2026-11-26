@@ -19,14 +19,10 @@ tests pin which capability holds which.)
 
 from .. import actions
 from ..actions.base import Operation
-from .client import PATCH_JSON, PATCH_MERGE, PATCH_STRATEGIC, get_client, safe_error
+from .client import PATCH_MERGE, PATCH_STRATEGIC, get_client, safe_error
 
 ACTIONS = actions.ACTIONS
-_PATCH_TYPES = {"merge": PATCH_MERGE, "strategic": PATCH_STRATEGIC, "json": PATCH_JSON}
-
-
-def build_operations(action: dict) -> list[Operation]:
-    return actions.get(action.get("action")).operations(action)
+_PATCH_TYPES = {"merge": PATCH_MERGE, "strategic": PATCH_STRATEGIC}
 
 
 async def _execute(kube, op: Operation, dry_run: bool) -> dict:
@@ -34,18 +30,13 @@ async def _execute(kube, op: Operation, dry_run: bool) -> dict:
         return await kube.patch(op.kind, op.name, op.namespace, op.body, _PATCH_TYPES[op.patch_type], dry_run, op.subresource)
     if op.verb == "delete":
         return await kube.delete(op.kind, op.name, op.namespace, dry_run, preconditions=op.preconditions)
-    if op.verb == "create":
-        return await kube.create(op.kind, op.namespace, op.body, dry_run, op.name, op.subresource)
     raise ValueError(f"unknown verb {op.verb!r}")
 
 
 async def _run(action: dict, dry_run: bool) -> dict:
     spec = actions.get(action.get("action"))
     kube = get_client()
-    try:
-        operations = await spec.build_operations(action, kube)
-    except Exception as exc:  # noqa: BLE001 — a read the operations need failed
-        raise RuntimeError(f"could not prepare {action.get('action')}: {safe_error(exc)}") from None
+    operations = spec.operations(action)
     summaries = []
     for op in operations:
         try:

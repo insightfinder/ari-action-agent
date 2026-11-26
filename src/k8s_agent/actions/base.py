@@ -18,13 +18,13 @@ from ..tools import governance
 class Operation:
     """One API call a change makes. `resource` is the label results and summaries use ("Deployment.Scale")."""
 
-    verb: str  # "patch" | "delete" | "create"
+    verb: str  # "patch" | "delete"
     kind: str
     name: str | None
     namespace: str | None
     resource: str
     body: dict | None = None
-    patch_type: str | None = None  # "merge" | "strategic" | "json" (patch only)
+    patch_type: str | None = None  # "merge" | "strategic" (patch only)
     subresource: str | None = None
     # delete only: e.g. {"uid": ...}, so the API server deletes that very object or answers 409.
     preconditions: dict | None = None
@@ -80,8 +80,8 @@ class ActionSpec:
 
     def accepts(self, prompt: str) -> bool:
         """Whether the request's own words ask for this kind of change, decided in code. The model's choice of
-        action alone is never enough for a change that does not take a quoted value (a restart, a rollback, a
-        delete): an on-call prompt quoting "restarted 5 times" is not a request to restart."""
+        action alone is never enough for a change that does not take a quoted value (a restart, a delete): an
+        on-call prompt quoting "restarted 5 times" is not a request to restart."""
         return True
 
     async def resolve_target(self, ctx, workload: dict, change: dict) -> tuple[dict | None, dict | None]:
@@ -117,12 +117,6 @@ class ActionSpec:
 
     def operations(self, action: dict) -> list[Operation]:
         raise NotImplementedError
-
-    async def build_operations(self, action: dict, kube) -> list[Operation]:
-        """The operations to run, for the dry run and the real write alike. Called inside the write tools
-        only, with the client: an action whose body cannot travel in the proposal (a rollback's full pod
-        template holds env values) reads it here, so it never reaches a step result or an artifact."""
-        return self.operations(action)
 
     def summarize(self, op: Operation, raw: dict, action: dict) -> dict:
         meta = raw.get("metadata") or {}
@@ -165,6 +159,7 @@ class DeploymentAction(ActionSpec):
     def snapshot(self, state: dict) -> dict:
         dep = state["deployment"]
         return {
+            "deployment_uid": dep.get("uid"),
             "deployment_generation": dep["generation"],
             "deployment_replicas": dep["replicas"],
             "container_resources": {c["name"]: c["resources"] for c in dep["template"]["containers"]},
@@ -176,10 +171,15 @@ class DeploymentAction(ActionSpec):
         return {"labels": dep["labels"], "annotations": dep["annotations"]}
 
     def drift(self, proposal: dict, state: dict) -> list[str]:
-        """The autoscaler governing the Deployment, compared for every Deployment action: its appearance,
-        disappearance or change invalidates any approval."""
+        """Compared for every Deployment action: the Deployment's uid, and the autoscaler governing it (its
+        appearance, disappearance or change invalidates any approval)."""
         snapshot = proposal["snapshot"]
         changes = []
+        # Deleted and made again (by hand, or by a GitOps tool after a rename) is another Deployment. Proposals
+        # made before the uid was recorded carry none.
+        uid = (state.get("deployment") or {}).get("uid")
+        if snapshot.get("deployment_uid") and uid != snapshot["deployment_uid"]:
+            changes.append("the Deployment was deleted and created again (new uid)")
         current_fp = governance.autoscaler_fingerprint(state.get("autoscaler"))
         proposed_fp = snapshot.get("autoscaler")
         if (current_fp is None) != (proposed_fp is None):

@@ -21,7 +21,6 @@ from test_k8s_change_actions import _apply, _approved, build_cluster  # noqa: E4
 from k8s_agent.capabilities import propose_change  # noqa: E402
 from k8s_agent.tools import protection  # noqa: E402
 
-pytestmark = pytest.mark.asyncio
 _SCALE = _change(action="scale_replicas", replicas=4, replicas_quote="4")
 
 
@@ -36,6 +35,7 @@ async def _propose_with(llm, prompt, results):
     return await propose_change.run(_ctx("propose_change", prompt, results=results, llm=llm))
 
 
+@pytest.mark.asyncio
 async def test_a_change_in_a_system_namespace_is_refused_without_asking_the_model(cluster):
     llm = ScriptedLLM(_SCALE)
     result = await _propose_with(llm, "scale coredns to 4", _resolved("coredns", namespace="kube-system"))
@@ -43,6 +43,7 @@ async def test_a_change_in_a_system_namespace_is_refused_without_asking_the_mode
     assert llm.prompts == [] and not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_a_protected_workload_is_refused(cluster, monkeypatch):
     monkeypatch.setenv("K8S_AGENT_PROTECTED_WORKLOADS", "shop/check*, other/ari-k8s-worker")
     llm = ScriptedLLM(_SCALE)
@@ -51,12 +52,14 @@ async def test_a_protected_workload_is_refused(cluster, monkeypatch):
     assert llm.prompts == [] and not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_a_pod_of_a_protected_workload_is_refused(cluster, monkeypatch):
     monkeypatch.setenv("K8S_AGENT_PROTECTED_WORKLOADS", "shop/checkout")
     result = await _propose_with(ScriptedLLM(_change(action="delete_pod", pod="checkout-1")), "delete pod checkout-1", _resolved("checkout"))
     assert "protected" in result["refusal"]["reason"] and not cluster.deletes
 
 
+@pytest.mark.asyncio
 async def test_an_approval_after_the_workload_became_protected_is_not_applied(cluster, monkeypatch):
     pa = await _approved(cluster, "scale checkout to 4", _SCALE)
     monkeypatch.setenv("K8S_AGENT_PROTECTED_WORKLOADS", "shop/checkout")
@@ -65,6 +68,7 @@ async def test_an_approval_after_the_workload_became_protected_is_not_applied(cl
     assert not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_a_pod_delete_approved_before_its_workload_became_protected_is_not_applied(cluster, monkeypatch):
     pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
     monkeypatch.setenv("K8S_AGENT_PROTECTED_WORKLOADS", "shop/checkout")
@@ -73,6 +77,7 @@ async def test_a_pod_delete_approved_before_its_workload_became_protected_is_not
     assert not cluster.deletes
 
 
+@pytest.mark.asyncio
 async def test_the_clusters_admission_policy_answer_is_a_refusal(cluster, monkeypatch):
     async def denied(kind, name, namespace, body, content_type, dry_run, subresource=None):
         raise fx.api_error(

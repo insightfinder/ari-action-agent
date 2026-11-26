@@ -7,8 +7,9 @@ log at the bottom, with the date and ticket.** The agent's own design lives in d
 ## Request
 
 A2A message: the prompt as a TextPart and one DataPart `{"llm": {...}, "options": {"namespace"?,
-"high_replica_threshold"?, "node_headroom_ratio"?}}`. A confirmation resumes the paused task with
-`{"confirm_pending_action": {"id": "<pending_action.id>"}}`. No cluster credential is ever sent.
+"high_replica_threshold"?, "node_headroom_ratio"?, "proposal_max_age_hours"?}}`. A confirmation resumes the
+paused task with `{"confirm_pending_action": {"id": "<pending_action.id>"}}`; `proposal_max_age_hours` (default
+24, 0 turns it off) is read from the confirming request's options. No cluster credential is ever sent.
 
 ## Artifacts (data parts, in this order)
 
@@ -72,12 +73,20 @@ UIE (`ran`).
   nothing is deleted.
 - `status` for `expand_pvc` (2026-11-26): `succeeded` (the PVC's `status.capacity` reached the size;
   `verification.capacity`), `resize_pending` (asked for, the volume has not reached it within the wait; it
-  grows on its own, a volume no pod mounts when next mounted), `resize_failed` (the driver or kubelet reported
+  grows on its own, a volume no pod mounts when next mounted; a `ControllerResizeError` / `NodeResizeError`
+  condition is named in `verification.detail`, and the resizer retries it), `resize_failed` (the driver or kubelet reported
   it infeasible), `pvc_replaced` (the PVC was deleted or replaced while watched). A PVC already asking for the
   size when the approval arrived counts as done (`applied.already_at_target`).
 - An approval is not applied (the step fails, nothing is written) when its target has become protected, when
   its kind is no longer changed (a StatefulSet or DaemonSet restart, or a delete of such a pod, proposed before
-  2026-11-26), or for an action that no longer exists.
+  2026-11-26), for an action that no longer exists, when the proposal is older than `proposal_max_age_hours`,
+  or when what the change depends on moved while the approval waited: the Deployment deleted and made again
+  (new uid), its replicas or the container's resources changed by someone else (for a scale-up, any container's
+  CPU/memory), an autoscaler added, removed
+  or changed, a rollout since a proposed restart (the Deployment's revision moved: its pods are new already), a
+  pod no longer ready beside the one to delete, a PVC whose size, StorageClass expansion or `Bound` phase
+  changed. When the cluster already holds the approved values, nothing is written and the result is verified;
+  `applied.changed_since_proposal` lists what differed from the proposal's snapshot. **Added II-25740.**
 
 ### `query_result`
 
@@ -297,3 +306,9 @@ Recorded for their owners; not changed from this repository.
   `workload`; new `action_result.status` values `resize_pending`, `resize_failed`, `pvc_replaced`;
   `find_workload` can answer `{"scope": "pvc", ...}`. oncallari 0.3.19 adds `patch` on persistentvolumeclaims
   and PVC rules to the admission policy. Additive; nothing removed or renamed.
+- **2026-11-26, II-25740** — late approvals: new option `proposal_max_age_hours` (default 24); an approval is
+  also refused when the Deployment was made again (new uid; `snapshot.deployment_uid`), a scale-up whose
+  containers' CPU/memory changed, after a rollout since a
+  proposed restart (`snapshot.revision`), or when a PVC's StorageClass no longer allows expansion or it is no
+  longer `Bound`; `applied.changed_since_proposal` on an already-applied result. The `expand_pvc` write carries
+  the PVC's uid (`metadata.uid` in the patch). Additive; nothing removed or renamed.

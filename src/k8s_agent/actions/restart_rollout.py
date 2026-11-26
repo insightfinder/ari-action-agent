@@ -8,6 +8,8 @@ its pods under its own update strategy. No setting changes. StatefulSets and Dae
 - The annotation's value is fixed when the proposal is made and is part of what is approved, so a retried
   apply finds it in place and verifies instead of restarting a second time.
 - Refused where the controller would not act on it: a paused Deployment, or one with no pods.
+- Refused at approval when a rollout has happened since the proposal (the Deployment's revision moved): its pods
+  are already new.
 - There is nothing to keep in Git: the hint says so.
 """
 
@@ -64,7 +66,7 @@ class RestartRollout(ActionSpec):
 
     async def load_state(self, ctx, target):
         view = await ctx.tool("get_workload")(target["kind"], target["namespace"], target["name"])
-        return {"workload": view, **({"deployment": view} if target["kind"] == "Deployment" else {})}
+        return {"workload": view, "deployment": view}
 
     def target(self, action):
         return {"kind": action.get("workload_kind") or "Deployment", "namespace": action.get("namespace"), "name": action.get("workload")}
@@ -86,7 +88,7 @@ class RestartRollout(ActionSpec):
         action = {
             "action": "restart_rollout",
             "namespace": w["namespace"],
-            "deployment": w["name"] if kind == "Deployment" else None,
+            "deployment": w["name"],
             "workload_kind": kind,
             "workload": w["name"],
             "restarted_at": restarted_at,
@@ -141,6 +143,7 @@ class RestartRollout(ActionSpec):
             "uid": w.get("uid"),
             "restarted_at": (w.get("template") or {}).get("restarted_at"),
             "strategy": (w.get("strategy") or {}).get("type"),
+            "revision": w.get("revision"),
         }
 
     def drift(self, proposal, state):
@@ -155,6 +158,13 @@ class RestartRollout(ActionSpec):
             changes.append("it is paused now")
         if (w.get("strategy") or {}).get("type") != snapshot.get("strategy"):
             changes.append(f"its update strategy is now {(w.get('strategy') or {}).get('type')}")
+        # A rollout since the proposal (image automation, a Helm upgrade, someone's change) has already
+        # replaced the pods the restart was asked for. Proposals made before the revision was recorded carry none.
+        if snapshot.get("revision") and w.get("revision") != snapshot["revision"]:
+            changes.append(
+                f"a rollout since the proposal already replaced its pods (revision {snapshot['revision']} -> "
+                f"{w.get('revision')}); ask again if a restart is still needed"
+            )
         return changes
 
     def at_target(self, action, state):

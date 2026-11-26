@@ -21,9 +21,8 @@ from test_k8s_change_actions import _apply, build_cluster  # noqa: E402
 
 from k8s_agent.actions import expand_pvc  # noqa: E402
 from k8s_agent.capabilities import find_workload, propose_change  # noqa: E402
-from k8s_agent.tools import policy, rollout  # noqa: E402
+from k8s_agent.tools import policy, rollout, write  # noqa: E402
 
-pytestmark = pytest.mark.asyncio
 _GROW = "expand pvc data-db-0 in namespace shop to 20Gi"
 
 
@@ -66,6 +65,7 @@ async def _approved(cluster, prompt=_GROW, name="data-db-0"):
 # ---------------------------------------------------------------- resolution
 
 
+@pytest.mark.asyncio
 async def test_a_disk_resize_naming_a_pvc_resolves_to_it_without_the_model(cluster):
     llm = ScriptedLLM()
     result = await find_workload.run(_ctx("find_workload", _GROW, llm=llm))
@@ -73,6 +73,7 @@ async def test_a_disk_resize_naming_a_pvc_resolves_to_it_without_the_model(clust
     assert llm.prompts == []
 
 
+@pytest.mark.asyncio
 async def test_a_pvc_named_like_a_deployment_wins_only_for_a_disk_resize(cluster):
     llm = ScriptedLLM()
     disk = await find_workload.run(_ctx("find_workload", "grow the disk checkout to 10Gi", llm=llm))
@@ -93,17 +94,20 @@ async def test_a_pvc_named_like_a_deployment_wins_only_for_a_disk_resize(cluster
         "increase checkout to 3 replicas; node disk pressure on node-a",
     ],
 )
+@pytest.mark.asyncio
 async def test_a_change_to_a_deployment_that_mentions_a_disk_stays_with_the_deployment(cluster, prompt):
     result = await find_workload.run(_ctx("find_workload", prompt, llm=ScriptedLLM()))
     assert (result["resolution"] or {}).get("kind", "Deployment") == "Deployment", result
     assert result["resolution"]["name"] == "checkout"
 
 
+@pytest.mark.asyncio
 async def test_a_pvc_named_without_a_disk_word_next_to_it_is_not_taken(cluster):
     result = await find_workload.run(_ctx("find_workload", "expand checkout to 10Gi; the old pvc was too small", llm=ScriptedLLM()))
     assert result["resolution"] == {"scope": "deployment", "namespace": "shop", "name": "checkout"}
 
 
+@pytest.mark.asyncio
 async def test_the_same_pvc_name_in_two_namespaces_gives_candidates(cluster):
     cluster.objects["PersistentVolumeClaim"].append(fx.pvc("data-db-0", namespace="other"))
     result = await find_workload.run(_ctx("find_workload", "expand pvc data-db-0 to 20Gi", llm=ScriptedLLM()))
@@ -115,6 +119,7 @@ async def test_the_same_pvc_name_in_two_namespaces_gives_candidates(cluster):
 # ---------------------------------------------------------------- proposal
 
 
+@pytest.mark.asyncio
 async def test_growing_a_claim_template_pvc_is_proposed_by_code_alone(cluster):
     llm = ScriptedLLM()
     result = await _propose(_GROW, llm=llm)
@@ -131,7 +136,7 @@ async def test_growing_a_claim_template_pvc_is_proposed_by_code_alone(cluster):
     assert pa["persistence"]["needed"] is False
     assert cluster.patches == [
         {"kind": "PersistentVolumeClaim", "name": "data-db-0", "namespace": "shop",
-         "body": {"spec": {"resources": {"requests": {"storage": "20Gi"}}}}, "dry_run": True,
+         "body": {"metadata": {"uid": "uid-pvc-data-db-0"}, "spec": {"resources": {"requests": {"storage": "20Gi"}}}}, "dry_run": True,
          "content_type": cluster.patches[0]["content_type"]}
     ]
     assert _pvc(cluster, "data-db-0")["spec"]["resources"]["requests"]["storage"] == "10Gi"
@@ -149,12 +154,14 @@ async def test_growing_a_claim_template_pvc_is_proposed_by_code_alone(cluster):
         ("expand pvc data-db-0 in namespace shop by 51Gi", "at most 60Gi"),
     ],
 )
+@pytest.mark.asyncio
 async def test_sizes_that_are_not_a_clear_larger_size_are_refused(cluster, prompt, reason):
     result = await _propose(prompt)
     assert reason in result["refusal"]["reason"], result
     assert not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_the_ebs_note_also_covers_the_in_tree_provisioner(cluster):
     cluster.objects["StorageClass"] = [fx.storageclass("gp3", provisioner="kubernetes.io/aws-ebs")]
     pa = (await _propose(_GROW))["pending_action"]
@@ -164,6 +171,7 @@ async def test_the_ebs_note_also_covers_the_in_tree_provisioner(cluster):
     assert not any("EBS" in r["message"] for r in other["risks"])
 
 
+@pytest.mark.asyncio
 async def test_the_cap_allows_fifty_gi_more_for_a_small_disk(cluster):
     result = await _propose("expand pvc data-db-0 in namespace shop to 60Gi")
     assert result["pending_action"]["storage"] == "60Gi"
@@ -173,23 +181,26 @@ async def test_the_cap_allows_fifty_gi_more_for_a_small_disk(cluster):
     "prompt",
     ["expand pvc data-db-0 in namespace shop by 10Gi", "扩容 pvc data-db-0 增加 10Gi", "pvc data-db-0 的磁盘再加 10Gi", "grow pvc data-db-0 +10Gi"],
 )
+@pytest.mark.asyncio
 async def test_an_amount_to_add_is_proposed_as_the_size_it_comes_to(cluster, prompt):
     pa = (await _propose(prompt))["pending_action"]
     assert pa["storage"] == "20Gi" and pa["after"] == {"storage": "20Gi"}
     assert pa["requested"]["computed"] == "10Gi + 10Gi = 20Gi"
     assert pa["action_name"].endswith("from 10Gi to 20Gi")
-    assert cluster.patches[0]["body"] == {"spec": {"resources": {"requests": {"storage": "20Gi"}}}}
+    assert cluster.patches[0]["body"] == {"metadata": {"uid": "uid-pvc-data-db-0"}, "spec": {"resources": {"requests": {"storage": "20Gi"}}}}
 
 
+@pytest.mark.asyncio
 async def test_an_added_amount_is_written_once_however_late_the_approval(cluster):
     pa = await _approved(cluster, "expand pvc data-db-0 in namespace shop by 10Gi")
     cluster.auto_expand = True
     result = await _apply(pa)
-    assert result["status"] == "succeeded" and [p["body"] for p in cluster.patches] == [{"spec": {"resources": {"requests": {"storage": "20Gi"}}}}]
+    assert result["status"] == "succeeded" and [p["body"] for p in cluster.patches] == [{"metadata": {"uid": "uid-pvc-data-db-0"}, "spec": {"resources": {"requests": {"storage": "20Gi"}}}}]
     again = await _apply(pa)
     assert again["applied"]["already_at_target"] is True and len(cluster.patches) == 1
 
 
+@pytest.mark.asyncio
 async def test_from_and_to_takes_the_target(cluster):
     result = await _propose("grow pvc data-db-0 from 10Gi to 20 GiB")
     assert result["pending_action"]["storage"] == "20Gi"
@@ -206,6 +217,7 @@ async def test_from_and_to_takes_the_target(cluster):
         ("data-db-1", fx.pvc("data-db-1", owners=[("Deployment", "x")]), "also owned by Deployment x"),
     ],
 )
+@pytest.mark.asyncio
 async def test_a_pvc_something_re_applies_is_refused(cluster, name, pvc, reason):
     if pvc is not None:
         cluster.objects["PersistentVolumeClaim"] = [p for p in cluster.objects["PersistentVolumeClaim"] if p["metadata"]["name"] != name] + [pvc]
@@ -214,23 +226,27 @@ async def test_a_pvc_something_re_applies_is_refused(cluster, name, pvc, reason)
     assert not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_a_pvc_applied_with_kubectl_is_refused(cluster):
     _pvc(cluster, "data-db-0")["metadata"]["annotations"]["kubectl.kubernetes.io/last-applied-configuration"] = '{"kind":"PersistentVolumeClaim"}'
     result = await _propose(_GROW)
     assert "kubectl apply" in result["refusal"]["reason"] and not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_a_pvc_of_an_operator_owned_statefulset_is_refused(cluster):
     cluster.objects["StatefulSet"][0]["metadata"]["ownerReferences"] = [{"kind": "Prometheus", "name": "k8s"}]
     result = await _propose(_GROW)
     assert "which Prometheus k8s manages" in result["refusal"]["reason"] and not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_the_statefulsets_own_and_its_pods_ownership_is_allowed(cluster):
     _pvc(cluster, "data-db-0")["metadata"]["ownerReferences"] = [{"kind": "StatefulSet", "name": "db"}, {"kind": "Pod", "name": "db-0"}]
     assert "pending_action" in await _propose(_GROW)
 
 
+@pytest.mark.asyncio
 async def test_a_pvc_of_a_protected_statefulset_is_refused(cluster, monkeypatch):
     monkeypatch.setenv("K8S_AGENT_PROTECTED_WORKLOADS", "shop/db")
     result = await _propose(_GROW)
@@ -238,6 +254,7 @@ async def test_a_pvc_of_a_protected_statefulset_is_refused(cluster, monkeypatch)
     assert not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_a_pvc_in_a_protected_namespace_is_refused_before_reading_it(cluster):
     result = await propose_change.run(_ctx("propose_change", "expand pvc data-vault-0 to 2Gi", results=_pvc_resolved("data-vault-0", "vault"), llm=ScriptedLLM()))
     assert result["refusal"]["protected"] is True and "Namespace vault is protected" in result["refusal"]["reason"]
@@ -254,6 +271,7 @@ async def test_a_pvc_in_a_protected_namespace_is_refused_before_reading_it(clust
         ({"requested": "15Gi"}, "already under way"),
     ],
 )
+@pytest.mark.asyncio
 async def test_a_pvc_that_cannot_be_grown_now_is_refused(cluster, change, reason):
     cluster.objects["PersistentVolumeClaim"] = [p for p in cluster.objects["PersistentVolumeClaim"] if p["metadata"]["name"] != "data-db-0"] + [
         fx.pvc("data-db-0", **change)
@@ -262,11 +280,13 @@ async def test_a_pvc_that_cannot_be_grown_now_is_refused(cluster, change, reason
     assert reason in result["refusal"]["reason"], result
 
 
+@pytest.mark.asyncio
 async def test_a_question_about_a_pvc_is_not_a_resize(cluster):
     result = await _propose("how big is pvc data-db-0?")
     assert result["refusal"]["asked_for"] == "expand_pvc" and not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_a_disk_request_about_a_statefulset_names_its_pvcs(cluster):
     results = {"find_workload": {"resolution": {"scope": "workload", "kind": "StatefulSet", "namespace": "shop", "name": "db"}}}
     result = await propose_change.run(_ctx("propose_change", "grow the disk of statefulset db to 20Gi", results=results, llm=ScriptedLLM()))
@@ -274,6 +294,7 @@ async def test_a_disk_request_about_a_statefulset_names_its_pvcs(cluster):
     assert "read only" in reason and "data-db-0, data-db-1" in reason
 
 
+@pytest.mark.asyncio
 async def test_the_clusters_admission_policy_answer_is_a_refusal(cluster, monkeypatch):
     async def denied(kind, name, namespace, body, content_type, dry_run, subresource=None):
         raise fx.api_error(403, "persistentvolumeclaims \"data-db-0\" is forbidden: ValidatingAdmissionPolicy 'ari-k8s-protected' denied request", "Forbidden")
@@ -283,6 +304,7 @@ async def test_the_clusters_admission_policy_answer_is_a_refusal(cluster, monkey
     assert result["refusal"]["protected"] is True
 
 
+@pytest.mark.asyncio
 async def test_a_missing_rbac_grant_is_a_refusal_naming_it(cluster, monkeypatch):
     async def forbidden(kind, name, namespace, body, content_type, dry_run, subresource=None):
         raise fx.api_error(403, "persistentvolumeclaims \"data-db-0\" is forbidden: User cannot patch resource", "Forbidden")
@@ -295,6 +317,7 @@ async def test_a_missing_rbac_grant_is_a_refusal_naming_it(cluster, monkeypatch)
 # ---------------------------------------------------------------- approval
 
 
+@pytest.mark.asyncio
 async def test_an_approved_growth_is_applied_once_and_verified(cluster):
     pa = await _approved(cluster)
     cluster.auto_expand = True
@@ -305,6 +328,7 @@ async def test_an_approved_growth_is_applied_once_and_verified(cluster):
     assert json.dumps(result).count(fx.CANARY) == 0
 
 
+@pytest.mark.asyncio
 async def test_a_retried_approval_finds_the_size_asked_and_does_not_write_again(cluster):
     pa = await _approved(cluster)
     _pvc(cluster, "data-db-0")["spec"]["resources"]["requests"]["storage"] = "20Gi"
@@ -322,6 +346,7 @@ async def test_a_retried_approval_finds_the_size_asked_and_does_not_write_again(
         (lambda p: p["metadata"].update(uid="uid-new"), "replaced"),
     ],
 )
+@pytest.mark.asyncio
 async def test_an_approval_after_the_pvc_changed_is_not_applied(cluster, mutate, message):
     pa = await _approved(cluster)
     mutate(_pvc(cluster, "data-db-0"))
@@ -330,6 +355,7 @@ async def test_an_approval_after_the_pvc_changed_is_not_applied(cluster, mutate,
     assert not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_an_approval_after_the_statefulset_became_protected_is_not_applied(cluster, monkeypatch):
     pa = await _approved(cluster)
     monkeypatch.setenv("K8S_AGENT_PROTECTED_WORKLOADS", "shop/db")
@@ -338,6 +364,7 @@ async def test_an_approval_after_the_statefulset_became_protected_is_not_applied
     assert not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_a_volume_still_growing_is_pending_not_failed(cluster):
     result = await rollout.wait_pvc_expanded("shop", "data-db-0", "uid-pvc-data-db-0", "20Gi", 0, poll_seconds=0)
     assert result["status"] == "resize_pending" and "grows on its own" in result["detail"]
@@ -401,6 +428,7 @@ def test_a_disk_resize_is_asked_for_in_words(prompt, asks):
     assert policy.asks_disk_size_change(prompt) is asks
 
 
+@pytest.mark.asyncio
 async def test_a_pvc_name_two_statefulsets_could_have_made_is_refused(cluster, monkeypatch):
     # data-a-b-0: template "data" of StatefulSet "a-b", or template "data-a" of StatefulSet "b".
     cluster.objects["StatefulSet"] += [fx.statefulset("a-b", claim_templates={"data": "10Gi"}), fx.statefulset("b", claim_templates={"data-a": "10Gi"})]
@@ -415,3 +443,72 @@ def test_the_claim_template_rule():
     assert expand_pvc.claim_template_owner({"name": "redis-data-redis-cluster-3"}, sts)[1:] == ("redis-data", 3)
     assert expand_pvc.claim_template_owner({"name": "redis-data-redis-cluster-x"}, sts) is None
     assert expand_pvc.claim_template_owner({"name": "redis-data-redis-3"}, sts) is None
+
+
+# ---------------------------------------------------------------- names, late approvals, older charts
+
+
+def test_the_pvc_names_are_left_out_of_the_disk_check():
+    prompt = "expand pvc redis-data-redis-replicas-0 to 20Gi"
+    assert not policy.asks_disk_size_change(prompt)
+    assert policy.asks_disk_size_change(prompt, ["redis-data-redis-replicas-0"])
+    assert not policy.asks_disk_size_change(prompt + " and set replicas to 3", ["redis-data-redis-replicas-0"])
+    in_namespace = "expand pvc data-db-0 in namespace memory-db to 20Gi"
+    assert policy.asks_disk_size_change(in_namespace, ["data-db-0", "memory-db"])
+
+
+@pytest.mark.asyncio
+async def test_a_pvc_whose_name_says_replicas_can_be_grown(cluster):
+    # Bitnami Redis names its replicas' PVCs redis-data-redis-replicas-<n>.
+    cluster.objects["StatefulSet"].append(fx.statefulset("redis-replicas", claim_templates={"redis-data": "8Gi"}))
+    cluster.objects["PersistentVolumeClaim"].append(fx.pvc("redis-data-redis-replicas-0", size="8Gi"))
+    prompt = "expand pvc redis-data-redis-replicas-0 in namespace shop to 16Gi"
+    llm = ScriptedLLM()
+    resolved = await find_workload.run(_ctx("find_workload", prompt, llm=llm))
+    assert resolved["resolution"]["name"] == "redis-data-redis-replicas-0" and llm.prompts == []
+    result = await _propose(prompt, "redis-data-redis-replicas-0")
+    assert result["pending_action"]["storage"] == "16Gi"
+
+
+@pytest.mark.asyncio
+async def test_the_write_is_tied_to_the_approved_pvc(cluster):
+    # A PVC deleted and made again under the same name between the approval-time re-read and the write.
+    action = {"action": "expand_pvc", "namespace": "shop", "pvc": "data-db-0", "pvc_uid": "uid-of-the-old-pvc", "storage": "20Gi"}
+    with pytest.raises(RuntimeError, match="field is immutable"):
+        await write.patch_workload(action)
+    assert _pvc(cluster, "data-db-0")["spec"]["resources"]["requests"]["storage"] == "10Gi"
+
+
+@pytest.mark.asyncio
+async def test_an_approval_after_the_storageclass_stopped_allowing_expansion_is_refused(cluster):
+    pa = await _approved(cluster)
+    next(s for s in cluster.objects["StorageClass"] if s["metadata"]["name"] == "gp3")["allowVolumeExpansion"] = False
+    with pytest.raises(RuntimeError, match="no longer allows volume expansion"):
+        await _apply(pa)
+    assert not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_an_approval_after_the_pvc_lost_its_volume_is_refused(cluster):
+    pa = await _approved(cluster)
+    _pvc(cluster, "data-db-0")["status"]["phase"] = "Lost"
+    with pytest.raises(RuntimeError, match="is Lost now, not Bound"):
+        await _apply(pa)
+    assert not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_an_older_chart_without_the_reads_is_refused_with_the_rule(cluster):
+    cluster.forbidden.add("StatefulSet")
+    result = await _propose(_GROW)
+    assert 'lacks patch on "persistentvolumeclaims"' in result["refusal"]["reason"] and not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_a_resize_error_is_named_when_the_wait_ends(cluster):
+    pvc = _pvc(cluster, "data-db-0")
+    pvc["spec"]["resources"]["requests"]["storage"] = "20Gi"
+    pvc["status"]["conditions"] = [{"type": "ControllerResizeError", "status": "True"}]
+    out = await rollout.wait_pvc_expanded("shop", "data-db-0", "uid-pvc-data-db-0", "20Gi", 0)
+    assert out["status"] == "resize_pending" and "reported ControllerResizeError" in out["detail"]
+    assert "grows on its own" not in out["detail"]

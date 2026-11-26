@@ -182,16 +182,16 @@ class ResizePod(ActionSpec):
         requested, refused = requested_values(ctx, change)
         if refused:
             return None, refused
-        policy = (pod.get("resize_policy") or {}).get(name) or {"cpu": "NotRequired", "memory": "NotRequired"}
-        if any(resource == "memory" for _side, resource in requested) and policy.get("memory") != "RestartContainer":
+        resize_policy = (pod.get("resize_policy") or {}).get(name) or {"cpu": "NotRequired", "memory": "NotRequired"}
+        if any(resource == "memory" for _side, resource in requested) and resize_policy.get("memory") != "RestartContainer":
             return None, refusal(
-                f"Container {name} has memory resizePolicy {policy.get('memory')}: a memory change would be applied "
+                f"Container {name} has memory resizePolicy {resize_policy.get('memory')}: a memory change would be applied "
                 "to the running process without a restart, which a process that sizes its heap at start (a JVM with "
                 "-XX:MaxRAMPercentage, for example) never uses, and a lowered limit can OOM-kill it. Memory is "
                 "resized in place only for containers whose memory resizePolicy is RestartContainer. Ask for the "
                 "Deployment's memory to be changed instead (that rolls its pods), or set the resizePolicy in the "
                 "pod template first.",
-                resize_policy=policy,
+                resize_policy=resize_policy,
             )
 
         current = (pod.get("resources") or {}).get(name) or {}
@@ -234,7 +234,7 @@ class ResizePod(ActionSpec):
                         )
 
         changed = sorted({resource for _side, resource in requested})
-        restart = [r for r in changed if policy.get(r) == "RestartContainer"]
+        restart = [r for r in changed if resize_policy.get(r) == "RestartContainer"]
         applied_fmt = {f"{s}.{r}": quantities.format_units(r, a) for (s, r), a in requested.items()}
         template = next((c["resources"] for c in (dep.get("template") or {}).get("containers") or [] if c["name"] == name), {})
         action = {

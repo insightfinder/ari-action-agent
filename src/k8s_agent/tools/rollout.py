@@ -562,6 +562,10 @@ async def wait_pod_replaced(
         await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
 
 
+# PVC conditions by which the external resizer or the kubelet report a failed attempt (retried by them).
+_PVC_RESIZE_ERRORS = ("ControllerResizeError", "NodeResizeError")
+
+
 async def wait_pvc_expanded(
     namespace: str,
     pvc: str,
@@ -604,13 +608,20 @@ async def wait_pvc_expanded(
                 "detail": f"The resize to {storage} was rejected as infeasible ({current.get('resize_status')}); the volume keeps {current.get('capacity')}.",
             }
         if time.monotonic() - started >= max_wait_seconds:
+            errors = [c for c in observed["conditions"] if c in _PVC_RESIZE_ERRORS]
+            state = current.get("resize_status") or ", ".join(observed["conditions"]) or "none reported"
+            outlook = (
+                f"The resizer reported {', '.join(errors)}: it retries on its own (an AWS EBS volume, for example, "
+                "waits until its previous change has finished optimizing), but check the PVC's events for the cause."
+                if errors
+                else "It grows on its own; a volume no pod mounts grows its filesystem when it is next mounted."
+            )
             return {
                 "status": "resize_pending",
                 **observed,
                 "detail": (
                     f"{storage} is asked for and the volume still has {current.get('capacity')} after "
-                    f"{int(max_wait_seconds)} s (state: {current.get('resize_status') or ', '.join(observed['conditions']) or 'none reported'}). "
-                    "It grows on its own; a volume no pod mounts grows its filesystem when it is next mounted."
+                    f"{int(max_wait_seconds)} s (state: {state}). {outlook}"
                 ),
             }
         await asyncio.sleep(poll_seconds)

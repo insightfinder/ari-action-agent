@@ -34,6 +34,7 @@ from common.llm_json import extract
 from .. import actions
 from ..stepkit import finish, options, refusal, resolved_target
 from ..tools import capacity, persistence, policy, protection, quantities
+from ..tools.client import api_status, safe_error
 
 _SENTINEL = "CHANGE_JSON:"
 _SYSTEM = (
@@ -150,12 +151,17 @@ async def _propose_pvc(ctx: StepContext, target: dict) -> dict:
     request's own words), never by the model."""
     spec = actions.REGISTRY["expand_pvc"]
     namespace, name = target["namespace"], target["name"]
-    if not policy.asks_disk_size_change(ctx.prompt):
+    if not policy.asks_disk_size_change(ctx.prompt, [name, namespace]):
         return refusal(spec.not_asked.format(kind="PersistentVolumeClaim", name=name, namespace=namespace), asked_for=spec.name)
     protected = protection.why_protected(namespace, None)
     if protected:
         return refusal(protected, protected=True)
-    state = await spec.load_state(ctx, {"kind": "PersistentVolumeClaim", "namespace": namespace, "name": name})
+    try:
+        state = await spec.load_state(ctx, {"kind": "PersistentVolumeClaim", "namespace": namespace, "name": name})
+    except Exception as exc:  # noqa: BLE001 — a chart older than this action's RBAC: say which rule is missing
+        if not spec.rbac_rule or (api_status(exc) != 403 and "HTTP 403" not in str(exc)):
+            raise
+        return refusal(_rbac_refusal(spec, exc))
     planned, refused = spec.plan(ctx, state, {}, {})
     if refused:
         return refused
@@ -166,6 +172,13 @@ async def _propose_pvc(ctx: StepContext, target: dict) -> dict:
         if risk.get("level") in ("medium", "high", "critical"):
             tier = policy.raise_tier(tier, risk["level"])
     return await _proposal(ctx, spec, state, action, facts, tier, risks, None, None)
+
+
+def _rbac_refusal(spec, exc: Exception) -> str:
+    return (
+        f"The agent is not allowed to make this change in this cluster yet: its ServiceAccount lacks "
+        f"{spec.rbac_rule}. Nothing was proposed. API answer: {exc if isinstance(exc, RuntimeError) else safe_error(exc)}"
+    )
 
 
 async def _disk_hint(ctx: StepContext, target: dict) -> str:
@@ -349,11 +362,7 @@ async def _proposal(ctx: StepContext, spec, state: dict, action: dict, facts: di
             )
         # A new image can reach a cluster before the chart that grants its RBAC does.
         if spec.rbac_rule and "HTTP 403" in str(exc):
-            return refusal(
-                f"The agent is not allowed to make this change in this cluster yet: its ServiceAccount lacks "
-                f"{spec.rbac_rule}. Nothing was proposed. "
-                f"Dry-run answer: {exc}"
-            )
+            return refusal(_rbac_refusal(spec, exc))
         raise
 
     pending_action = {

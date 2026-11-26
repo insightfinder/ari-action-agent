@@ -166,7 +166,8 @@ def workload_of(pod: dict) -> tuple[str, str] | None:
     return None
 
 
-# What find_workload resolves a request to: the workloads above, plus a CronJob (suspend, resume).
+# What find_workload resolves a request to: the workloads above, plus a CronJob (read only, like the rest but
+# Deployments).
 RESOLVABLE_KINDS = (*WORKLOAD_KINDS, "CronJob")
 
 

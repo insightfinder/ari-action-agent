@@ -41,8 +41,6 @@ _PAGE_SIZE = 500
 
 PATCH_MERGE = "application/merge-patch+json"
 PATCH_STRATEGIC = "application/strategic-merge-patch+json"
-# RFC 6902: replaces a whole subtree and can `test` a value first.
-PATCH_JSON = "application/json-patch+json"
 
 # Flux source kind -> kinds to try, newest API version first.
 FLUX_SOURCES = {
@@ -90,8 +88,8 @@ class Kube:
         return json.loads(text) if text else {}
 
     @staticmethod
-    def _write_query(dry_run: bool, field_manager: bool = True) -> list:
-        query = [("fieldManager", FIELD_MANAGER)] if field_manager else []
+    def _write_query(dry_run: bool) -> list:
+        query = [("fieldManager", FIELD_MANAGER)]
         if dry_run:
             query.append(("dryRun", "All"))
         return query
@@ -135,17 +133,10 @@ class Kube:
         if grace_period_seconds is not None:
             body["gracePeriodSeconds"] = int(grace_period_seconds)
         if preconditions:
-            # The API server deletes only the object with this uid: a pod name a StatefulSet has already
-            # reused for a new pod answers 409 instead of deleting the new one.
+            # The API server deletes only the object with this uid: an object made again under the same
+            # name answers 409 instead of being deleted.
             body["preconditions"] = dict(preconditions)
         return self._request("DELETE", k.path(namespace, name), [], body)
-
-    def _create_sync(self, kind, namespace, body, dry_run, name, subresource) -> dict:
-        k = _kind(kind)
-        # An eviction is a create on the pod's subresource; fieldManager is not a parameter there. A plain
-        # create POSTs to the collection (the name is in the body): `.../jobs/<name>` would answer 405.
-        query = self._write_query(dry_run, field_manager=subresource is None)
-        return self._request("POST", k.path(namespace, name if subresource else None, subresource), query, body)
 
     # Fixed paths only: neither takes a value that could become part of a request path.
     def _server_version_sync(self) -> dict:
@@ -180,9 +171,6 @@ class Kube:
         self, kind, name: str, namespace: str | None, dry_run: bool, grace_period_seconds: int | None = None, preconditions: dict | None = None
     ) -> dict:
         return await asyncio.to_thread(self._delete_sync, kind, name, namespace, dry_run, grace_period_seconds, preconditions)
-
-    async def create(self, kind, namespace: str | None, body: dict, dry_run: bool, name: str | None = None, subresource: str | None = None) -> dict:
-        return await asyncio.to_thread(self._create_sync, kind, namespace, body, dry_run, name, subresource)
 
     async def pod_log(self, namespace, pod, container=None, previous=True, tail_lines=40, limit_bytes=8000, since_seconds=None) -> str:
         return await asyncio.to_thread(self._log_sync, namespace, pod, container, previous, tail_lines, limit_bytes, since_seconds)

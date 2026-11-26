@@ -29,6 +29,13 @@ class K8sOptions(BaseModel):
         0.2, description="CPU/memory caps use at most (1 - ratio) of the best node's allocatable capacity."
     )
     include_logs: bool = Field(True, description="Attach redacted previous-container log tails to crash findings.")
+    proposal_max_age_hours: float = Field(
+        24,
+        description=(
+            "An approval of a proposal older than this is refused (nothing is changed; ask again). Read from the "
+            "approving request's config. 0 turns the limit off."
+        ),
+    )
     pipeline_budget_seconds: Optional[float] = None
 
 

@@ -23,7 +23,6 @@ from test_k8s_change_actions import _obj, _workload, build_cluster  # noqa: E402
 from k8s_agent.capabilities import check_health, find_workload, propose_change  # noqa: E402
 from k8s_agent.tools import governance  # noqa: E402
 
-pytestmark = pytest.mark.asyncio
 _CRON = _workload("CronJob", "report")
 
 
@@ -73,6 +72,7 @@ def test_every_example_request_passes_its_own_gate():
 # ---------------------------------------------------------------- CronJob resolution and health
 
 
+@pytest.mark.asyncio
 async def test_find_workload_resolves_a_cronjob_by_name(cluster):
     llm = ScriptedLLM()
     result = await find_workload.run(_ctx("find_workload", "suspend cronjob report", llm=llm))
@@ -80,11 +80,13 @@ async def test_find_workload_resolves_a_cronjob_by_name(cluster):
     assert llm.prompts == []
 
 
+@pytest.mark.asyncio
 async def test_find_workload_resolves_a_scheduled_run_pod_to_its_cronjob(cluster):
     result = await find_workload.run(_ctx("find_workload", "why did report-29410560-x7k2p fail?", llm=ScriptedLLM()))
     assert result["resolution"]["kind"] == "CronJob" and result["resolution"]["name"] == "report"
 
 
+@pytest.mark.asyncio
 async def test_check_health_of_a_cronjob_looks_at_its_runs_pods(cluster):
     _obj(cluster, "CronJob", "report")["spec"]["suspend"] = True
     result = await check_health.run(_ctx("check_health", "check report", results=_CRON, options={"include_logs": False}))
@@ -100,6 +102,7 @@ def test_a_cronjob_owns_its_scheduled_runs_only():
     assert not governance.is_cronjob_job("report-manual-x2k4q", "report")
 
 
+@pytest.mark.asyncio
 async def test_a_change_to_a_cronjob_is_refused_without_asking_the_model(cluster):
     llm = ScriptedLLM(_change(action="restart_rollout"))
     result = await propose_change.run(_ctx("propose_change", "suspend cronjob report", results=_CRON, llm=llm))

@@ -553,7 +553,8 @@ a request never carries cluster credentials.
     "namespace": "shop",
     "high_replica_threshold": 30,
     "node_headroom_ratio": 0.2,
-    "include_logs": true
+    "include_logs": true,
+    "proposal_max_age_hours": 24
   }
 }
 ```
@@ -581,10 +582,18 @@ are `a2a-task:k8s`, `plan_task`, one `capability:<name>` per step (`check_health
    whose config `DataPart` repeats `llm` and adds
    `"confirm_pending_action": {"id": "<pending_action.id>"}`. Decline:
    `POST /tasks/{id}:cancel`.
-3. The agent re-reads the target; if anything changed since the proposal
-   it refuses and nothing is applied, unless the target already holds the
-   approved values (a retried step whose first attempt wrote them), in
-   which case it skips the write and verifies. It writes at most once and
+3. The agent re-reads the target; if anything the change depends on
+   changed since the proposal (the object deleted and made again, its
+   replicas or the container's resources changed by someone else (for a
+   scale-up, any container's CPU/memory), an
+   autoscaler added or changed, a rollout since a proposed restart, a
+   PVC's size or StorageClass, ...) it refuses and nothing is applied,
+   unless the target already holds the approved values (a retried step
+   whose first attempt wrote them), in which case it skips the write and
+   verifies (`applied.changed_since_proposal` lists what differed). A
+   proposal older than `options.proposal_max_age_hours` (default 24, from
+   the approving request's config; 0 turns it off) is refused the same
+   way. It writes at most once and
    verifies from cluster state; new pods must also stay up without a
    restart for 45 s after the rollout looks done. A
    `ProgressDeadlineExceeded` left over from a rollout that was already
@@ -599,7 +608,7 @@ are `a2a-task:k8s`, `plan_task`, one `capability:<name>` per step (`check_health
    Cluster Autoscaler could not add a node for these pods, e.g. an EC2
    quota; `autoscaler_cannot_help`; or `failed_scheduling`), `reverted`
    (the approved value was put back while or after it was verified —
-   replicas, resources, the autoscaler's bounds or a rolled-back image —
+   replicas, resources or the autoscaler's bounds —
    e.g. by a GitOps reconcile, a Helm upgrade or image automation), or
    `verification_unavailable` (applied, but the rollout could not be
    checked). A deleted pod is verified by its replacement: the old uid

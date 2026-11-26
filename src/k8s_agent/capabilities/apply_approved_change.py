@@ -12,10 +12,14 @@ Two independent gates, the same shape as the oncall kind's `publish_pr`:
 
 Before writing, the target is re-read and compared with the snapshot taken
 at proposal time: the approval window is hours long, and approving "scale
-from 3 to 5" means nothing once someone else has already changed it. Only
-the fields the change depends on are compared (replicas and the absence
-of an autoscaler; the container's resources; the autoscaler's identity and
-bounds); any difference refuses the change and asks for a fresh proposal.
+from 3 to 5" means nothing once someone else has already changed it. Each
+action compares the fields its change depends on (`drift` in its spec:
+the object's uid, replicas, a container's resources, the autoscaler's
+identity and bounds, a rollout since a proposed restart, a pod's
+readiness, a PVC's size and StorageClass, ...); any difference refuses
+the change and asks for a fresh proposal. A proposal older than
+`options.proposal_max_age_hours` (default 24) is refused the same way:
+its risks and capacity estimate were read from a cluster that has moved on.
 
 The write happens at most once. A retried attempt (the worker restarted,
 or a read failed, after the patch landed) finds the cluster already at the
@@ -34,11 +38,12 @@ from common.capabilities_base import StepContext
 
 from .. import actions
 from ..actions.base import artifact_int as _int, target_of
-from ..stepkit import finish
+from ..stepkit import finish, options
 from ..tools import governance, persistence, protection
 
 _VERIFY_MARGIN_SECONDS = 60
 _DEFAULT_STEP_SECONDS = 900
+DEFAULT_PROPOSAL_MAX_AGE_HOURS = 24.0
 
 
 def _require_confirmed(ctx: StepContext) -> dict:
@@ -65,6 +70,33 @@ def _proposed_at(proposal: dict) -> datetime | None:
         return datetime.fromisoformat(str(proposal.get("created_at")).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _max_age_hours(ctx: StepContext) -> float | None:
+    """`options.proposal_max_age_hours`; 0 or less turns the limit off."""
+    raw = options(ctx).get("proposal_max_age_hours")
+    try:
+        hours = DEFAULT_PROPOSAL_MAX_AGE_HOURS if raw is None or isinstance(raw, bool) else float(raw)
+    except (TypeError, ValueError):
+        hours = DEFAULT_PROPOSAL_MAX_AGE_HOURS
+    return hours if hours > 0 else None
+
+
+def _too_old(ctx: StepContext, proposal: dict) -> str | None:
+    hours = _max_age_hours(ctx)
+    made = _proposed_at(proposal)
+    if hours is None or made is None:
+        return None
+    if made.tzinfo is None:
+        made = made.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - made
+    if age <= timedelta(hours=hours):
+        return None
+    return (
+        f"apply_approved_change: this proposal was made {age.total_seconds() / 3600:.1f} hours ago, more than the "
+        f"{hours:g} hours an approval stays valid; its risks and estimates describe the cluster as it was then. "
+        "Nothing was changed. Ask again so a fresh proposal reflects the current state."
+    )
 
 
 async def run(ctx: StepContext) -> dict:
@@ -94,6 +126,11 @@ async def run(ctx: StepContext) -> dict:
             + "). Nothing was changed. Ask again so a fresh proposal reflects the current state."
         )
 
+    # Too old to write, but not too old to verify what an earlier attempt of this step already wrote.
+    stale = None if already else _too_old(ctx, proposal)
+    if stale:
+        raise RuntimeError(stale)
+
     # Second precision on pod creation timestamps: back off a little so pods
     # created by this very patch are never mistaken for older ones.
     applied_at = (datetime.now(timezone.utc) - timedelta(seconds=2)).replace(microsecond=0)
@@ -102,7 +139,12 @@ async def run(ctx: StepContext) -> dict:
     before_write = None if already else state
     if already:
         # An earlier attempt of this step (or someone else) already put the approved values in place.
-        applied = {"already_at_target": True, "note": "the cluster already held the approved values; nothing was written again"}
+        applied = {
+            "already_at_target": True,
+            "note": "the cluster already held the approved values; nothing was written again",
+            # What differs from the proposal's snapshot: this step's own earlier write, or someone else's change.
+            "changed_since_proposal": drift,
+        }
         # When it was written is unknown here, but not before the proposal: pods from before it (often the
         # very crash loop this change fixes) must not be judged as the change's own.
         applied_at = _proposed_at(proposal)
