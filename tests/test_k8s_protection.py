@@ -44,6 +44,15 @@ async def test_a_change_in_a_system_namespace_is_refused_without_asking_the_mode
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("namespace,name", [("ingress-nginx", "ingress-nginx-controller"), ("istio-system", "istiod")])
+async def test_the_ingress_controller_and_the_mesh_are_refused(cluster, namespace, name):
+    llm = ScriptedLLM(_SCALE)
+    result = await _propose_with(llm, f"scale {name} to 4", _resolved(name, namespace=namespace))
+    assert f"Namespace {namespace} is protected" in result["refusal"]["reason"]
+    assert llm.prompts == [] and not cluster.patches
+
+
+@pytest.mark.asyncio
 async def test_a_protected_workload_is_refused(cluster, monkeypatch):
     monkeypatch.setenv("K8S_AGENT_PROTECTED_WORKLOADS", "shop/check*, other/ari-k8s-worker")
     llm = ScriptedLLM(_SCALE)
@@ -96,6 +105,8 @@ def test_the_lists_come_from_the_environment(monkeypatch):
     monkeypatch.delenv("K8S_AGENT_PROTECTED_NAMESPACES", raising=False)
     monkeypatch.delenv("K8S_AGENT_PROTECTED_WORKLOADS", raising=False)
     assert "kube-system" in protection.protected_namespaces() and "monitoring" not in protection.protected_namespaces()
+    # The ingress controllers and the service mesh carry the stg/prod clusters' traffic (2026-11-26).
+    assert {"traefik", "ingress-nginx", "istio-system"} <= set(protection.protected_namespaces())
     assert protection.protected_workloads() == ()
     monkeypatch.setenv("K8S_AGENT_PROTECTED_NAMESPACES", "")
     assert protection.why_protected("kube-system", "coredns") is None

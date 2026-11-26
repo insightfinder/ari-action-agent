@@ -218,6 +218,28 @@ spec:
             requests: {cpu: 10m, memory: 16Mi}
             limits: {cpu: 200m, memory: 32Mi}
 ---
+# Holds ~100Mi of memory: a memory decrease below 1.2 x its usage is refused,
+# one above it is proposed as a high risk (never applied by the live test).
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: e2e-memuse, namespace: ari-k8s-e2e}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: e2e-memuse}}
+  template:
+    metadata: {labels: {app: e2e-memuse}}
+    spec:
+      containers:
+        - name: app
+          image: python:3.12-alpine
+          command:
+            - python
+            - -c
+            - "import time; b = bytearray(100 * 1024 * 1024); b[::4096] = b'x' * len(b[::4096]); time.sleep(10**9)"
+          resources:
+            requests: {cpu: 10m, memory: 64Mi}
+            limits: {cpu: 100m, memory: 256Mi}
+---
 # Prefix namesakes: e2e-web is healthy, e2e-web-gateway (a different
 # Deployment whose name starts with "e2e-web-") crash-loops. A health check of
 # e2e-web must not report the gateway's pods or events.

@@ -30,6 +30,19 @@ _CPU_LIMIT = _change(action="resize_pod", pod="checkout-1", container="app", res
 _MEM_LIMIT = _change(action="resize_pod", pod="checkout-1", container="app", resources={"limits": {"memory": {"value": "3Gi", "quote": "memory limit 3Gi"}}})
 
 
+@pytest.fixture(autouse=True)
+def _usage(cluster):
+    """metrics-server samples for the running checkout pods (checkout-3 is crash-looping: none)."""
+    cluster.objects["PodMetrics"] = [fx.pod_metrics("checkout-1"), fx.pod_metrics("checkout-2")]
+
+
+def _set_limits(cluster, name="checkout-1", **limits):
+    """Give the pod's container limits (spec and the kubelet's status alike)."""
+    pod = _pod(cluster, name)
+    pod["spec"]["containers"][0]["resources"]["limits"].update(limits)
+    pod["status"]["containerStatuses"][0]["resources"]["limits"].update(limits)
+
+
 def _pod(cluster, name="checkout-1"):
     return next(p for p in cluster.objects["Pod"] if p["metadata"]["name"] == name)
 
@@ -55,13 +68,14 @@ async def _approved(cluster, prompt, change):
 
 
 async def test_cpu_resize_of_a_named_pod_is_proposed_in_place(cluster):
+    _set_limits(cluster, cpu="1")
     result = await _propose(cluster, "resize pod checkout-1 in place: cpu limit 2", _CPU_LIMIT)
     pa = result["pending_action"]
     assert pa["action"] == "resize_pod" and pa["pod"] == "checkout-1" and pa["deployment"] == "checkout"
     assert pa["target"] == {"kind": "Pod", "namespace": "shop", "name": "checkout-1"}
     assert pa["resources"] == {"limits": {"cpu": "2"}}
-    assert pa["before"] == {"limits.cpu": None} and pa["after"] == {"limits.cpu": "2"}
-    assert pa["risk_tier"] == "low"  # cpu under the default NotRequired: no restart
+    assert pa["before"] == {"limits.cpu": "1"} and pa["after"] == {"limits.cpu": "2"}
+    assert pa["risk_tier"] == "low"  # a raise of cpu under the default NotRequired: no restart
     assert "without a restart" in pa["notes"][0]
     assert pa["snapshot"]["pod_uid"] == "uid-checkout-1"
     # The dry run went to the pod's resize subresource, as a strategic merge by container name.
@@ -91,6 +105,7 @@ async def test_memory_is_refused_in_place_unless_the_container_restarts_for_it(c
 
 async def test_memory_with_restart_container_is_proposed_as_medium(cluster):
     _set_policy(cluster)
+    _set_limits(cluster, memory="2Gi")
     pa = (await _propose(cluster, "resize pod checkout-1 in place: memory limit 3Gi", _MEM_LIMIT))["pending_action"]
     assert pa["risk_tier"] == "medium"
     assert "restarts in place" in pa["notes"][0]

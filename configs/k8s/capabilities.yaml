@@ -57,7 +57,8 @@ capabilities:
     module: k8s_agent.capabilities.propose_change
     description: >
       For any requested change to a Deployment — its replicas, its KEDA/HPA
-      min or max, CPU/memory requests/limits (rolls its pods), CPU/memory of
+      min or max, CPU/memory requests/limits (rolls its pods; memory is lowered
+      only to at least 1.2 times its current usage), CPU/memory of
       one of its running pods in place (no rollout; needs Kubernetes
       in-place pod resize, read live from the cluster), a rolling restart,
       deleting one of its pods (never the only ready one); and growing a
@@ -87,6 +88,7 @@ capabilities:
       - get_pvc
       - get_storageclass
       - list_statefulsets
+      - get_pod_metrics
       - dry_run_patch
     retry:
       max_attempts: 2
@@ -119,6 +121,7 @@ capabilities:
       - get_pvc
       - get_storageclass
       - list_statefulsets
+      - get_pod_metrics
       - wait_pvc_expanded
       - get_flux_chain
     # A second attempt (the worker died, or a read failed, mid-step) finds the

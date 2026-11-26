@@ -7004,3 +7004,32 @@ the PVC's uid), `drift`, `node_beside_workload`, `scale` (2 -> 3, 63 s), `gate_s
 9 passed. Fixtures afterwards: e2e-plain 2/2 ready, data-e2e-disk-0 at 2Gi (recreated at 1Gi on the next
 `expand_pvc` run). Not exercised live: the new late-approval refusals (revision moved, scale-up after a
 resources change, max age) and the new intent-gate phrasings; unit tests only.
+
+**Lowering CPU/memory; ingress-nginx and istio-system protected (2026-11-26, II-25740, uncommitted).** From a
+second capability review with the user. Why: a failed rollout or resize is only reported (`rollout_failed`,
+`new_pods_failing`), never undone, and nothing compared a lowered value with what the container uses; prod's
+`insightfinder` namespace has 61 of 119 Deployments on Recreate and 81 with one replica (read-only `kubectl`,
+2026-11-26), where a memory limit below usage leaves nothing running. User decisions:
+- `set_resources` and `resize_pod` (shared `decrease_check` in `actions/set_resources.py`): a memory request or
+  limit is lowered only to at least 1.2 x the container's current usage from metrics.k8s.io
+  (`policy.DECREASE_USAGE_MARGIN`; the busiest of the Deployment's pods, or the resized pod's own); no sample
+  (metrics-server missing, pods crash-looping) refuses the decrease. A decrease is also a limit where there was
+  none, or a request below the limit it defaulted to. Any decrease, CPU included, is a `high` risk showing the
+  usage. The approval re-reads usage (`drift`: "usage changed: ..."). Raises need no metrics.
+- `set_resources` on a Recreate Deployment is `high`, as `restart_rollout` already was (revisits the earlier
+  "Recreate is not a concern here" for this action only).
+- Protected namespaces add ingress-nginx and istio-system (code defaults and oncallari 0.3.21 values; charts
+  branch `II-25740-k8s-agent-protect-ingress`, uncommitted). Not openvpn (user), not kserve or metrics-server.
+  The test cluster has neither namespace; stg and prod have both.
+- Live versions read the same day: test 1.36.5, stg 1.35.9, prod 1.34.12, prod-standby 1.35.9, prod-monitoring
+  1.34.12, eu 1.33.13 (the 1.37.3 noted above for test/stg/prod is not what the API servers report), so
+  `resize_pod` is refused on prod and eu by its 1.35 floor.
+Verified: suite on Python 3.12, 1353 passed, 11 skipped (17 new in `tests/test_k8s_resource_decrease.py`, two in
+`test_k8s_protection.py`; two resize tests now give their pod a limit so they still test a raise). Margin
+mutated to 0.5: the two refusal tests fail. Local proposal run against the test API (real reads, server dry runs,
+scripted model; generation unchanged): `insightfinder-dailyreportworker` (usage 1123Mi) request 1Gi refused
+("lowest 1348Mi"), limit 3500Mi -> 3000Mi high with the Recreate risk, 4Gi high (Recreate); new fixture
+`e2e-memuse` (~104Mi) 110Mi refused, 200Mi high, 300Mi medium. oncallari 0.3.21 `helm lint` and `helm template`:
+both namespaces reach the worker env and the admission policy. New live scenarios `refuse_memory_decrease`,
+`memory_decrease_high` (fixture applied on test). Not run: the live script against a deployed build (needs
+commit, merge into test, deploy, and chart 0.3.21 released + test-fluxcd bumped).

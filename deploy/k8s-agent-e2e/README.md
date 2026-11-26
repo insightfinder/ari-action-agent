@@ -89,6 +89,12 @@ here, not on real services: on test, image automation redeploys the
 `health_cronjob` reads the
 CronJob `e2e-cron`, which fires only once a year.
 
+Lowering memory (2026-11-26): `e2e-memuse` holds about 100Mi under a 256Mi
+limit. `refuse_memory_decrease` (limit to 110Mi, below 1.2 x its usage) must
+end without a proposal; `memory_decrease_high` (limit to 200Mi) must be
+proposed as `high` with the usage shown, and is always cancelled. Both need
+metrics-server, and a minute after the pod starts for its first sample.
+
 What is never changed (2026-11-26): `refuse_statefulset_change` (a restart of
 `e2e-sts` is refused), `refuse_protected_namespace` (scaling coredns in
 kube-system), `refuse_self` (a restart of the agent's own worker): each must

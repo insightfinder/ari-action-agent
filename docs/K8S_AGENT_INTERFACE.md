@@ -158,6 +158,21 @@ and both the API server and the pod's kubelet are >= 1.35; memory only when the 
 `resizePolicy` is `RestartContainer`. The Deployment template is not changed, so the persistence hint names the
 template fields to change in Git.
 
+Lowering CPU/memory (`set_resources` and `resize_pod`, **2026-11-26, user decision**). A decrease is a value
+below the current one, a limit where there was none, or a request below the limit it defaulted to.
+- A memory request or limit goes down only when metrics.k8s.io reports the container's current memory usage
+  (the highest across the Deployment's pods for `set_resources`; the pod's own for `resize_pod`) and the new value
+  is at least 1.2 x it (`policy.DECREASE_USAGE_MARGIN`, not configurable); otherwise refused, naming the lowest
+  value it would propose. No usage sample (metrics-server missing, the pods crash-looping) refuses the decrease.
+  Raises need no metrics.
+- Any decrease, CPU too, is a `high` risk that shows the current usage (a sample now, not the peak over time) and
+  whether a new CPU limit is below the current CPU usage.
+- The approval re-reads usage: a memory decrease that the usage now refuses is not applied ("usage changed").
+- A failed rollout or resize is reported (`rollout_failed`, `new_pods_failing`, ...), never undone by the agent;
+  this rule is what keeps a lowered value from being the cause.
+- `set_resources` on a Recreate Deployment is `high` (every pod stops before the new ones start), as
+  `restart_rollout` is.
+
 Added II-25740. Restart and delete are proposed only when the request's own words ask for them
 (decided in code: an on-call prompt quoting "restarted 5 times" does not); otherwise the refusal carries
 `asked_for` with the action the model picked.
@@ -192,7 +207,8 @@ says. The oncallari chart's `ariK8sAgent.protection` values hold both lists and 
   InsightFinder's). A chart shipped for other installations should default `workloads` to empty: the agent's
   own API and worker are added anyway.
 - Namespaces by default: kube-system, kube-public, kube-node-lease, flux-system, cert-manager, vault, keda,
-  traefik. Workloads by default (in the release namespace): insightfinder-mcp-service,
+  traefik, ingress-nginx, istio-system (the last two from oncallari 0.3.21: stg and prod route traffic through
+  them; not monitoring, knative-*, reloader or openvpn, user decisions 2026-11-26). Workloads by default (in the release namespace): insightfinder-mcp-service,
   insightfinder-mcp-service-worker, temporal-*, ari-coordinator; the chart always adds the agent's own API
   and worker. The agent runs beside the services it changes (`insightfinder` on test), so it and its approval
   path are protected by name, not by namespace.
@@ -312,3 +328,8 @@ Recorded for their owners; not changed from this repository.
   proposed restart (`snapshot.revision`), or when a PVC's StorageClass no longer allows expansion or it is no
   longer `Bound`; `applied.changed_since_proposal` on an already-applied result. The `expand_pvc` write carries
   the PVC's uid (`metadata.uid` in the patch). Additive; nothing removed or renamed.
+- **2026-11-26, II-25740** — lowering CPU/memory (`set_resources`, `resize_pod`): a memory decrease below 1.2 x the
+  container's current usage, or with no usage to read, is refused, at proposal and at approval; any decrease is
+  `high`; `set_resources` under Recreate is `high`. `propose_change` and `apply_approved_change` read
+  metrics.k8s.io (RBAC already granted). Protected namespaces add ingress-nginx and istio-system (oncallari
+  0.3.21). No field added or removed.
