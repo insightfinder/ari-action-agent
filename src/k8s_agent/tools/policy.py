@@ -13,6 +13,9 @@ from . import quantities
 
 REPLICA_FLOOR = 1  # never configurable: nothing this agent does scales a workload to zero
 DEFAULT_HIGH_REPLICA_THRESHOLD = 30  # the user's choice, 2026-11-24 (was 50)
+# A lowered memory request or limit must be at least this many times the container's current usage (user
+# decision 2026-11-26). Never configurable: it guards against an OOM-killed service, not a preference.
+DECREASE_USAGE_MARGIN = 1.2
 
 _AUTOSCALER_WORDS = re.compile(
     r"(?i)(keda|scaled\s*-?\s*object|\bhpa\b|horizontal\s*pod\s*autoscaler|autoscal\w*|自动扩缩|弹性伸缩)"

@@ -1,7 +1,8 @@
 """Namespaces and workloads this agent never changes, whatever a request or an approval says.
 
-Decided 2026-11-26 (nothing that could break a product environment): the cluster's own system namespaces, and
-the workloads the agent itself and its approval path run on. The agent runs in the same namespace as the
+Decided 2026-11-26 (nothing that could break a product environment): the cluster's own system namespaces
+(ingress-nginx and istio-system added the same day: they carry the stg/prod clusters' traffic), and the
+workloads the agent itself and its approval path run on. The agent runs in the same namespace as the
 services it changes (`insightfinder`), so it and its approval path are protected by name, not by namespace.
 
 The oncallari chart sets both lists from its values (the same values also render a ValidatingAdmissionPolicy
@@ -28,6 +29,8 @@ DEFAULT_NAMESPACES = (
     "vault",
     "keda",
     "traefik",
+    "ingress-nginx",
+    "istio-system",
 )
 # Workload names depend on the installation: the chart lists them (its own API and worker Deployments always).
 DEFAULT_WORKLOADS: tuple[str, ...] = ()

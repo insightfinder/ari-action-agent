@@ -616,6 +616,14 @@ def owned_pod(name, owner_kind, owner, node="node-a", namespace="shop"):
     return p
 
 
+def pod_metrics(name, namespace="shop", cpu="300m", memory="600Mi", container="app"):
+    """A metrics.k8s.io PodMetrics object: one container's current usage."""
+    return {
+        "metadata": {"name": name, "namespace": namespace},
+        "containers": [{"name": container, "usage": {"cpu": cpu, "memory": memory}}],
+    }
+
+
 def api_error(status: int, message: str, reason: str = "Error"):
     from kubernetes.client.exceptions import ApiException
 

@@ -331,6 +331,23 @@ def scenario_refuse_limit_below_request(_args):
     return "exceed" in str(refusal.get("reason")), str(refusal.get("reason"))[:160]
 
 
+def scenario_refuse_memory_decrease(_args):
+    """A memory limit below 1.2 x the container's current usage is refused (e2e-memuse holds ~100Mi)."""
+    task, _ = _run("set the memory limit of e2e-memuse to 110Mi")
+    reason = str((_artifact(task, "refusal") or {}).get("reason"))
+    ok = "below 1.2 x the current memory usage" in reason and _artifact(task, "pending_action") is None
+    return ok, reason[:200]
+
+
+def scenario_memory_decrease_high(_args):
+    """A memory limit lowered but above 1.2 x usage is proposed as high, with the usage shown (cancelled)."""
+    task, pending, note = _proposal_only("set the memory limit of e2e-memuse to 200Mi", "e2e-memuse")
+    pending = pending or {}
+    lowered = [r for r in pending.get("risks") or [] if str(r.get("message")).startswith("This lowers limits.memory 256Mi -> 200Mi")]
+    ok = pending.get("risk_tier") == "high" and bool(lowered) and "Current usage:" in lowered[0]["message"] and not note
+    return ok, f"risk_tier={pending.get('risk_tier')} risk={(lowered or [{}])[0].get('message', '')[:140]}{note}"
+
+
 def scenario_clamp(_args):
     """A CPU value above node capacity is clamped, and the proposal says so (cancelled, never applied)."""
     task, pending, note = _proposal_only("set the cpu request of e2e-plain to 64 and the cpu limit to 64", "e2e-plain")
@@ -1255,6 +1272,8 @@ SCENARIOS = {
     "refuse_managed": scenario_refuse_managed,
     "refuse_zero": scenario_refuse_zero,
     "refuse_limit": scenario_refuse_limit_below_request,
+    "refuse_memory_decrease": scenario_refuse_memory_decrease,
+    "memory_decrease_high": scenario_memory_decrease_high,
     "clamp": scenario_clamp,
     "clamp_sidecar": scenario_clamp_sidecar,
     "injection": scenario_injection,

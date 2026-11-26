@@ -29,7 +29,14 @@ import re
 from ..stepkit import refusal
 from ..tools import governance, policy, quantities
 from .base import ActionSpec, Operation, target_of
-from .set_resources import pick_container, request_over_limit, requested_values
+from .set_resources import (
+    decrease_check,
+    decrease_drift,
+    own_pod_usage,
+    pick_container,
+    request_over_limit,
+    requested_values,
+)
 
 # The floor the user set (2026-11-24): in-place resize is GA from 1.35. 1.33/1.34 serve pods/resize as beta,
 # with behaviour that differs in places; they are left out until checked.
@@ -145,7 +152,8 @@ class ResizePod(ActionSpec):
             if owner:
                 dep = await ctx.tool("get_deployment")(target["namespace"], owner)
             node = next((n for n in await ctx.tool("list_nodes")() if n.get("name") == pod.get("node_name")), None)
-        return {"pod": pod, "deployment": dep, "node": node, "support": support}
+        usage = await own_pod_usage(ctx, target["namespace"], [f"{target['namespace']}/{target['name']}"]) if pod else None
+        return {"pod": pod, "deployment": dep, "node": node, "support": support, "usage": usage}
 
     def target(self, action):
         return {"kind": "Pod", "namespace": action.get("namespace"), "name": action.get("pod")}
@@ -217,6 +225,10 @@ class ResizePod(ActionSpec):
                 "changed instead."
             )
 
+        risks, refused_why = decrease_check(name, current, requested, state.get("usage"))
+        if refused_why:
+            return None, refusal(refused_why)
+
         if node is not None:
             for resource in ("cpu", "memory"):
                 new = requested.get(("requests", resource))
@@ -264,6 +276,7 @@ class ResizePod(ActionSpec):
             "new_pods": 0,
             "restart": restart,
             "notes": notes,
+            "risks": risks,
             "changed_object": {
                 "kind": "Deployment",
                 "name": dep.get("name"),
@@ -360,6 +373,11 @@ class ResizePod(ActionSpec):
         container = proposal.get("container")
         if ((pod.get("resources") or {}).get(container)) != ((snapshot.get("container_resources") or {}).get(container)):
             changes.append(f"container {container} resources changed since the proposal")
+        usage_changed = decrease_drift(
+            container, (snapshot.get("container_resources") or {}).get(container), proposal.get("resources") or {}, state.get("usage")
+        )
+        if usage_changed:
+            changes.append(usage_changed)
         unsupported = support_problem(state.get("support") or {}, state.get("node"))
         if unsupported:
             changes.append(f"in-place resize is no longer available ({unsupported})")
