@@ -6223,3 +6223,11 @@ Verified: suite on Python 3.12, 1332 passed, 11 skipped, 2 failed — `test_a2a_
 Not run: the live e2e script (needs a merge into test and a deploy). Docs: K8S_AGENT_INTERFACE.md (request
 option, refusal list, change log), DEVELOPER_GUIDE.md. Open, other repo: insightfinder-mcp-service still lists
 only three action names in `KUBERNETES_CHANGE_ACTIONS` and maps none of the new statuses.
+
+**Review fixes live on test (2026-11-26).** Merge into test `1cf2786`; images ari-k8s-agent-worker and
+ari-agent-api `2611260856-test` (`proposal_max_age_hours` present in the worker). Live script, `--allow-writes`:
+`rbac`, `restart_deployment` (59 s), `delete_pod` (63 s), `expand_pvc` (1Gi -> 2Gi, 57 s, the patch now carrying
+the PVC's uid), `drift`, `node_beside_workload`, `scale` (2 -> 3, 63 s), `gate_stale`, `refuse_pvc_shrink`:
+9 passed. Fixtures afterwards: e2e-plain 2/2 ready, data-e2e-disk-0 at 2Gi (recreated at 1Gi on the next
+`expand_pvc` run). Not exercised live: the new late-approval refusals (revision moved, scale-up after a
+resources change, max age) and the new intent-gate phrasings; unit tests only.
