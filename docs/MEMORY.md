@@ -6129,7 +6129,7 @@ makes the whole status "could not be read completely" rather than half-read. Che
 line in the test fixture follows the format, not an observed backoff. Suite on 3.12: 1298 passed, 11 skipped.
 
 **Security review of the expand_pvc commits (2026-11-26), two fixes, one accepted.**
-- Chart (follow-up commit on the charts branch): `patch` on PVCs let the ServiceAccount change any PVC field the API
+- Chart (oncallari 0.3.20, charts branch `II-25740-k8s-agent-pvc-grow-only`; 0.3.19 was merged as PR #115 before this fix): `patch` on PVCs let the ServiceAccount change any PVC field the API
   allows: labels, annotations, finalizers (dropping `kubernetes.io/pvc-protection`), ownerReferences (a bogus
   owner gets the PVC garbage-collected, and with reclaimPolicy Delete its volume) or volumeAttributesClassName.
   The admission policy now allows a PVC UPDATE only when the storage request grows (CEL `quantity(...)

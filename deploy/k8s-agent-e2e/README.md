@@ -80,7 +80,7 @@ run left it larger. `refuse_pvc_shrink` and `refuse_pvc_helm` (a PVC the
 agent's own chart renders) must get no proposal; `admission_policy` also
 dry-runs a write to that Helm-rendered PVC (denied) and, on
 `data-e2e-disk-0`, a larger storage request (allowed) and an annotation
-(denied: the agent may only raise a PVC's storage request). They need oncallari 0.3.19. On the test cluster the agent runs in namespace `insightfinder`
+(denied: the agent may only raise a PVC's storage request; oncallari 0.3.20). They need oncallari 0.3.19. On the test cluster the agent runs in namespace `insightfinder`
 (`ari-k8s-api` / `ari-k8s-worker`, secret `ari-k8s-secret`) rather than
 `ari-k8s-agent`; only `ari-k8s-e2e` is ever changed. Write scenarios belong
 here, not on real services: on test, image automation redeploys the
