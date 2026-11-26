@@ -156,6 +156,19 @@ async def test_start_sends_the_configured_repo_llm_and_options(bridge):
 
 
 @pytest.mark.asyncio
+async def test_a_configured_jenkins_goes_with_every_request(bridge):
+    bridge.settings.jenkins_url = "http://jenkins.example:8080"
+    bridge.settings.jenkins_user = "ci"
+    bridge.settings.jenkins_token = "jt"
+    await bridge.start("th", "why did the last build fail?", "alice")
+    assert bridge.client.sent[0]["config"]["jenkins"] == {
+        "base_url": "http://jenkins.example:8080",
+        "auth": {"type": "api_token", "token": "jt", "user": "ci"},
+        "verify_tls": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_directives_override_the_repo_and_shape_the_prompt(bridge):
     await bridge.start("th", "fix it repo=https://github.com/org/x ref=dev base=staging", "alice")
     sent = bridge.client.sent[0]

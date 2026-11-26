@@ -1,0 +1,17 @@
+{
+  "name": "ari-ai-agent",
+  "owner": {
+    "name": "InsightFinder"
+  },
+  "metadata": {
+    "description": "Plugins for the open-source ARI agents"
+  },
+  "plugins": [
+    {
+      "name": "ari-ai-agent",
+      "displayName": "ARI AI Agent",
+      "source": "plugins/ari-ai-agent-cursor",
+      "description": "Work with the ARI operations agents from Cursor: root-cause a problem in a repository and open a pull request, check or change Kubernetes workloads, and query or trigger Jenkins jobs, each change approved by a person first."
+    }
+  ]
+}

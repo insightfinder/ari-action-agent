@@ -1,0 +1,22 @@
+{
+  "name": "ari-ai-agent",
+  "displayName": "ARI AI Agent",
+  "version": "1.0.0",
+  "description": "Work with the ARI operations agents from Cursor: root-cause a problem in a repository and open a pull request, check or change Kubernetes workloads, and query or trigger Jenkins jobs, each change approved by a person first.",
+  "author": {
+    "name": "InsightFinder"
+  },
+  "homepage": "https://github.com/insightfinder/ari-action-agent/blob/main/docs/MCP_GATEWAY.md",
+  "repository": "https://github.com/insightfinder/ari-action-agent",
+  "license": "Apache-2.0",
+  "keywords": [
+    "ari",
+    "operations",
+    "on-call",
+    "kubernetes",
+    "jenkins",
+    "mcp"
+  ],
+  "logo": "assets/icon.png",
+  "mcpServers": "mcp.json"
+}

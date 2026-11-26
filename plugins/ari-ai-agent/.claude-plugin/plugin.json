@@ -1,0 +1,31 @@
+{
+  "name": "ari-ai-agent",
+  "displayName": "ARI AI Agent",
+  "version": "1.0.0",
+  "description": "Work with the ARI operations agents from Claude Code: root-cause a problem in a repository and open a pull request, check or change Kubernetes workloads, and query or trigger Jenkins jobs, each change approved by a person first.",
+  "author": {
+    "name": "InsightFinder",
+    "url": "https://github.com/insightfinder"
+  },
+  "homepage": "https://github.com/insightfinder/ari-action-agent/blob/main/docs/MCP_GATEWAY.md",
+  "repository": "https://github.com/insightfinder/ari-action-agent",
+  "license": "Apache-2.0",
+  "keywords": [
+    "ari",
+    "operations",
+    "on-call",
+    "kubernetes",
+    "jenkins",
+    "mcp"
+  ],
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "ARI MCP gateway URL",
+      "description": "The MCP endpoint of your ARI gateway, for example https://ari-mcp.example.com/mcp",
+      "required": true
+    }
+  },
+  "icon": "./.claude-plugin/icon.png",
+  "privacyPolicyUrl": "https://insightfinder.com/privacy-policy/"
+}
