@@ -6521,3 +6521,99 @@ and istio-system. Live script, `--allow-writes`, 15 scenarios: `refuse_memory_de
 with "connection refused", the port-forward not up yet; passed on a rerun). Fixtures restored afterwards
 (e2e-slow 64Mi, e2e-memhungry 32Mi, e2e-plain 2 replicas). Not run this round: the other 38 scenarios (reads,
 restart, delete_pod, expand_pvc, autoscaler bounds, the remaining gates, worker/API restarts), unchanged paths.
+
+**Late approvals live; full e2e on fresh fixtures (2026-11-26).** Four live scenarios for the approval-time
+refusals that were unit-only (`scripts/k8s_agent_live_test.py`, section "approvals that arrive late"). Each
+proposes, changes what one check compares, then approves; it passes only if nothing is written and the worker's
+log holds that check's `RuntimeError: apply_approved_change: ...` for the task id (the reason otherwise reaches
+the task only through the LLM-written summary). They need `ARI_WORKER_DEPLOYMENT`. `_send_approval` /
+`_approval_after` take request options.
+- `late_restart_after_rollout`: a template annotation `ari-e2e/late-approval` rolls e2e-plain (revision 10 -> 11)
+  before a restart is approved -> "a rollout since the proposal already replaced its pods". Annotation removed.
+- `late_scale_after_resources`: e2e-plain memory limit 32Mi -> 48Mi before a scale-up is approved -> "its
+  containers' CPU/memory changed". Both fields put back.
+- `late_too_old`: approved 15 s later with `options.proposal_max_age_hours=0.002` -> too old. The message reads
+  "made 0.0 hours ago, more than the 0.002 hours" (one decimal); harmless at the 24 h default, not changed.
+- `late_memory_usage`: e2e-memuse 256Mi -> 200Mi proposed at ~104Mi usage; a second process in the pod
+  (`kubectl exec`, 80Mi) brings usage to 188Mi -> "usage changed: ... below 1.2 x ...". Process killed afterwards.
+(The list of checks still unit-only that stood here is superseded by the next entry: all are now live.)
+
+Full run, test, images `2611261053-test` (image automation moved them from `2611261023-test` before the run; the
+k8s agent code is the same): namespace `ari-k8s-e2e` deleted and re-applied from `fixtures.yaml` (every live
+object was a fixture or generated from one), preconditions checked (Deployments Available, PVC Bound,
+e2e-memhungry ProgressDeadlineExceeded, e2e-memuse sample 103Mi). `--allow-writes`, all 57 scenarios: 57 passed,
+no reruns, about 50 minutes. Fixtures afterwards as in `fixtures.yaml`, except data-e2e-disk-0 at 2Gi (recreated
+at 1Gi by the next `expand_pvc`) and e2e-plain's restartedAt.
+
+**Every approval-time check live (2026-11-26, user: "all of them, nothing left out").** 26 more `late_*`
+scenarios, 30 in all, one per check that `apply_approved_change` and the actions' `drift` run, read from the
+code (`actions/*.py` `drift`, `base.py`, `apply_approved_change.py`). Same pattern (propose, change, approve, the
+worker's log must hold that check's refusal, nothing written):
+- Deployments: recreated from its own manifest (scale and restart both refused, new uid); an HPA added; e2e-hpa's
+  HPA deleted, or its max changed; e2e-keda's ScaledObject min changed; the CPU limit changed under a memory
+  change; plus the earlier scale-after-resources, too-old and usage-changed.
+- Restarts: another rollout, `kubectl rollout restart`, paused, strategy Recreate.
+- Pod deletes: pod deleted by hand / held terminating by a finalizer -> the approval completed as
+  `already_at_target` (`at_target` is "the pod is gone or going"); changed the same day, see the next entry; pod
+  orphaned from its ReplicaSet -> refused (bare pod); Deployment scaled to that one pod (pod-deletion-cost) ->
+  refused (no other ready pod).
+- Pod resizes: pod deleted; pod resized by hand; usage raised (e2e-memuse, which now has
+  `resizePolicy memory: RestartContainer` in fixtures.yaml, because resize_pod refuses memory under NotRequired).
+- PVC growth: deleted, then recreated (two proposals: "no longer exists", "replaced (new uid)"); left Terminating;
+  grown by hand to 1536Mi; Helm annotations added; an extra owner (ConfigMap); its StatefulSet given a controlling
+  owner (ConfigMap as the operator); a second StatefulSet `disk` with template `data-e2e` (same PVC name, ambiguous);
+  the StatefulSet deleted with `--cascade=orphan`; the fixtures' own StorageClass `ari-k8s-e2e-expand` (new,
+  cluster-scoped, with new StatefulSet `e2e-vol`) set to no expansion, or deleted.
+- `late_protected`: the worker's `K8S_AGENT_PROTECTED_WORKLOADS` extended with ari-k8s-e2e/e2e-plain and
+  ari-k8s-e2e/e2e-disk via `kubectl set env` (worker restarts), both approvals refused, original value put back
+  (read back afterwards: identical). The only scenario that changes the agent's own configuration.
+Not reachable on any cluster, so not live (listed in the script's section comment): a proposal for a kind this
+build no longer changes (only an older build made those), a Bound PVC turning unbound (PV protection), a pod's
+resizePolicy changing (immutable: the API server answered "only cpu and memory resources are mutable"), in-place
+resize becoming unavailable (needs a downgrade). Deployment pods are never replaced under the same name.
+
+Run on test (images `2611261053-test`): 29 of 30 passed first time. `late_resize_pod_usage` failed on the
+fixture (NotRequired, above); after the fixture change it first failed again because metrics-server still showed
+the previous scenario's 187Mi, so the memory hold now waits for the usage to fall back under 130Mi after it ends;
+then `late_memory_usage`, `late_resize_pod_usage`, `refuse_memory_decrease` passed back to back, and
+`memory_decrease_high` on the new pod. Fixtures checked afterwards: no leftover HPA, ConfigMap, StatefulSet `disk`,
+orphan pod, finalizer, owner reference or annotation; data-e2e-disk-0 at 1Gi; StorageClass expandable.
+Wording seen in the refusals (agent text, not changed): PVC eligibility and protection refusals at approval reuse
+their proposal-time sentence ("nothing was proposed", "Nothing was proposed; use kubectl..."), followed by
+"Nothing was changed"; the too-old one says "0.0 hours ago" for sub-6-minute ages. `tests/test_k8s_live_script.py`
+gains fixture checks (68 passed). README: the late-approval list, the StorageClass in scope and cleanup.
+
+**A pod someone else deleted is not reported as deleted; refusals are not retried (2026-11-26, user).** The user,
+on `late_delete_pod_gone`: if the pod is already gone, the agent could not delete it, so that is not a success.
+Why it was a success: `apply_approved_change` treats "drift, but the target already holds the approved result" as
+an earlier attempt of its own (the worker lost after the write), so a retry verifies instead of refusing; for a
+delete, "the pod is gone" cannot tell whose delete it was. Changes:
+- `StepContext.attempt` (common, from `activity.info().attempt`; None outside an activity) and
+  `common.capabilities_base.StepRefused` (a `RuntimeError`), which `execute_step` turns into a non-retryable
+  `ApplicationError` (type `StepRefused`, same message). Every `apply_approved_change` refusal raises it. Before,
+  each refusal ran twice (worker logs showed attempt 1 and 2), and the second look 10 s later could act on a
+  state the first ruled out (e.g. `no other pod ... is ready now`, a sibling ready again by then). Other errors
+  stay retryable (a read timeout).
+- Every action (user, after the pod delete: "其他操作也按同样规则改"): on attempt 1, a target already holding
+  the approved result (pod gone or terminating, replicas, resources, bounds, pod resources, PVC size) is refused
+  with the drift text plus "; it already holds what was approved, done by someone else, not this agent"; from
+  attempt 2 on it still counts as done (`already_at_target`). A 404/409 from the write itself on attempt 1 is
+  refused too ("had already been changed by someone else when this agent's write reached the API"). Residual:
+  attempt 1 fails for another reason (a read timeout) before writing and someone makes the change in the 10 s
+  before attempt 2 -> reported done. Restart has no such case (its restartedAt is the proposal's own).
+- Too-old refusal: `_duration` ("7 seconds", "10 minutes", "24 hours", "25.5 hours", "3 days") instead of
+  "0.0 hours" / "0.002 hours" (user: looked odd).
+- Live script: `_refusals_in` reads a refusal line of any exception class (the new traceback ends in
+  `...StepRefused: apply_approved_change: ...` then `temporalio.exceptions.ApplicationError: StepRefused: ...`);
+  `late_delete_pod_gone` now expects both refusals; new `late_delete_pod_retry` kills the worker right after the
+  agent's own delete and expects `already_at_target` from the retry.
+Live script: `late_already_scaled`, `_resources`, `_bounds`, `_resized`, `_grown` (kubectl sets exactly the
+proposed value before the approval; refusal expected). Tests: unit (pod gone / terminating / 404 race on
+attempt 1, retry on attempt 2; scale, resources, KEDA bounds, resize, PVC size done by someone else; durations), `test_activities.py` (attempt passed, StepRefused non-retryable, other errors retryable),
+`test_k8s_workflow.py` through the real Temporal worker (a refusal runs once; a RuntimeError runs twice; a pod
+deleted before the approval -> failed, drift checked once, nothing deleted). Mutations (delete counting others'
+pods as done; `non_retryable=False`): the new tests no longer pass (they hang in verification waiting for a
+replacement). Suite on 3.12: 1471 passed, 11 skipped, 2 failed (`test_a2a_agent_card`, `test_a2a_executor`: the
+same 2 fail on HEAD without these changes and pass alone; test order).
+Docs: K8S_AGENT_INTERFACE.md (delete_pod status, change log), the e2e README.
+Not verified live yet: needs commit, merge into test, push and deploy, then the live script.

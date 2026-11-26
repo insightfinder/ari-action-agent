@@ -236,6 +236,9 @@ spec:
             - python
             - -c
             - "import time; b = bytearray(100 * 1024 * 1024); b[::4096] = b'x' * len(b[::4096]); time.sleep(10**9)"
+          # resize_pod changes memory in place only for containers that restart on it.
+          resizePolicy:
+            - {resourceName: memory, restartPolicy: RestartContainer}
           resources:
             requests: {cpu: 10m, memory: 64Mi}
             limits: {cpu: 100m, memory: 256Mi}
@@ -388,6 +391,46 @@ spec:
     - metadata: {name: data}
       spec:
         accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 1Gi}}
+---
+# A StorageClass only these fixtures use, so the late-approval scenarios can
+# stop it allowing expansion, or delete and recreate it, without touching the
+# cluster's own classes. Cluster-scoped: deleting the namespace leaves it.
+# The EBS CSI provisioner of the test EKS.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: ari-k8s-e2e-expand}
+provisioner: ebs.csi.aws.com
+parameters: {type: gp3}
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+---
+# Its PVC data-e2e-vol-0 is only ever proposed for growth, never grown.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: e2e-vol, namespace: ari-k8s-e2e}
+spec:
+  replicas: 1
+  serviceName: e2e-vol
+  selector: {matchLabels: {app: e2e-vol}}
+  template:
+    metadata: {labels: {app: e2e-vol}}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: ari-k8s-e2e-expand
         resources: {requests: {storage: 1Gi}}
 ---
 # One tiny pod per schedulable node.

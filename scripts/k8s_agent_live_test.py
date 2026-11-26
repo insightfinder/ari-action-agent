@@ -48,6 +48,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -164,8 +165,8 @@ def _propose(prompt: str) -> tuple[dict, dict | None]:
     return task, _artifact(task, "pending_action")
 
 
-def _send_approval(task: dict, pending_id: str) -> dict:
-    config = _config()
+def _send_approval(task: dict, pending_id: str, **options) -> dict:
+    config = _config(**options)
     config["confirm_pending_action"] = {"id": pending_id}
     return _send("approved", config, task_id=task["id"], context_id=task.get("contextId") or task.get("context_id") or "")
 
@@ -189,6 +190,10 @@ FIELDS = {
     "hpa_min": ("hpa", "{.spec.minReplicas}", "merge", lambda v: {"spec": {"minReplicas": int(v)}}),
     "memory_limit": ("deploy", _CONTAINER_MEMORY, "strategic",
                      lambda v: {"spec": {"template": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": v}}}]}}}}),
+    "cpu_limit": ("deploy", "{.spec.template.spec.containers[0].resources.limits.cpu}", "strategic",
+                  lambda v: {"spec": {"template": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"cpu": v}}}]}}}}),
+    "hpa_max": ("hpa", "{.spec.maxReplicas}", "merge", lambda v: {"spec": {"maxReplicas": int(v)}}),
+    "keda_min": ("scaledobject", "{.spec.minReplicaCount}", "merge", lambda v: {"spec": {"minReplicaCount": int(v)}}),
 }
 
 
@@ -682,10 +687,11 @@ def scenario_auth(_args):
     return ok, f"card={card} control_with_key={control} {results}"
 
 
-def _approval_after(task: dict, pending_id: str) -> tuple[str, dict | None]:
-    """Sends an approval and returns the state it ends in (or the HTTP error) and the final task."""
+def _approval_after(task: dict, pending_id: str, **options) -> tuple[str, dict | None]:
+    """Sends an approval (with these request `options`) and returns the state it ends in (or the HTTP error) and
+    the final task."""
     try:
-        resumed = _send_approval(task, pending_id)
+        resumed = _send_approval(task, pending_id, **options)
     except httpx.HTTPStatusError as exc:
         return f"HTTP {exc.response.status_code}", None
     done, _ = _wait(resumed["id"], budget_seconds=1200)
@@ -1020,6 +1026,857 @@ def scenario_health_statefulset(_args):
     return ok, f"{task['status']['state']} in {elapsed:.0f}s scope={scope} pods={(report.get('summary') or {}).get('pods')}"
 
 
+# ---------------------------------------------------------------- approvals that arrive late (2026-11-26)
+# An approval can come hours after its proposal, and the cluster moves on meanwhile. Each scenario below changes
+# what one approval-time check compares, then approves: nothing may be written, and the worker must have logged
+# that very check's refusal. The reason reaches the task only through the summary the LLM writes, so it is read
+# from the worker's log (the failed activity names the task id as its workflow id).
+#
+# Every check an approval runs has a scenario here (the actions' `drift`, apply_approved_change's protection and
+# age checks), except four no cluster can be made to reach: a proposal for a target kind this build no longer
+# changes (only an older build made those), a Bound PVC turning unbound (its PV is protected while bound), a pod's
+# resizePolicy changing (immutable once the pod exists), and in-place resize becoming unavailable (the API server
+# or the kubelets would have to be downgraded). A Deployment pod "replaced under the same name" cannot happen
+# either: its replacement gets a new name, which is the `no longer exists` case.
+
+LATE_MARK = "ari-e2e/late-approval"
+LATE_OWNER = "e2e-late-owner"  # ConfigMap that stands in for an extra owner or an operator
+LATE_HPA = "e2e-plain-late"
+AMBIGUOUS_STS = "disk"  # with claim template `data-e2e`, its PVC 0 would also be named data-e2e-disk-0
+VOL_STS, VOL_PVC, VOL_CLASS = "e2e-vol", "data-e2e-vol-0", "ari-k8s-e2e-expand"
+
+
+def _kubectl_in(stdin: str, *args: str) -> str:
+    context = os.environ.get("KUBE_CONTEXT")
+    cmd = ["kubectl", *(["--context", context] if context else []), *args]
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, input=stdin).stdout.strip()
+
+
+def _worker_refusals(task_id: str) -> list[str]:
+    """The `apply_approved_change` refusals the worker pods logged for this task in the last 30 minutes."""
+    namespace, deployment = _split("ARI_WORKER_DEPLOYMENT")
+    selector = json.loads(_kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.selector.matchLabels}"))
+    labels = ",".join(f"{k}={v}" for k, v in selector.items())
+    return _refusals_in(_kubectl("-n", namespace, "logs", "-l", labels, "--since=30m", "--tail=-1", "--max-log-requests=10"), task_id)
+
+
+# The exception line of a refusal in the worker's traceback, whatever its class: `RuntimeError: ...` before
+# 2026-11-26, then `common.capabilities_base.StepRefused: ...` followed by the `ApplicationError` Temporal reports.
+_REFUSAL_LINE = re.compile(r"^[\w.]+: (?:StepRefused: )?apply_approved_change: (.*)$")
+
+
+def _refusals_in(logs: str, task_id: str) -> list[str]:
+    """The `apply_approved_change` refusals in these worker logs for this task (its workflow id), each once."""
+    reasons, current = [], False
+    for line in logs.splitlines():
+        if "Completing activity as failed" in line:
+            current = f"'workflow_id': '{task_id}'" in line
+            continue
+        match = _REFUSAL_LINE.match(line) if current else None
+        if match and match.group(1) not in reasons:
+            reasons.append(match.group(1))
+    return reasons
+
+
+def _late_skip(args) -> tuple[None, str] | None:
+    if not args.allow_writes:
+        return None, "needs --allow-writes (sends an approval)"
+    if not _split("ARI_WORKER_DEPLOYMENT"):
+        return None, "needs ARI_WORKER_DEPLOYMENT (<namespace>/<name>): the refusal is read from the worker's log"
+    return None
+
+
+def _must_propose(prompt: str) -> tuple[dict, dict]:
+    task, pending = _propose(prompt)
+    if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending:
+        raise RuntimeError(f"expected a proposal for {prompt!r}, got {task['status']['state']} :: {_artifact(task, 'refusal')}")
+    return task, pending
+
+
+def _late_approve(proposal: tuple[dict, dict], needle: str, untouched, **approval_options) -> tuple[bool, str]:
+    """Approves `proposal` now: the task must not complete, no action_result, `untouched()` must read the same
+    before and after, and the worker must have logged a refusal containing `needle`."""
+    task, pending = proposal
+    before = untouched()
+    state, done = _approval_after(task, pending["id"], **approval_options)
+    time.sleep(5)
+    reasons = _worker_refusals(task["id"])
+    after = untouched()
+    ok = (
+        state != "TASK_STATE_COMPLETED"
+        and _artifact(done or {}, "action_result") is None
+        and after == before
+        and any(needle in r for r in reasons)
+        and not _leaks(done or {})
+    )
+    return ok, f"{state} untouched={after == before} refusal={(reasons or ['none logged'])[-1][:200]}"
+
+
+def _late(args, prompt: str, meanwhile, needle: str, untouched, **approval_options) -> tuple[bool | None, str]:
+    """Proposes `prompt`, runs `meanwhile()` (what changes while the approval waits), then approves (see `_late_approve`)."""
+    skip = _late_skip(args)
+    if skip:
+        return skip
+    proposal = _must_propose(prompt)
+    meanwhile()
+    return _late_approve(proposal, needle, untouched, **approval_options)
+
+
+def _settled(deployment: str) -> None:
+    _kubectl("-n", NAMESPACE, "rollout", "status", f"deploy/{deployment}", "--timeout=300s")
+
+
+def _revision(deployment: str) -> str:
+    return _kubectl("-n", NAMESPACE, "get", "deploy", deployment, "-o", r"jsonpath={.metadata.annotations.deployment\.kubernetes\.io/revision}")
+
+
+def _template_mark(deployment: str, value: str | None) -> None:
+    _kubectl("-n", NAMESPACE, "patch", "deploy", deployment, "--type", "strategic",
+             "-p", json.dumps({"spec": {"template": {"metadata": {"annotations": {LATE_MARK: value}}}}}))
+
+
+def _clean(obj: dict) -> dict:
+    """A live object as a manifest to create again: no uid, version, owners or status."""
+    meta = obj["metadata"]
+    for key in ("uid", "resourceVersion", "creationTimestamp", "generation", "managedFields", "ownerReferences"):
+        meta.pop(key, None)
+    (meta.get("annotations") or {}).pop("deployment.kubernetes.io/revision", None)
+    obj.pop("status", None)
+    return obj
+
+
+def _create(obj: dict) -> None:
+    _kubectl_in(json.dumps(obj), "create", "-f", "-")
+
+
+def _running_pods(app: str) -> list[dict]:
+    pods = json.loads(_kubectl("-n", NAMESPACE, "get", "pods", "-l", f"app={app}", "-o", "json"))["items"]
+    return sorted(
+        (p for p in pods if p["status"].get("phase") == "Running" and not p["metadata"].get("deletionTimestamp")),
+        key=lambda p: p["metadata"]["name"],
+    )
+
+
+def _exists(kind: str, name: str) -> bool:
+    try:
+        _kubectl("get", kind, name, "-o", "name")
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _uid(kind: str, name: str) -> str | None:
+    return ((_object(kind, name) or {}).get("metadata") or {}).get("uid")
+
+
+def _plain_cpu_limits() -> list:
+    """The distinct CPU limits of e2e-plain's running pods (a replacement pod may or may not be up yet)."""
+    return sorted({_pod_cpu_limit(p)[0] or "" for p in _running_pods("e2e-plain")})
+
+
+# --- Deployments: the object, its autoscaler, its containers
+
+
+def scenario_late_recreated(args):
+    """e2e-plain deleted and created again from its own manifest after a scale-up and a restart were proposed:
+    both approvals are refused (new uid)."""
+    skip = _late_skip(args)
+    if skip:
+        return skip
+    scale = _must_propose("scale e2e-plain to 3 replicas")
+    restart = _must_propose(f"restart the deployment e2e-plain in namespace {NAMESPACE}")
+    manifest = _clean(_object("deploy", "e2e-plain"))
+    try:
+        _kubectl("-n", NAMESPACE, "delete", "deploy", "e2e-plain", "--wait=true", "--timeout=120s")
+        _create(manifest)
+        _settled("e2e-plain")
+        untouched = lambda: (_generation("e2e-plain"), _get("replicas", "e2e-plain"), _restarted_at("deployment", "e2e-plain"))
+        a = _late_approve(scale, "the Deployment was deleted and created again", untouched)
+        b = _late_approve(restart, "Deployment e2e-plain was deleted and created again", untouched)
+        return a[0] and b[0], f"scale: {a[1]} | restart: {b[1]}"
+    finally:
+        if _object("deploy", "e2e-plain") is None:
+            _create(manifest)
+        _settled("e2e-plain")
+
+
+def scenario_late_autoscaler_added(args):
+    """An HPA for e2e-plain created after a scale-up was proposed (min = max = 2, its current replicas): the
+    approval is refused. The HPA is deleted afterwards."""
+    hpa = {
+        "apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
+        "metadata": {"name": LATE_HPA, "namespace": NAMESPACE},
+        "spec": {
+            "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "e2e-plain"},
+            "minReplicas": 2, "maxReplicas": 2,
+            "metrics": [{"type": "Resource", "resource": {"name": "cpu", "target": {"type": "Utilization", "averageUtilization": 80}}}],
+        },
+    }
+    try:
+        return _late(args, "scale e2e-plain to 3 replicas", lambda: _create(hpa), "an autoscaler now governs this Deployment",
+                     lambda: _generation("e2e-plain"))
+    finally:
+        if args.allow_writes:
+            _kubectl("-n", NAMESPACE, "delete", "hpa", LATE_HPA, "--ignore-not-found")
+
+
+def scenario_late_autoscaler_removed(args):
+    """The HPA of e2e-hpa deleted after a change of its minimum was proposed: the approval is refused. The HPA is
+    created again afterwards."""
+    manifest = _clean(_object("hpa", "e2e-hpa")) if args.allow_writes else None
+    try:
+        return _late(args, "set the HPA min replicas of e2e-hpa to 2",
+                     lambda: _kubectl("-n", NAMESPACE, "delete", "hpa", "e2e-hpa", "--wait=true"),
+                     "the autoscaler governing it is gone", lambda: (_generation("e2e-hpa"), _object("hpa", "e2e-hpa") is None))
+    finally:
+        if manifest and _object("hpa", "e2e-hpa") is None:
+            _create(manifest)
+
+
+def scenario_late_autoscaler_changed_hpa(args):
+    """e2e-hpa's HPA maximum changed (3 -> 4) after a change of its minimum was proposed: refused. Put back."""
+    with _restored(args, "hpa_min", "e2e-hpa"), _restored(args, "hpa_max", "e2e-hpa"):
+        return _late(args, "set the HPA min replicas of e2e-hpa to 2", lambda: _set("hpa_max", "e2e-hpa", "4"),
+                     "autoscaler max changed from 3 to 4", lambda: _get("hpa_min", "e2e-hpa"))
+
+
+def scenario_late_autoscaler_changed_keda(args):
+    """e2e-keda's ScaledObject minimum changed (1 -> 2) after a change of its maximum was proposed: refused. Put
+    back (KEDA scales the Deployment back down after its cooldown)."""
+    with _restored(args, "keda_max", "e2e-keda"), _restored(args, "keda_min", "e2e-keda"):
+        return _late(args, "set the KEDA max replicas of e2e-keda to 4", lambda: _set("keda_min", "e2e-keda", "2"),
+                     "autoscaler min changed from 1 to 2", lambda: _get("keda_max", "e2e-keda"))
+
+
+def scenario_late_resources_changed(args):
+    """e2e-plain's CPU limit changed (50m -> 60m) after a memory limit change was proposed: refused. Put back."""
+    try:
+        with _restored(args, "memory_limit", "e2e-plain"), _restored(args, "cpu_limit", "e2e-plain"):
+            return _late(args, "set the memory limit of e2e-plain to 48Mi", lambda: _set("cpu_limit", "e2e-plain", "60m"),
+                         "container app resources changed since the proposal", lambda: _get("memory_limit", "e2e-plain"))
+    finally:
+        if args.allow_writes:
+            _settled("e2e-plain")
+
+
+def scenario_late_scale_after_resources(args):
+    """A scale-up of e2e-plain approved after its memory limit changed (32Mi -> 48Mi by kubectl) is refused: its
+    estimate of where the new pods fit was made from the old values. Both fields are put back."""
+    try:
+        with _restored(args, "replicas", "e2e-plain"), _restored(args, "memory_limit", "e2e-plain"):
+            return _late(args, "scale e2e-plain to 3 replicas", lambda: _set("memory_limit", "e2e-plain", "48Mi"),
+                         "its containers' CPU/memory changed since the proposal", lambda: _generation("e2e-plain"))
+    finally:
+        if args.allow_writes:
+            _settled("e2e-plain")
+
+
+def scenario_late_too_old(args):
+    """An approval sent with options.proposal_max_age_hours=0.002 (7 s) 15 s after the proposal is refused as too
+    old; e2e-plain keeps its replicas."""
+    with _restored(args, "replicas", "e2e-plain"):
+        return _late(args, "scale e2e-plain to 3 replicas", lambda: time.sleep(15), "hours an approval stays valid",
+                     lambda: _generation("e2e-plain"), proposal_max_age_hours=0.002)
+
+
+# --- the approved result already in place, done by someone else (user, 2026-11-26): refused, never reported
+# as this agent's change. A restart has no such case: its approved restartedAt is the proposal's own timestamp.
+
+_DONE_ELSEWHERE = "already holds what was approved, done by someone else"
+
+
+def scenario_late_already_scaled(args):
+    """e2e-plain scaled to 3 by kubectl before "scale e2e-plain to 3" is approved: refused. Put back."""
+    with _restored(args, "replicas", "e2e-plain"):
+        return _late(args, "scale e2e-plain to 3 replicas", lambda: _set("replicas", "e2e-plain", "3"), _DONE_ELSEWHERE,
+                     lambda: _generation("e2e-plain"))
+
+
+def scenario_late_already_resources(args):
+    """e2e-plain's memory limit set to 48Mi by kubectl before that very change is approved: refused. Put back."""
+    try:
+        with _restored(args, "memory_limit", "e2e-plain"):
+            return _late(args, "set the memory limit of e2e-plain to 48Mi", lambda: _set("memory_limit", "e2e-plain", "48Mi"),
+                         _DONE_ELSEWHERE, lambda: _generation("e2e-plain"))
+    finally:
+        if args.allow_writes:
+            _settled("e2e-plain")
+
+
+def scenario_late_already_bounds(args):
+    """e2e-hpa's HPA minimum set to 2 by kubectl before that very change is approved: refused. Put back."""
+    with _restored(args, "hpa_min", "e2e-hpa"):
+        return _late(args, "set the HPA min replicas of e2e-hpa to 2", lambda: _set("hpa_min", "e2e-hpa", "2"), _DONE_ELSEWHERE,
+                     lambda: _get("hpa_min", "e2e-hpa"))
+
+
+def scenario_late_already_resized(args):
+    """An e2e-plain pod resized to cpu limit 100m by kubectl before that very resize is approved: refused. The pod
+    is resized back to its own value."""
+    pods = _running_pods("e2e-plain")
+    if not pods:
+        return False, "no running e2e-plain pod"
+    name, original = pods[0]["metadata"]["name"], _pod_cpu_limit(pods[0])[0]
+    try:
+        return _late(args, f"resize pod {name} in namespace {NAMESPACE} in place: cpu limit 100m", lambda: _resize_cpu(name, "100m"),
+                     _DONE_ELSEWHERE, lambda: _pod_cpu_limit(_object("pod", name) or {})[0])
+    finally:
+        if args.allow_writes and original and _pod_cpu_limit(_object("pod", name) or {})[0] not in (None, original):
+            _resize_cpu(name, original)
+
+
+def scenario_late_already_grown(args):
+    """data-e2e-disk-0 grown to 2Gi by kubectl before "expand it to 2Gi" is approved: refused. The disk is
+    recreated at 1Gi afterwards."""
+    if args.allow_writes:
+        _fresh_disk()
+
+    def grow():
+        _kubectl("-n", NAMESPACE, "patch", "pvc", DISK_PVC, "--type", "merge", "-p", json.dumps({"spec": {"resources": {"requests": {"storage": "2Gi"}}}}))
+
+    try:
+        return _late(args, _EXPAND, grow, _DONE_ELSEWHERE, _disk_untouched)
+    finally:
+        if args.allow_writes:
+            _disk_down()
+            _disk_up()
+
+
+# --- restarts
+
+
+_RESTART = f"restart the deployment e2e-plain in namespace {NAMESPACE}"
+
+
+def _restart_untouched():
+    return _restarted_at("deployment", "e2e-plain")
+
+
+def scenario_late_restart_after_rollout(args):
+    """A restart of e2e-plain approved after another rollout of it (kubectl changed a template annotation) is
+    refused: that rollout already replaced the pods. The annotation is removed afterwards."""
+    def roll():
+        before = _revision("e2e-plain")
+        _template_mark("e2e-plain", str(int(time.time())))
+        for _ in range(30):
+            if _revision("e2e-plain") != before:
+                return
+            time.sleep(1)
+
+    try:
+        return _late(args, _RESTART, roll, "a rollout since the proposal already replaced its pods", _restart_untouched)
+    finally:
+        if args.allow_writes:
+            if (_object("deploy", "e2e-plain")["spec"]["template"]["metadata"].get("annotations") or {}).get(LATE_MARK):
+                _template_mark("e2e-plain", None)
+            _settled("e2e-plain")
+
+
+def scenario_late_restart_restarted(args):
+    """A restart of e2e-plain approved after someone else restarted it (kubectl rollout restart) is refused."""
+    try:
+        return _late(args, _RESTART, lambda: _kubectl("-n", NAMESPACE, "rollout", "restart", "deploy/e2e-plain"),
+                     "it was restarted since the proposal", _restart_untouched)
+    finally:
+        if args.allow_writes:
+            _settled("e2e-plain")
+
+
+def scenario_late_restart_paused(args):
+    """A restart of e2e-plain approved while its rollout is paused (kubectl rollout pause) is refused. Resumed."""
+    try:
+        return _late(args, _RESTART, lambda: _kubectl("-n", NAMESPACE, "rollout", "pause", "deploy/e2e-plain"),
+                     "it is paused now", _restart_untouched)
+    finally:
+        if args.allow_writes:
+            if (_object("deploy", "e2e-plain") or {}).get("spec", {}).get("paused"):
+                _kubectl("-n", NAMESPACE, "rollout", "resume", "deploy/e2e-plain")
+            _settled("e2e-plain")
+
+
+def scenario_late_restart_strategy(args):
+    """A restart of e2e-plain approved after its update strategy became Recreate is refused. Strategy put back."""
+    original = (_object("deploy", "e2e-plain") or {}).get("spec", {}).get("strategy") if args.allow_writes else None
+
+    def recreate():
+        _kubectl("-n", NAMESPACE, "patch", "deploy", "e2e-plain", "--type", "strategic",
+                 "-p", json.dumps({"spec": {"strategy": {"type": "Recreate", "rollingUpdate": None}}}))
+
+    try:
+        return _late(args, _RESTART, recreate, "its update strategy is now Recreate", _restart_untouched)
+    finally:
+        if original and _object("deploy", "e2e-plain")["spec"].get("strategy") != original:
+            _kubectl("-n", NAMESPACE, "patch", "deploy", "e2e-plain", "--type", "strategic", "-p", json.dumps({"spec": {"strategy": original}}))
+            _settled("e2e-plain")
+
+
+# --- pod delete
+
+
+def scenario_late_delete_pod_gone(args):
+    """Deletes of both e2e-plain pods proposed; then one is deleted by kubectl and the other is left terminating
+    (a finalizer holds it). This agent deleted neither, so both approvals are refused, not reported as done
+    (user, 2026-11-26). The finalizer is removed afterwards."""
+    skip = _late_skip(args)
+    if skip:
+        return skip
+    pods = _running_pods("e2e-plain")
+    if len(pods) < 2:
+        return False, f"needs 2 running e2e-plain pods, found {len(pods)}"
+    gone, going = pods[0]["metadata"]["name"], pods[1]["metadata"]["name"]
+    first = _must_propose(f"delete pod {gone} in namespace {NAMESPACE}")
+    second = _must_propose(f"delete pod {going} in namespace {NAMESPACE}")
+    try:
+        _kubectl("-n", NAMESPACE, "delete", "pod", gone, "--wait=true")
+        _kubectl("-n", NAMESPACE, "patch", "pod", going, "--type", "merge", "-p", json.dumps({"metadata": {"finalizers": [LATE_MARK]}}))
+        _kubectl("-n", NAMESPACE, "delete", "pod", going, "--wait=false")
+        a = _late_approve(first, f"pod {gone} no longer exists", lambda: _uid("pod", gone))
+        b = _late_approve(second, f"pod {going} is already being deleted", lambda: _uid("pod", going))
+        return a[0] and b[0], f"deleted: {a[1]} | terminating: {b[1]}"
+    finally:
+        if _object("pod", going):
+            _kubectl("-n", NAMESPACE, "patch", "pod", going, "--type", "merge", "-p", json.dumps({"metadata": {"finalizers": None}}))
+        _settled("e2e-plain")
+
+
+def scenario_late_delete_pod_retry(args):
+    """The other side of late_delete_pod_gone: the worker dies right after this agent's own delete, so the
+    retried step (attempt 2) finds the pod gone and must report the delete as done (`already_at_target`), not
+    refuse it."""
+    skip = _late_skip(args)
+    if skip:
+        return skip
+    pods = _running_pods("e2e-plain")
+    if len(pods) < 2:
+        return False, f"needs 2 running e2e-plain pods, found {len(pods)}"
+    name, uid = pods[0]["metadata"]["name"], pods[0]["metadata"]["uid"]
+    task, pending = _must_propose(f"delete pod {name} in namespace {NAMESPACE}")
+    namespace, deployment = _split("ARI_WORKER_DEPLOYMENT")
+    try:
+        resumed = _send_approval(task, pending["id"])
+        for _ in range(120):  # until this agent's delete is in, then kill the worker mid-verification
+            pod = _object("pod", name)
+            if pod is None or pod["metadata"].get("uid") != uid or pod["metadata"].get("deletionTimestamp"):
+                break
+            time.sleep(1)
+        selector = json.loads(_kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.selector.matchLabels}"))
+        _kubectl("-n", namespace, "delete", "pod", "-l", ",".join(f"{k}={v}" for k, v in selector.items()), "--wait=false")
+        done, elapsed = _wait(resumed["id"], budget_seconds=1800)
+        result = _artifact(done, "action_result") or {}
+        ok = (
+            done["status"]["state"] == "TASK_STATE_COMPLETED"
+            and result.get("ran") is True
+            and (result.get("applied") or {}).get("already_at_target") is True
+            and result.get("status") == "succeeded"
+        )
+        return ok, f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} applied={result.get('applied')}"
+    finally:
+        _settled("e2e-plain")
+
+
+def scenario_late_delete_pod_orphaned(args):
+    """An e2e-plain pod taken out of its ReplicaSet (owner reference removed, relabelled) after its delete was
+    proposed: the approval is refused, a bare pod is not this agent's to delete. The orphan is deleted afterwards."""
+    pods = _running_pods("e2e-plain")
+    if not pods:
+        return False, "no running e2e-plain pod"
+    name = pods[0]["metadata"]["name"]
+
+    def orphan():
+        _kubectl("-n", NAMESPACE, "patch", "pod", name, "--type", "json", "-p", json.dumps([
+            {"op": "remove", "path": "/metadata/ownerReferences"},
+            {"op": "replace", "path": "/metadata/labels/app", "value": "e2e-late-orphan"},
+        ]))
+
+    try:
+        return _late(args, f"delete pod {name} in namespace {NAMESPACE}", orphan, f"pod {name} is a bare pod", lambda: _uid("pod", name))
+    finally:
+        if args.allow_writes:
+            _kubectl("-n", NAMESPACE, "delete", "pod", name, "--ignore-not-found", "--wait=false")
+            _settled("e2e-plain")
+
+
+def scenario_late_delete_pod_last_ready(args):
+    """e2e-plain scaled to 1 by kubectl after a pod delete was proposed, keeping exactly the pod named (deletion
+    cost): no other pod would serve, so the approval is refused. Replicas put back."""
+    pods = _running_pods("e2e-plain")
+    if len(pods) < 2:
+        return False, f"needs 2 running e2e-plain pods, found {len(pods)}"
+    keep, other = pods[0]["metadata"]["name"], pods[1]["metadata"]["name"]
+    cost = "controller.kubernetes.io/pod-deletion-cost"
+
+    def last_one():
+        _kubectl("-n", NAMESPACE, "annotate", "pod", keep, f"{cost}=10000", "--overwrite")
+        _kubectl("-n", NAMESPACE, "annotate", "pod", other, f"{cost}=-10000", "--overwrite")
+        _set("replicas", "e2e-plain", "1")
+        _kubectl("-n", NAMESPACE, "wait", "--for=delete", f"pod/{other}", "--timeout=120s")
+
+    try:
+        with _restored(args, "replicas", "e2e-plain"):
+            return _late(args, f"delete pod {keep} in namespace {NAMESPACE}", last_one, "is ready now", lambda: _uid("pod", keep))
+    finally:
+        if args.allow_writes:
+            with contextlib.suppress(subprocess.CalledProcessError):
+                _kubectl("-n", NAMESPACE, "annotate", "pod", keep, f"{cost}-")
+            _settled("e2e-plain")
+
+
+# --- in-place pod resize
+
+
+def scenario_late_resize_pod_gone(args):
+    """An e2e-plain pod deleted by kubectl after its in-place resize was proposed: the approval is refused and no
+    other pod is resized."""
+    pods = _running_pods("e2e-plain")
+    if not pods:
+        return False, "no running e2e-plain pod"
+    name = pods[0]["metadata"]["name"]
+    try:
+        return _late(args, f"resize pod {name} in namespace {NAMESPACE} in place: cpu limit 100m",
+                     lambda: _kubectl("-n", NAMESPACE, "delete", "pod", name, "--wait=true"),
+                     f"pod {name} no longer exists", _plain_cpu_limits)
+    finally:
+        if args.allow_writes:
+            _settled("e2e-plain")
+
+
+def _resize_cpu(pod: str, cpu: str) -> None:
+    _kubectl("-n", NAMESPACE, "patch", "pod", pod, "--subresource", "resize", "--type", "strategic",
+             "-p", json.dumps({"spec": {"containers": [{"name": "app", "resources": {"limits": {"cpu": cpu}}}]}}))
+
+
+def scenario_late_resize_pod_resources(args):
+    """An e2e-plain pod resized by kubectl (cpu limit -> 70m) after a resize to 100m was proposed: refused. The
+    pod is resized back to its own value."""
+    pods = _running_pods("e2e-plain")
+    if not pods:
+        return False, "no running e2e-plain pod"
+    name, original = pods[0]["metadata"]["name"], _pod_cpu_limit(pods[0])[0]
+    try:
+        return _late(args, f"resize pod {name} in namespace {NAMESPACE} in place: cpu limit 100m", lambda: _resize_cpu(name, "70m"),
+                     "container app resources changed since the proposal", lambda: _pod_cpu_limit(_object("pod", name) or {})[0])
+    finally:
+        if args.allow_writes and original and _pod_cpu_limit(_object("pod", name) or {})[0] not in (None, original):
+            _resize_cpu(name, original)
+
+
+# --- memory decreases: the usage re-read at approval
+
+
+HOLD_MARK = "ari-e2e-hold"
+
+
+def _pod_memory_mi(pod: str) -> float:
+    """The pod's container memory from metrics.k8s.io, in Mi (0 without a sample)."""
+    try:
+        raw = json.loads(_kubectl("get", "--raw", f"/apis/metrics.k8s.io/v1beta1/namespaces/{NAMESPACE}/pods/{pod}"))
+    except subprocess.CalledProcessError:
+        return 0.0
+    units = {"Ki": 1 / 1024, "Mi": 1, "Gi": 1024}
+    total = 0.0
+    for container in raw.get("containers") or []:
+        value = container["usage"]["memory"]
+        unit = value[-2:]
+        total += float(value[:-2]) * units[unit] if unit in units else float(value) / 1024 / 1024
+    return total
+
+
+@contextlib.contextmanager
+def _memory_hold(pod: str):
+    """Yields `grow()`, which starts a second process in the e2e-memuse pod holding 80Mi more (about 190Mi in
+    all, under the 256Mi limit) and waits for metrics-server to report over 175Mi; the process is killed after."""
+    hold = None
+
+    def grow():
+        nonlocal hold
+        code = f"import time; b = bytearray(80 * 1024 * 1024); b[::4096] = b'x' * len(b[::4096]); time.sleep(600)  # {HOLD_MARK}"
+        context = os.environ.get("KUBE_CONTEXT")
+        hold = subprocess.Popen(["kubectl", *(["--context", context] if context else []), "-n", NAMESPACE, "exec", pod, "--", "python", "-c", code],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(36):  # metrics-server samples every 15-60 s
+            if _pod_memory_mi(pod) > 175:
+                return
+            time.sleep(5)
+
+    try:
+        yield grow
+    finally:
+        if hold is not None:
+            with contextlib.suppress(subprocess.CalledProcessError):
+                _kubectl("-n", NAMESPACE, "exec", pod, "--", "pkill", "-f", HOLD_MARK)
+            hold.terminate()
+            # metrics-server keeps reporting the old usage for up to a minute; the next scenario must not see it.
+            for _ in range(36):
+                if 0 < _pod_memory_mi(pod) < 130:
+                    break
+                time.sleep(5)
+
+
+def _memuse_pod() -> str | None:
+    pods = _running_pods("e2e-memuse")
+    return pods[0]["metadata"]["name"] if pods else None
+
+
+def scenario_late_memory_usage(args):
+    """Lowering e2e-memuse's memory limit 256Mi -> 200Mi is proposed (usage ~100Mi); a second process then holds
+    80Mi more, so 200Mi is below 1.2 x the usage, and the approval is refused on the re-read usage."""
+    pod = _memuse_pod()
+    if not pod:
+        return False, "no running e2e-memuse pod"
+    with _restored(args, "memory_limit", "e2e-memuse"), _memory_hold(pod) as grow:
+        ok, note = _late(args, "set the memory limit of e2e-memuse to 200Mi", grow, "usage changed:", lambda: _generation("e2e-memuse"))
+        return ok, f"{note} (usage at approval {_pod_memory_mi(pod):.0f}Mi)"
+
+
+def scenario_late_resize_pod_usage(args):
+    """An in-place resize of the e2e-memuse pod's memory limit 256Mi -> 200Mi is proposed; the second process then
+    raises the usage past 200Mi / 1.2, and the approval is refused on the re-read usage."""
+    pod = _memuse_pod()
+    if not pod:
+        return False, "no running e2e-memuse pod"
+    limit = lambda: (((_object("pod", pod) or {}).get("spec") or {}).get("containers") or [{}])[0].get("resources", {}).get("limits", {}).get("memory")
+    with _memory_hold(pod) as grow:
+        ok, note = _late(args, f"resize pod {pod} in namespace {NAMESPACE} in place: memory limit 200Mi", grow, "usage changed:", limit)
+        return ok, f"{note} (usage at approval {_pod_memory_mi(pod):.0f}Mi)"
+
+
+# --- PVC growth
+
+
+def _disk_up() -> None:
+    _kubectl("-n", NAMESPACE, "scale", "statefulset", DISK_STS, "--replicas=1")
+    _kubectl("-n", NAMESPACE, "wait", "--for=jsonpath={.status.phase}=Bound", f"pvc/{DISK_PVC}", "--timeout=300s")
+    _kubectl("-n", NAMESPACE, "rollout", "status", f"statefulset/{DISK_STS}", "--timeout=300s")
+
+
+def _disk_down() -> None:
+    _kubectl("-n", NAMESPACE, "scale", "statefulset", DISK_STS, "--replicas=0")
+    _kubectl("-n", NAMESPACE, "wait", "--for=delete", f"pod/{DISK_STS}-0", "--timeout=120s")
+    _kubectl("-n", NAMESPACE, "delete", "pvc", DISK_PVC, "--ignore-not-found", "--wait=true", "--timeout=120s")
+
+
+_EXPAND = f"expand pvc {DISK_PVC} in namespace {NAMESPACE} to 2Gi"
+
+
+def _disk_untouched():
+    return _pvc_size(DISK_PVC)[0]
+
+
+def scenario_late_pvc_deleted_then_replaced(args):
+    """Two growths of data-e2e-disk-0 proposed; the PVC is then deleted (StatefulSet at 0): the first approval is
+    refused (no longer exists); the StatefulSet back at 1 makes a new PVC of the same name: the second is refused
+    (new uid)."""
+    skip = _late_skip(args)
+    if skip:
+        return skip
+    _fresh_disk()
+    first, second = _must_propose(_EXPAND), _must_propose(_EXPAND)
+    try:
+        _disk_down()
+        a = _late_approve(first, f"PVC {DISK_PVC} no longer exists", lambda: _object("pvc", DISK_PVC) is None)
+        _disk_up()
+        b = _late_approve(second, f"PVC {DISK_PVC} was replaced (new uid)", _disk_untouched)
+        return a[0] and b[0], f"deleted: {a[1]} | replaced: {b[1]}"
+    finally:
+        if _object("pvc", DISK_PVC) is None:
+            _disk_up()
+
+
+def scenario_late_pvc_terminating(args):
+    """data-e2e-disk-0 deleted while its pod still mounts it (it stays Terminating) after its growth was proposed:
+    refused. The disk is recreated at 1Gi afterwards."""
+    if args.allow_writes:
+        _fresh_disk()
+    try:
+        return _late(args, _EXPAND, lambda: _kubectl("-n", NAMESPACE, "delete", "pvc", DISK_PVC, "--wait=false"),
+                     f"PVC {DISK_PVC} is being deleted", _disk_untouched)
+    finally:
+        if args.allow_writes:
+            _disk_down()
+            _disk_up()
+
+
+def scenario_late_pvc_size_changed(args):
+    """data-e2e-disk-0 grown by kubectl to 1536Mi after a growth to 2Gi was proposed: refused (its requested size
+    changed). The disk is recreated at 1Gi afterwards."""
+    if args.allow_writes:
+        _fresh_disk()
+
+    def grow():
+        _kubectl("-n", NAMESPACE, "patch", "pvc", DISK_PVC, "--type", "merge",
+                 "-p", json.dumps({"spec": {"resources": {"requests": {"storage": "1536Mi"}}}}))
+
+    try:
+        return _late(args, _EXPAND, grow, "its requested size changed from 1Gi to 1536Mi", _disk_untouched)
+    finally:
+        if args.allow_writes:
+            _disk_down()
+            _disk_up()
+
+
+def scenario_late_pvc_helm_marked(args):
+    """data-e2e-disk-0 given Helm's release annotations after its growth was proposed: refused (a release would
+    re-apply it). Annotations removed afterwards."""
+    if args.allow_writes:
+        _fresh_disk()
+    try:
+        return _late(args, _EXPAND,
+                     lambda: _kubectl("-n", NAMESPACE, "annotate", "pvc", DISK_PVC, "meta.helm.sh/release-name=e2e-late",
+                                      f"meta.helm.sh/release-namespace={NAMESPACE}"),
+                     "is rendered and re-applied by Helm release e2e-late", _disk_untouched)
+    finally:
+        if args.allow_writes:
+            _kubectl("-n", NAMESPACE, "annotate", "pvc", DISK_PVC, "meta.helm.sh/release-name-", "meta.helm.sh/release-namespace-")
+
+
+@contextlib.contextmanager
+def _owned_by_late_owner(kind: str, name: str, controller: bool):
+    """Yields `own()`, which adds the ConfigMap LATE_OWNER as an owner of `kind/name`. Afterwards the owner
+    reference goes first and the ConfigMap after it: deleting an owner first would let the garbage collector
+    delete the object it owns."""
+    owned = False
+
+    def own():
+        nonlocal owned
+        _kubectl_in(json.dumps({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": LATE_OWNER, "namespace": NAMESPACE}}),
+                    "apply", "-f", "-")
+        uid = _uid("configmap", LATE_OWNER)
+        ref = {"apiVersion": "v1", "kind": "ConfigMap", "name": LATE_OWNER, "uid": uid, **({"controller": True} if controller else {})}
+        _kubectl("-n", NAMESPACE, "patch", kind, name, "--type", "merge", "-p", json.dumps({"metadata": {"ownerReferences": [ref]}}))
+        owned = True
+
+    try:
+        yield own
+    finally:
+        if owned:
+            _kubectl("-n", NAMESPACE, "patch", kind, name, "--type", "merge", "-p", json.dumps({"metadata": {"ownerReferences": None}}))
+        _kubectl("-n", NAMESPACE, "delete", "configmap", LATE_OWNER, "--ignore-not-found")
+
+
+def scenario_late_pvc_extra_owner(args):
+    """data-e2e-disk-0 given another owner (a ConfigMap) after its growth was proposed: refused. Owner removed."""
+    if args.allow_writes:
+        _fresh_disk()
+    with _owned_by_late_owner("pvc", DISK_PVC, controller=False) as own:
+        return _late(args, _EXPAND, own, f"is also owned by ConfigMap {LATE_OWNER}", _disk_untouched)
+
+
+def scenario_late_pvc_operator(args):
+    """StatefulSet e2e-disk given a controlling owner (a ConfigMap standing in for an operator) after the growth of
+    its PVC was proposed: refused. Owner removed."""
+    if args.allow_writes:
+        _fresh_disk()
+    with _owned_by_late_owner("statefulset", DISK_STS, controller=True) as own:
+        return _late(args, _EXPAND, own, f"which ConfigMap {LATE_OWNER} manages", _disk_untouched)
+
+
+def scenario_late_pvc_ambiguous(args):
+    """A StatefulSet `disk` with claim template `data-e2e` (0 replicas) created after the growth of data-e2e-disk-0
+    was proposed: the PVC's name now fits two StatefulSets, so the approval is refused. Deleted afterwards."""
+    sts = {
+        "apiVersion": "apps/v1", "kind": "StatefulSet",
+        "metadata": {"name": AMBIGUOUS_STS, "namespace": NAMESPACE},
+        "spec": {
+            "replicas": 0, "serviceName": AMBIGUOUS_STS,
+            "selector": {"matchLabels": {"app": "e2e-late-disk"}},
+            "template": {"metadata": {"labels": {"app": "e2e-late-disk"}},
+                         "spec": {"containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]}},
+            "volumeClaimTemplates": [{"metadata": {"name": "data-e2e"},
+                                      "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}}],
+        },
+    }
+    if args.allow_writes:
+        _fresh_disk()
+    try:
+        return _late(args, _EXPAND, lambda: _create(sts), "fits the claim templates of several StatefulSets", _disk_untouched)
+    finally:
+        if args.allow_writes:
+            _kubectl("-n", NAMESPACE, "delete", "statefulset", AMBIGUOUS_STS, "--ignore-not-found")
+
+
+def scenario_late_pvc_owner_gone(args):
+    """StatefulSet e2e-disk deleted with its pod and PVC left in place (--cascade=orphan) after the growth of its
+    PVC was proposed: nothing says what re-applies the PVC now, so refused. The StatefulSet is created again."""
+    manifest = _clean(_object("statefulset", DISK_STS)) if args.allow_writes else None
+    if args.allow_writes:
+        _fresh_disk()
+    try:
+        return _late(args, _EXPAND,
+                     lambda: _kubectl("-n", NAMESPACE, "delete", "statefulset", DISK_STS, "--cascade=orphan", "--wait=true"),
+                     "was not created by a StatefulSet's volumeClaimTemplates", _disk_untouched)
+    finally:
+        if manifest and _object("statefulset", DISK_STS) is None:
+            _create(manifest)
+            _kubectl("-n", NAMESPACE, "rollout", "status", f"statefulset/{DISK_STS}", "--timeout=300s")
+
+
+_EXPAND_VOL = f"expand pvc {VOL_PVC} in namespace {NAMESPACE} to 2Gi"
+
+
+def _vol_untouched():
+    return _pvc_size(VOL_PVC)[0]
+
+
+def scenario_late_storageclass_no_expansion(args):
+    """The e2e StorageClass ari-k8s-e2e-expand stops allowing expansion after the growth of data-e2e-vol-0 was
+    proposed: refused. Expansion allowed again afterwards."""
+    expansion = lambda allowed: _kubectl("patch", "storageclass", VOL_CLASS, "--type", "merge",
+                                         "-p", json.dumps({"allowVolumeExpansion": allowed}))
+    try:
+        return _late(args, _EXPAND_VOL, lambda: expansion(False), f"StorageClass {VOL_CLASS} no longer allows volume expansion", _vol_untouched)
+    finally:
+        if args.allow_writes:
+            expansion(True)
+
+
+def scenario_late_storageclass_gone(args):
+    """The e2e StorageClass ari-k8s-e2e-expand deleted after the growth of data-e2e-vol-0 was proposed (the bound
+    volume is unaffected): refused. Created again afterwards."""
+    manifest = _clean(json.loads(_kubectl("get", "storageclass", VOL_CLASS, "-o", "json"))) if args.allow_writes else None
+    try:
+        return _late(args, _EXPAND_VOL, lambda: _kubectl("delete", "storageclass", VOL_CLASS, "--wait=true"),
+                     f"StorageClass {VOL_CLASS} no longer exists", _vol_untouched)
+    finally:
+        if manifest and not _exists("storageclass", VOL_CLASS):
+            _create(manifest)
+
+
+# --- protection
+
+
+PROTECTED_ENV = "K8S_AGENT_PROTECTED_WORKLOADS"
+
+
+def _worker_env(value: str) -> None:
+    namespace, deployment = _split("ARI_WORKER_DEPLOYMENT")
+    _kubectl("-n", namespace, "set", "env", f"deploy/{deployment}", f"{PROTECTED_ENV}={value}")
+    _kubectl("-n", namespace, "rollout", "status", f"deploy/{deployment}", "--timeout=300s")
+
+
+def scenario_late_protected(args):
+    """A scale-up of e2e-plain and a growth of data-e2e-disk-0 proposed; then the worker's protected-workload list
+    gains ari-k8s-e2e/e2e-plain and ari-k8s-e2e/e2e-disk (kubectl set env, which restarts the worker): both
+    approvals are refused. The worker's list is put back exactly as it was (another restart). Changes the agent's
+    own Deployment on the test cluster; the next Helm upgrade would put the chart's value back anyway."""
+    skip = _late_skip(args)
+    if skip:
+        return skip
+    namespace, deployment = _split("ARI_WORKER_DEPLOYMENT")
+    env = json.loads(_kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.template.spec.containers[0].env}"))
+    original = next((e.get("value") for e in env if e.get("name") == PROTECTED_ENV), None)
+    if original is None:
+        return False, f"the worker has no literal {PROTECTED_ENV} to extend"
+    _fresh_disk()
+    scale, grow = _must_propose("scale e2e-plain to 3 replicas"), _must_propose(_EXPAND)
+    try:
+        _worker_env(f"{original},{NAMESPACE}/e2e-plain,{NAMESPACE}/{DISK_STS}")
+        a = _late_approve(scale, f"{NAMESPACE}/e2e-plain is protected", lambda: _generation("e2e-plain"))
+        b = _late_approve(grow, f"{NAMESPACE}/{DISK_STS} is protected", _disk_untouched)
+        return a[0] and b[0], f"deployment: {a[1]} | pvc: {b[1]}"
+    finally:
+        _worker_env(original)
+
+
 # ---------------------------------------------------------------- CronJob, read only (II-25740)
 
 
@@ -1295,6 +2152,41 @@ SCENARIOS = {
     "gate_stale": scenario_gate_stale,
     "gate_replay": scenario_gate_replay,
     "double_approve": scenario_double_approve,
+    "late_recreated": scenario_late_recreated,
+    "late_autoscaler_added": scenario_late_autoscaler_added,
+    "late_autoscaler_removed": scenario_late_autoscaler_removed,
+    "late_autoscaler_changed_hpa": scenario_late_autoscaler_changed_hpa,
+    "late_autoscaler_changed_keda": scenario_late_autoscaler_changed_keda,
+    "late_resources_changed": scenario_late_resources_changed,
+    "late_scale_after_resources": scenario_late_scale_after_resources,
+    "late_too_old": scenario_late_too_old,
+    "late_memory_usage": scenario_late_memory_usage,
+    "late_already_scaled": scenario_late_already_scaled,
+    "late_already_resources": scenario_late_already_resources,
+    "late_already_bounds": scenario_late_already_bounds,
+    "late_already_resized": scenario_late_already_resized,
+    "late_restart_after_rollout": scenario_late_restart_after_rollout,
+    "late_restart_restarted": scenario_late_restart_restarted,
+    "late_restart_paused": scenario_late_restart_paused,
+    "late_restart_strategy": scenario_late_restart_strategy,
+    "late_delete_pod_gone": scenario_late_delete_pod_gone,
+    "late_delete_pod_retry": scenario_late_delete_pod_retry,
+    "late_delete_pod_orphaned": scenario_late_delete_pod_orphaned,
+    "late_delete_pod_last_ready": scenario_late_delete_pod_last_ready,
+    "late_resize_pod_gone": scenario_late_resize_pod_gone,
+    "late_resize_pod_resources": scenario_late_resize_pod_resources,
+    "late_resize_pod_usage": scenario_late_resize_pod_usage,
+    "late_pvc_deleted_then_replaced": scenario_late_pvc_deleted_then_replaced,
+    "late_pvc_terminating": scenario_late_pvc_terminating,
+    "late_pvc_size_changed": scenario_late_pvc_size_changed,
+    "late_pvc_helm_marked": scenario_late_pvc_helm_marked,
+    "late_pvc_extra_owner": scenario_late_pvc_extra_owner,
+    "late_pvc_operator": scenario_late_pvc_operator,
+    "late_pvc_ambiguous": scenario_late_pvc_ambiguous,
+    "late_pvc_owner_gone": scenario_late_pvc_owner_gone,
+    "late_already_grown": scenario_late_already_grown,
+    "late_storageclass_no_expansion": scenario_late_storageclass_no_expansion,
+    "late_storageclass_gone": scenario_late_storageclass_gone,
     "health_statefulset": scenario_health_statefulset,
     "restart_deployment": scenario_restart_deployment,
     "delete_pod": scenario_delete_pod,
@@ -1310,6 +2202,7 @@ SCENARIOS = {
     "refuse_self": scenario_refuse_self,
     "admission_policy": scenario_admission_policy,
     "node_beside_workload": scenario_node_beside_workload,
+    "late_protected": scenario_late_protected,
     "worker_restart": scenario_worker_restart,
     "resume_after_restart": scenario_resume_after_restart,
 }
