@@ -46,9 +46,10 @@ META = AgentMeta(
         "CPU/memory requests, limits and usage, workloads, nodes, events, ...), checks Pod-level health, and "
         "changes Deployments only: scales them, changes CPU/memory — of a Deployment (rolls its pods) or of one "
         "of its running pods in place (no rollout, where the cluster supports in-place pod resize) —, restarts "
-        "them, and deletes a single pod for the Deployment to replace (never its only ready pod) — every change "
+        "them, and deletes a single pod for the Deployment to replace (never its only ready pod); it also grows a "
+        "StatefulSet's disk (a PVC its claim template created; never smaller) — every change "
         "proposed first and applied only after a person approves it. "
-        "StatefulSets, DaemonSets, CronJobs, nodes and protected system namespaces are read only. Deployments "
+        "StatefulSets, DaemonSets, CronJobs, nodes and protected system namespaces are otherwise read only. Deployments "
         "managed by KEDA or an HPA are scaled only through their autoscaler's min/max, and only on explicit "
         "request; CPU/memory change only on explicit request, capped by real node capacity."
     ),
@@ -64,11 +65,13 @@ META = AgentMeta(
             "request only); CPU/memory requests or limits of a container (explicit request only), either in the "
             "Deployment's template (rolls its pods) or in place on one named running pod (no recreation; memory "
             "only for containers whose resizePolicy restarts them); a rolling restart; deleting one named pod "
-            "that the Deployment replaces (never its only ready pod). Restart and "
+            "that the Deployment replaces (never its only ready pod). Also growing one named PVC that a "
+            "StatefulSet's claim template created to a size the request names (never smaller; a PVC a chart or "
+            "GitOps renders is changed in Git instead). Restart and "
             "delete only when the request asks for them. Never scales anything below 1 replica, "
-            "and never changes StatefulSets, DaemonSets, CronJobs, nodes, system namespaces or the agent itself."
+            "and otherwise never changes StatefulSets, DaemonSets, CronJobs, nodes, system namespaces or the agent itself."
         ),
-        tags=["kubernetes", "health", "scaling", "keda", "hpa", "restart"],
+        tags=["kubernetes", "health", "scaling", "keda", "hpa", "restart", "storage"],
         examples=[
             "check the health of the pods in the insightfinder namespace",
             "list all pods with cpu and memory limit and usage in the insightfinder namespace",
@@ -77,9 +80,10 @@ META = AgentMeta(
             "resize pod checkout-7d9f5c6b8-x2k4q in place: cpu limit 2",
             "restart the checkout deployment",
             "delete pod checkout-7d9f5c6b8-x2k4q",
+            "expand pvc data-loki-0 in namespace monitoring to 100Gi",
         ],
     ),
-    planner_description="Kubernetes agent that checks cluster health and changes Deployments (scale, resources, restart, delete a pod)",
+    planner_description="Kubernetes agent that checks cluster health and changes Deployments (scale, resources, restart, delete a pod) and grows StatefulSet disks",
     planner_domain_guidance="""Requests are either a listing question, a health question, a change, or a plain question.
 - A listing question ("list / show / which / table of ...": all pods with their CPU/memory limits and usage, \
 Deployments, nodes, events, PVCs, ...): plan "query_resources" alone (no "find_workload"); pass a namespace the \
@@ -88,7 +92,7 @@ everything of some kind rather than what is wrong.
 - A health question ("what's wrong with X", "check the pods in namespace Y", "is the cluster healthy"): \
 plan "find_workload" then "check_health". Read-only; never needs approval.
 - A change to a Deployment (scale it, change its KEDA/HPA min or max, change its CPU/memory or, in place, \
-that of one of its pods, restart it, delete one of its pods): plan \
+that of one of its pods, restart it, delete one of its pods), or growing a disk (a PVC): plan \
 "find_workload" then "propose_change". "propose_change" works out and checks the exact change and pauses for a person's approval; \
 it decides itself whether the request is explicit enough and refuses otherwise — do not try to pre-judge that.
 - **NEVER schedule "apply_approved_change".** It runs only after a person approves a proposal, through a \

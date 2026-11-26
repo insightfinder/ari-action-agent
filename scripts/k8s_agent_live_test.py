@@ -880,6 +880,120 @@ def scenario_delete_pod(args):
     return _delete(args, running[0], same_name=False)
 
 
+def _pod_cpu_limit(pod: dict) -> tuple[str | None, str | None]:
+    """The first container's CPU limit as the spec asks for it and as the kubelet reports it applied."""
+    spec = (((pod.get("spec") or {}).get("containers") or [{}])[0].get("resources") or {}).get("limits") or {}
+    status = ((((pod.get("status") or {}).get("containerStatuses") or [{}])[0].get("resources") or {}).get("limits")) or {}
+    return spec.get("cpu"), status.get("cpu")
+
+
+def scenario_resize_pod(args):
+    """In-place resize of one e2e-plain pod (cpu limit 50m -> 100m): same pod, no restart, the kubelet reports
+    the new limit; put back to 50m with kubectl afterwards."""
+    pods = json.loads(_kubectl("-n", NAMESPACE, "get", "pods", "-l", "app=e2e-plain", "-o", "json"))["items"]
+    running = sorted(
+        (p for p in pods if p["status"].get("phase") == "Running" and not p["metadata"].get("deletionTimestamp")),
+        key=lambda p: p["metadata"]["name"],
+    )
+    if not running:
+        return False, "no running e2e-plain pod"
+    pod = running[0]
+    name, uid = pod["metadata"]["name"], pod["metadata"]["uid"]
+    restarts = (pod["status"].get("containerStatuses") or [{}])[0].get("restartCount")
+    original = _pod_cpu_limit(pod)[0]
+    task, pending = _propose(f"resize pod {name} in namespace {NAMESPACE} in place: cpu limit 100m")
+    if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending:
+        return False, f"expected a proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
+    shape = pending.get("action") == "resize_pod" and (pending.get("target") or {}).get("name") == name
+    if not args.allow_writes:
+        state = _cancel(task["id"])
+        untouched = _pod_cpu_limit(_object("pod", name) or {})[0] == original
+        return (shape and untouched) or False, f"proposal only ({state}) tier={pending.get('risk_tier')} untouched={untouched}"
+    try:
+        done, elapsed = _approve(task, pending)
+        result = _artifact(done, "action_result") or {}
+        now = _object("pod", name) or {}
+        spec_cpu, applied_cpu = _pod_cpu_limit(now)
+        same_pod = (now.get("metadata") or {}).get("uid") == uid
+        now_restarts = ((now.get("status") or {}).get("containerStatuses") or [{}])[0].get("restartCount")
+        ok = shape and result.get("status") == "succeeded" and same_pod and spec_cpu == "100m" and applied_cpu == "100m" and now_restarts == restarts
+        return ok, (
+            f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} tier={pending.get('risk_tier')} "
+            f"same_pod={same_pod} cpu spec={spec_cpu} applied={applied_cpu} restarts {restarts}->{now_restarts}"
+        )
+    finally:
+        if original and _pod_cpu_limit(_object("pod", name) or {})[0] not in (None, original):
+            _kubectl("-n", NAMESPACE, "patch", "pod", name, "--subresource", "resize", "--type", "strategic",
+                     "-p", json.dumps({"spec": {"containers": [{"name": "app", "resources": {"limits": {"cpu": original}}}]}}))
+
+
+# ---------------------------------------------------------------- disks (expand_pvc, 2026-11-26)
+
+DISK_STS = "e2e-disk"
+DISK_PVC = f"data-{DISK_STS}-0"
+
+
+def _pvc_size(name: str) -> tuple[str, str]:
+    """(requested, capacity) of a PVC in the e2e namespace."""
+    out = _kubectl("-n", NAMESPACE, "get", "pvc", name, "-o", "jsonpath={.spec.resources.requests.storage} {.status.capacity.storage}")
+    requested, _, capacity = out.partition(" ")
+    return requested, capacity
+
+
+def _fresh_disk() -> None:
+    """data-e2e-disk-0 back at 1Gi: a grown volume cannot shrink, so the StatefulSet is scaled to 0, the PVC deleted
+    (its gp3 volume goes with it) and the StatefulSet scaled back to 1, which creates a new 1Gi PVC."""
+    if _pvc_size(DISK_PVC) == ("1Gi", "1Gi"):
+        return
+    _kubectl("-n", NAMESPACE, "scale", "statefulset", DISK_STS, "--replicas=0")
+    _kubectl("-n", NAMESPACE, "wait", "--for=delete", f"pod/{DISK_STS}-0", "--timeout=120s")
+    _kubectl("-n", NAMESPACE, "delete", "pvc", DISK_PVC, "--wait=true", "--timeout=120s")
+    _kubectl("-n", NAMESPACE, "scale", "statefulset", DISK_STS, "--replicas=1")
+    _kubectl("-n", NAMESPACE, "wait", "--for=jsonpath={.status.phase}=Bound", f"pvc/{DISK_PVC}", "--timeout=300s")
+    _kubectl("-n", NAMESPACE, "rollout", "status", f"statefulset/{DISK_STS}", "--timeout=300s")
+
+
+def scenario_expand_pvc(args):
+    """Grow data-e2e-disk-0 (e2e-disk's claim template) 1Gi -> 2Gi: proposed as high risk, approved, the volume
+    reports 2Gi. Recreated at 1Gi first when a run left it larger."""
+    if args.allow_writes:
+        _fresh_disk()
+    before = _pvc_size(DISK_PVC)
+    task, pending = _propose(f"expand pvc {DISK_PVC} in namespace {NAMESPACE} to 2Gi")
+    if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending:
+        return False, f"expected a proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
+    shape = pending.get("action") == "expand_pvc" and pending.get("storage") == "2Gi" and pending.get("risk_tier") == "high"
+    if not args.allow_writes:
+        state = _cancel(task["id"])
+        untouched = _pvc_size(DISK_PVC) == before
+        return (shape and untouched) or False, f"proposal only ({state}) tier={pending.get('risk_tier')} untouched={untouched}"
+    done, elapsed = _approve(task, pending)
+    result = _artifact(done, "action_result") or {}
+    after = _pvc_size(DISK_PVC)
+    ok = shape and result.get("status") == "succeeded" and after == ("2Gi", "2Gi")
+    return ok, f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} size {before}->{after}"
+
+
+def scenario_refuse_pvc_shrink(_args):
+    """Shrinking data-e2e-disk-0 is refused: no proposal, size unchanged."""
+    return _no_proposal(f"shrink pvc {DISK_PVC} in namespace {NAMESPACE} to 500Mi", lambda: _pvc_size(DISK_PVC))
+
+
+def scenario_refuse_pvc_helm(_args):
+    """Growing a PVC the agent's own chart renders (Helm-marked, in the agent's namespace) is refused: it is changed
+    in Git, because the next upgrade would fail on it. No proposal, size unchanged."""
+    worker = _split("ARI_WORKER_DEPLOYMENT")
+    if not worker:
+        return None, "needs ARI_WORKER_DEPLOYMENT (<namespace>/<name>)"
+    namespace = worker[0]
+    pvcs = json.loads(_kubectl("-n", namespace, "get", "pvc", "-o", "json"))["items"]
+    name = next((p["metadata"]["name"] for p in pvcs if "meta.helm.sh/release-name" in (p["metadata"].get("annotations") or {})), None)
+    if not name:
+        return None, f"no Helm-rendered PVC in {namespace}"
+    size = lambda: _kubectl("-n", namespace, "get", "pvc", name, "-o", "jsonpath={.spec.resources.requests.storage}")  # noqa: E731
+    return _no_proposal(f"expand pvc {name} in namespace {namespace} to 2Gi", size)
+
+
 def scenario_health_statefulset(_args):
     """A health check of the StatefulSet e2e-sts covers its own pods only."""
     task, elapsed = _run(f"check the health of the statefulset e2e-sts in namespace {NAMESPACE}")
@@ -950,11 +1064,11 @@ def scenario_admission_policy(_args):
     sa = _kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.template.spec.serviceAccountName}")
     body = json.dumps({"metadata": {"annotations": {"ari-e2e/probe": "1"}}})
 
-    def dry_run(ns, name):
+    def dry_run(ns, name, kind="deploy"):
         context = os.environ.get("KUBE_CONTEXT")
         cmd = [
             "kubectl", *(["--context", context] if context else []), f"--as=system:serviceaccount:{namespace}:{sa}",
-            "-n", ns, "patch", "deploy", name, "--type", "merge", "-p", body, "--dry-run=server",
+            "-n", ns, "patch", kind, name, "--type", "merge", "-p", body, "--dry-run=server",
         ]
         out = subprocess.run(cmd, capture_output=True, text=True)
         return out.returncode == 0, (out.stderr or out.stdout).strip()
@@ -962,9 +1076,20 @@ def scenario_admission_policy(_args):
     system_ok, system_msg = dry_run("kube-system", "coredns")
     self_ok, self_msg = dry_run(namespace, deployment)
     e2e_ok, e2e_msg = dry_run(NAMESPACE, "e2e-plain")
-    by_policy = "ValidatingAdmissionPolicy" in system_msg and "ValidatingAdmissionPolicy" in self_msg
-    ok = not system_ok and not self_ok and e2e_ok and by_policy
-    return ok, f"kube-system denied={not system_ok} self denied={not self_ok} e2e-plain allowed={e2e_ok} :: {system_msg[:140]}"
+    # PVCs: one the chart renders (Helm-marked, in the agent's namespace) is denied; the claim-template PVC allowed.
+    helm_pvc = next(
+        (p["metadata"]["name"] for p in json.loads(_kubectl("-n", namespace, "get", "pvc", "-o", "json"))["items"]
+         if "meta.helm.sh/release-name" in (p["metadata"].get("annotations") or {})),
+        None,
+    )
+    helm_ok, helm_msg = dry_run(namespace, helm_pvc, "pvc") if helm_pvc else (True, "no Helm-rendered PVC found")
+    disk_ok, disk_msg = dry_run(NAMESPACE, DISK_PVC, "pvc")
+    by_policy = all("ValidatingAdmissionPolicy" in m for m in (system_msg, self_msg, helm_msg))
+    ok = not system_ok and not self_ok and e2e_ok and not helm_ok and disk_ok and by_policy
+    return ok, (
+        f"kube-system denied={not system_ok} self denied={not self_ok} e2e-plain allowed={e2e_ok} "
+        f"helm pvc {helm_pvc} denied={not helm_ok} {DISK_PVC} allowed={disk_ok} :: {helm_msg[:140]}"
+    )
 
 
 # ---------------------------------------------------------------- nodes: read only (II-25740)
@@ -1046,6 +1171,8 @@ RBAC_ALLOWED = [
     ("patch", "deployments.apps", f"-n={NAMESPACE}"), ("patch", "deployments.apps", f"-n={NAMESPACE}", "scale"),
     ("patch", "horizontalpodautoscalers.autoscaling", f"-n={NAMESPACE}"), ("patch", "scaledobjects.keda.sh", f"-n={NAMESPACE}"),
     ("patch", "pods", f"-n={NAMESPACE}", "resize"), ("delete", "pods", f"-n={NAMESPACE}"),
+    ("list", "persistentvolumeclaims", "-A"), ("patch", "persistentvolumeclaims", f"-n={NAMESPACE}"),
+    ("get", "storageclasses.storage.k8s.io", ""),
     ("list", "replicasets.apps", "-A"), ("list", "statefulsets.apps", "-A"), ("list", "daemonsets.apps", "-A"),
     ("list", "cronjobs.batch", "-A"), ("get", "jobs.batch", f"-n={NAMESPACE}"),
 ]
@@ -1060,7 +1187,8 @@ RBAC_DENIED = [
     ("create", "jobs.batch", f"-n={NAMESPACE}"), ("delete", "jobs.batch", f"-n={NAMESPACE}"), ("patch", "jobs.batch", f"-n={NAMESPACE}"),
     ("create", "cronjobs.batch", f"-n={NAMESPACE}"), ("patch", "cronjobs.batch", f"-n={NAMESPACE}"),
     ("patch", "statefulsets.apps", f"-n={NAMESPACE}"), ("patch", "daemonsets.apps", f"-n={NAMESPACE}"),
-    ("patch", "persistentvolumeclaims", f"-n={NAMESPACE}"), ("delete", "persistentvolumeclaims", f"-n={NAMESPACE}"),
+    ("delete", "persistentvolumeclaims", f"-n={NAMESPACE}"), ("create", "persistentvolumeclaims", f"-n={NAMESPACE}"),
+    ("patch", "persistentvolumes", ""), ("delete", "persistentvolumes", ""),
 ]
 
 
@@ -1146,6 +1274,10 @@ SCENARIOS = {
     "health_statefulset": scenario_health_statefulset,
     "restart_deployment": scenario_restart_deployment,
     "delete_pod": scenario_delete_pod,
+    "resize_pod": scenario_resize_pod,
+    "expand_pvc": scenario_expand_pvc,
+    "refuse_pvc_shrink": scenario_refuse_pvc_shrink,
+    "refuse_pvc_helm": scenario_refuse_pvc_helm,
     "health_cronjob": scenario_health_cronjob,
     "health_node": scenario_health_node,
     "refuse_node_change": scenario_refuse_node_change,

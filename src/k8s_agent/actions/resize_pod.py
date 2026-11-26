@@ -31,8 +31,8 @@ from ..tools import governance, policy, quantities
 from .base import ActionSpec, Operation, target_of
 from .set_resources import pick_container, request_over_limit, requested_values
 
-# The floor the user set (2026-11-24): in-place resize is GA from 1.35. 1.33/1.34 serve pods/resize as beta
-# (prod 1.34 and eu 1.33 do), with behaviour that differs in places; they are left out until checked.
+# The floor the user set (2026-11-24): in-place resize is GA from 1.35. 1.33/1.34 serve pods/resize as beta,
+# with behaviour that differs in places; they are left out until checked.
 MIN_VERSION = (1, 35)
 _RESIZE_CONDITIONS = ("PodResizePending", "PodResizeInProgress")
 _VERSION = re.compile(r"v?(\d+)\.(\d+)")

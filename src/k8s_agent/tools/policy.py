@@ -136,6 +136,81 @@ def asks_delete_pod(prompt: str) -> bool:
     return _asks(_DELETE_POD_WORDS, prompt)
 
 
+# A disk (PVC) size change: the request names a disk and asks for it to be larger (or smaller, which is refused).
+_DISK_WORDS = re.compile(r"(?i)(\b(?:pvcs?|persistentvolumeclaims?|persistent\s+volume\s+claims?|disks?|volumes?|storage)\b|磁盘|硬盘|存储|卷)")
+_SIZE_CHANGE_WORDS = re.compile(
+    r"(?i)(\b(?:expand|grow|resize|increase|enlarge|extend|raise|bigger|larger|add|shrink|reduce|decrease|smaller)\b"
+    r"|扩容|扩大|扩到|扩展|增大|加大|调大|增加|加|缩小|缩容|减小|调小)"
+)
+
+
+# Words of a request about something else that also says disk/volume/storage: container resources, replicas,
+# a node's disk pressure, ephemeral storage.
+_NOT_A_DISK_SIZE = re.compile(
+    r"(?i)(\b(?:cpu|memory|mem|replicas?|ephemeral[-\s]?storage|disk\s*pressure|diskpressure|limits?)\b|内存|副本)"
+)
+
+
+def names_disk(prompt: str) -> bool:
+    """Does the request talk about a disk (PVC, volume, storage)?"""
+    text = _NOT_A_DISK_SIZE.sub(" ", prompt or "")
+    return bool(_DISK_WORDS.search(text))
+
+
+def asks_disk_size_change(prompt: str) -> bool:
+    """Does the request itself ask for a disk's size to change, and nothing about CPU, memory or replicas?"""
+    return names_disk(prompt) and not _NOT_A_DISK_SIZE.search(prompt or "") and _asks(_SIZE_CHANGE_WORDS, prompt)
+
+
+# A storage size as people write it: 20Gi, 20 GiB, 500G, 1.5TB. Units are required, so a PVC name's ordinal
+# ("data-loki-0") or a count is never read as a size.
+_STORAGE_SIZE = re.compile(r"(?i)(?<![\w.])(\d+(?:\.\d+)?)\s*(kib|mib|gib|tib|pib|ki|mi|gi|ti|pi|kb|mb|gb|tb|pb|k|m|g|t|p)(?![\w])")
+_STORAGE_UNIT = {
+    "ki": "Ki", "kib": "Ki", "mi": "Mi", "mib": "Mi", "gi": "Gi", "gib": "Gi", "ti": "Ti", "tib": "Ti", "pi": "Pi", "pib": "Pi",
+    "k": "k", "kb": "k", "m": "M", "mb": "M", "g": "G", "gb": "G", "t": "T", "tb": "T", "p": "P", "pb": "P",
+}
+# Words right before a size that make it an amount to add, not the size to reach.
+_RELATIVE = re.compile(r"(?i)(\bby|\badd(?:ing)?|\bmore|\+|增加了?|加|多|再)\s*$")
+# Words right before a size that make it the size to reach.
+_TARGET = re.compile(r"(?i)(\bto|\binto|到|至|为|成)\s*$")
+# Words right before a size that make it the size now ("from 10Gi to 20Gi").
+_FROM = re.compile(r"(?i)(\bfrom|从|由)\s*$")
+
+
+def requested_storage(prompt: str) -> tuple[dict | None, str | None]:
+    """`({"value": "20Gi", "quote": "20 GiB", "relative": False}, None)`: the one size the request names, as a
+    Kubernetes quantity (`G` is 10^9, `Gi` 2^30, as Kubernetes reads them), or `(None, why not)`. `relative` is True
+    for an amount to add ("add 10Gi", "加 10Gi", "by 10Gi"; user decision 2026-11-26): the caller adds it to the
+    current capacity and shows the sum. Several sizes need exactly one that is the target or the amount, and the
+    rest marked as the size now ("from 10Gi to 20Gi"); a size to reach and an amount to add together are refused."""
+    text = prompt or ""
+    sizes = []
+    for m in _STORAGE_SIZE.finditer(text):
+        before = text[max(0, m.start() - 12) : m.start()]
+        sizes.append(
+            {
+                "value": f"{m.group(1)}{_STORAGE_UNIT[m.group(2).lower()]}",
+                "quote": m.group(0),
+                "relative": bool(_RELATIVE.search(before)),
+                "target": bool(_TARGET.search(before)),
+                "from": bool(_FROM.search(before)),
+            }
+        )
+    if not sizes:
+        return None, "The request names no size with a unit (for example 20Gi)."
+    relative = [s for s in sizes if s["relative"]]
+    targets = [s for s in sizes if s["target"] and not s["relative"]]
+    if relative and targets:
+        return None, (
+            f"The request names both a size to reach ({targets[0]['quote']}) and an amount to add ({relative[0]['quote']}); "
+            "name only one."
+        )
+    chosen = relative or targets or (sizes if len(sizes) == 1 else [])
+    if len(chosen) == 1 and all(s["from"] for s in sizes if s is not chosen[0]):
+        return {"value": chosen[0]["value"], "quote": chosen[0]["quote"], "relative": chosen[0]["relative"]}, None
+    return None, "The request names several sizes (" + ", ".join(s["quote"] for s in sizes) + "); name only the size the disk should have."
+
+
 def high_replica_threshold(options: dict) -> int:
     raw = (options or {}).get("high_replica_threshold")
     try:

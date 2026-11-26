@@ -7,6 +7,10 @@ one of its pods) is changed: a StatefulSet, DaemonSet, CronJob or node that
 2026-11-26: nothing that could break a product environment). A change that
 takes no value (a restart, a pod delete) is proposed only when the
 request's own words ask for it (`spec.accepts`).
+The one change not on a Deployment is growing a disk (`expand_pvc`): a PVC
+`find_workload` resolved from a disk-resize request is planned by code alone
+(the size is read from the request's words; no model call), and only a
+StatefulSet claim-template PVC is grown (see `actions/expand_pvc.py`).
 Everything else is code: whether the Deployment is managed by KEDA/HPA (and so may only be
 changed through its autoscaler, and only on explicit request), the
 replica floor, the node-capacity cap for CPU/memory, the capacity and
@@ -141,6 +145,50 @@ def _template_pod_labels(workload: dict) -> dict:
 # ------------------------------------------------------------------ run
 
 
+async def _propose_pvc(ctx: StepContext, target: dict) -> dict:
+    """A disk size change for the PVC `find_workload` resolved: decided in code (the size is read from the
+    request's own words), never by the model."""
+    spec = actions.REGISTRY["expand_pvc"]
+    namespace, name = target["namespace"], target["name"]
+    if not policy.asks_disk_size_change(ctx.prompt):
+        return refusal(spec.not_asked.format(kind="PersistentVolumeClaim", name=name, namespace=namespace), asked_for=spec.name)
+    protected = protection.why_protected(namespace, None)
+    if protected:
+        return refusal(protected, protected=True)
+    state = await spec.load_state(ctx, {"kind": "PersistentVolumeClaim", "namespace": namespace, "name": name})
+    planned, refused = spec.plan(ctx, state, {}, {})
+    if refused:
+        return refused
+    action, facts = planned
+    risks = list(facts.get("risks") or [])
+    tier = spec.base_tier(facts)
+    for risk in risks:
+        if risk.get("level") in ("medium", "high", "critical"):
+            tier = policy.raise_tier(tier, risk["level"])
+    return await _proposal(ctx, spec, state, action, facts, tier, risks, None, None)
+
+
+async def _disk_hint(ctx: StepContext, target: dict) -> str:
+    """For a disk request about a StatefulSet: the PVCs its claim templates made, which can be named instead."""
+    try:
+        sts = await ctx.tool("get_workload")("StatefulSet", target["namespace"], target["name"])
+    except Exception:  # noqa: BLE001 — only a hint
+        return ""
+    names = [
+        f"{t['name']}-{sts['name']}-{i}"
+        for t in sts.get("volume_claim_templates") or []
+        if t.get("name")
+        for i in range(int(sts.get("replicas") or 0))
+    ][:10]
+    if not names:
+        return ""
+    return (
+        f" To grow one of its disks, name the PVC, e.g. \"expand pvc {names[0]} in namespace {target['namespace']} to "
+        f"<size>\". Its PVCs: {', '.join(names)}."
+    )
+
+
+
 async def run(ctx: StepContext) -> dict:
     target = resolved_target(ctx)
     kind = target.get("kind") or "Deployment"
@@ -150,6 +198,8 @@ async def run(ctx: StepContext) -> dict:
             f"This agent does not change nodes (cordon, uncordon, drain, labels, taints), so nothing was proposed for "
             f"node {target.get('name')}. Use kubectl, or ask for a health check of the node."
         )
+    if target.get("scope") == "pvc" and target.get("name") and target.get("namespace"):
+        return await _propose_pvc(ctx, target)
     if target.get("scope") not in ("deployment", "workload") or not target.get("name") or not target.get("namespace"):
         candidates = (ctx.results.get("find_workload") or {}).get("candidates") or []
         return refusal(
@@ -158,9 +208,10 @@ async def run(ctx: StepContext) -> dict:
         )
 
     if kind != "Deployment":
+        hint = await _disk_hint(ctx, target) if kind == "StatefulSet" and policy.names_disk(ctx.prompt) else ""
         return refusal(
             f"This agent changes only Deployments and their pods; {kind} {target['namespace']}/{target['name']} is "
-            "read only here (a health check or a listing works). Nothing was proposed."
+            "read only here (a health check or a listing works). Nothing was proposed." + hint
         )
 
     protected = protection.why_protected(target["namespace"], target["name"])
@@ -271,6 +322,13 @@ async def run(ctx: StepContext) -> dict:
             if any(r["level"] == "high" for r in ca_notes):
                 tier = policy.raise_tier(tier, "high")
 
+    # Nothing restarts for an in-place resize without RestartContainer.
+    startup = None if "restart" in facts and not facts["restart"] else _startup_estimate(workload)
+    return await _proposal(ctx, spec, state, action, facts, tier, risks, outlook, startup)
+
+
+async def _proposal(ctx: StepContext, spec, state: dict, action: dict, facts: dict, tier: str, risks: list[dict], outlook, startup) -> dict:
+    """The checked change's ownership notice, persistence hint and dry run, and the `pending_action` built from them."""
     changed = facts["changed_object"]
     chain = await ctx.tool("get_flux_chain")(changed["labels"], changed["annotations"])
     ownership = chain.get("ownership") or {}
@@ -297,8 +355,6 @@ async def run(ctx: StepContext) -> dict:
                 f"Dry-run answer: {exc}"
             )
         raise
-    # Nothing restarts for an in-place resize without RestartContainer.
-    startup = None if "restart" in facts and not facts["restart"] else _startup_estimate(workload)
 
     pending_action = {
         "id": str(uuid.uuid4()),

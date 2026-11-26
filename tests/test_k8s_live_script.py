@@ -89,6 +89,14 @@ def test_the_refusal_scenarios_have_their_fixtures():
     assert _fixtures()[("StatefulSet", "e2e-sts")]["metadata"]["namespace"] == live.NAMESPACE
 
 
+def test_the_disk_fixture_makes_the_pvc_the_scenarios_name():
+    sts = _fixtures()[("StatefulSet", live.DISK_STS)]
+    [template] = sts["spec"]["volumeClaimTemplates"]
+    assert sts["metadata"]["namespace"] == live.NAMESPACE and sts["spec"]["replicas"] == 1
+    assert f"{template['metadata']['name']}-{live.DISK_STS}-0" == live.DISK_PVC
+    assert template["spec"]["resources"]["requests"]["storage"] == "1Gi"
+
+
 def test_the_cronjob_fixture_never_fires_on_its_own_and_its_job_ends():
     cron = _fixtures()[("CronJob", "e2e-cron")]
     assert cron["metadata"]["namespace"] == live.NAMESPACE and cron["spec"]["schedule"] == "0 0 1 1 *"

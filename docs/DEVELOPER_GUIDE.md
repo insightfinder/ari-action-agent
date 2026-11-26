@@ -570,9 +570,11 @@ are `a2a-task:k8s`, `plan_task`, one `capability:<name>` per step (`check_health
 1. `message/send` "scale checkout to 5 replicas" → the task ends in
    `TASK_STATE_INPUT_REQUIRED` with a `pending_action` artifact: `id`,
    `action` (`scale_replicas` | `set_autoscaler_bounds` | `set_resources` |
-   `resize_pod` | `restart_rollout` | `delete_pod`, see
+   `resize_pod` | `restart_rollout` | `delete_pod` | `expand_pvc`, see
    docs/K8S_AGENT_INTERFACE.md; a restart or pod delete, which takes no
-   stated number, is proposed only when the request's own words ask for it),
+   stated number, is proposed only when the request's own words ask for it;
+   `expand_pvc` grows only a StatefulSet's claim-template PVC, to a size
+   read from the request by code),
    `action_name` (the line an approval email shows), `before`/`after`,
    `clamped`, `risk_tier`, `risks`, `capacity_outlook`, the server-side
    `dry_run` result, `drift_notice`, `persistence`, and a `snapshot` of

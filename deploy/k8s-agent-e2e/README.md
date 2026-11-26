@@ -70,7 +70,16 @@ can be repeated; after an interrupted run, re-apply `fixtures.yaml`.
 Restart and pod delete (`restart_deployment`, `delete_pod`) work on
 `e2e-plain`. Without `--allow-writes` they still check that the proposal's
 dry run changed nothing (the pod a delete names is still there with the same
-uid). On the test cluster the agent runs in namespace `insightfinder`
+uid). `resize_pod` resizes one `e2e-plain` pod in place (cpu limit 50m ->
+100m): same pod uid, no restart, and the kubelet reports the new limit; the
+pod is resized back to its own value with kubectl afterwards. `expand_pvc`
+grows `data-e2e-disk-0` (StatefulSet `e2e-disk`'s 1Gi claim template) to
+2Gi; a volume cannot shrink, so with `--allow-writes` the scenario first
+recreates the PVC at 1Gi (StatefulSet to 0, PVC deleted, back to 1) when a
+run left it larger. `refuse_pvc_shrink` and `refuse_pvc_helm` (a PVC the
+agent's own chart renders) must get no proposal; `admission_policy` also
+dry-runs a write to that Helm-rendered PVC (denied) and to `data-e2e-disk-0`
+(allowed). They need oncallari 0.3.19. On the test cluster the agent runs in namespace `insightfinder`
 (`ari-k8s-api` / `ari-k8s-worker`, secret `ari-k8s-secret`) rather than
 `ari-k8s-agent`; only `ari-k8s-e2e` is ever changed. Write scenarios belong
 here, not on real services: on test, image automation redeploys the

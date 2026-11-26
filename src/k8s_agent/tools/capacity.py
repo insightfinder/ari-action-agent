@@ -1,15 +1,18 @@
 """Node capacity: the per-pod cap for resource changes, whether new pods
 will fit, and what the Cluster Autoscaler says when they don't.
 
-Every EKS cluster this agent runs in has the Cluster Autoscaler (CA), so
-a pod that does not fit *today* is normally just waiting for a node. The
+The EKS clusters this agent runs in normally have the Cluster Autoscaler
+(CA), so a pod that does not fit *today* is normally just waiting for a
+node (prod-monitoring has none; a missing or unreadable status is reported
+as unknown, never as fine). The
 cases worth raising are the ones where no node is coming: the node group
-is at its max size, or provisioning keeps failing (most often an EC2
-quota). Those are read from CA's own status ConfigMap and from the
+is at its max size, or provisioning keeps failing (an EC2 quota, or no
+capacity for the instance type, which is common for spot). Those are read from CA's own status ConfigMap and from the
 events it puts on pending pods, never guessed.
 """
 
 import math
+import re
 
 import yaml
 
@@ -261,9 +264,8 @@ def estimate_fit(nodes: list[dict], pods: list[dict], template: dict, per_pod: d
 def parse_ca_status(text: str | None) -> dict:
     """`kube-system/cluster-autoscaler-status` -> node groups and scale-up state.
 
-    Recent CA versions write YAML; older ones a free-text block. Anything
-    that does not parse as the YAML shape is reported as unrecognised
-    rather than half-read.
+    Recent CA versions write YAML; older ones (stg 1.25, prod 1.27, eu 1.26 on 2026-11-26) a free-text block,
+    read by `_parse_ca_text`. Anything that parses as neither is reported as unrecognised rather than half-read.
     """
     if not text:
         return {"available": False, "reason": "cluster-autoscaler-status not found"}
@@ -272,7 +274,7 @@ def parse_ca_status(text: str | None) -> dict:
     except yaml.YAMLError:
         data = None
     if not isinstance(data, dict) or "nodeGroups" not in data:
-        return {"available": False, "reason": "cluster-autoscaler-status is not in a recognised format"}
+        return _parse_ca_text(text)
     groups = []
     for group in data.get("nodeGroups") or []:
         health = group.get("health") or {}
@@ -295,6 +297,62 @@ def parse_ca_status(text: str | None) -> dict:
         )
     cluster_scale_up = ((data.get("clusterWide") or {}).get("scaleUp") or {}).get("status")
     return {"available": True, "cluster_scale_up_status": cluster_scale_up, "node_groups": groups}
+
+
+_TEXT_HEADER = re.compile(r"^\s*Cluster-autoscaler status at ")
+_TEXT_SECTION = re.compile(r"^(Cluster-wide|NodeGroups):\s*$")
+_TEXT_NAME = re.compile(r"^\s+Name:\s+(\S+)\s*$")
+_TEXT_CONDITION = re.compile(r"^\s+(Health|ScaleUp|ScaleDown):\s+(\w+)\s*(?:\((.*)\))?\s*$")
+_TEXT_COUNT = re.compile(r"\b(\w+)=(\d+)")
+
+
+def _parse_ca_text(text: str) -> dict:
+    """The free-text status older CA versions write:
+
+        Cluster-autoscaler status at 2026-11-26 07:18:21 +0000 UTC:
+        Cluster-wide:
+          Health:      Healthy (ready=69 unready=0 ... registered=69 longUnregistered=0)
+          ScaleUp:     NoActivity (ready=69 registered=69)
+        NodeGroups:
+          Name:        eks-mng-webapp-...
+          Health:      Healthy (ready=15 ... registered=15 longUnregistered=0 cloudProviderTarget=15 (minSize=7, maxSize=60))
+          ScaleUp:     Backoff (ready=0 cloudProviderTarget=1)
+
+    The same fields as the YAML shape, except a backoff's error code and message, which this format does not
+    carry (a group in `Backoff` still counts as in backoff). Every node group must have a name and sizes, or the
+    whole status is reported as unrecognised."""
+    lines = text.splitlines()
+    if not lines or not _TEXT_HEADER.match(lines[0]):
+        return {"available": False, "reason": "cluster-autoscaler-status is not in a recognised format"}
+    section, cluster_scale_up, groups, current = None, None, [], None
+    for line in lines[1:]:
+        heading = _TEXT_SECTION.match(line)
+        if heading:
+            section = heading.group(1)
+            continue
+        name = _TEXT_NAME.match(line)
+        if name and section == "NodeGroups":
+            current = {"name": name.group(1), "min_size": None, "max_size": None, "target": None, "registered": None,
+                       "health": None, "scale_up_status": None, "backoff_error_code": None, "backoff_error_message": None}
+            groups.append(current)
+            continue
+        condition = _TEXT_CONDITION.match(line)
+        if not condition:
+            continue
+        kind, status, detail = condition.group(1), condition.group(2), condition.group(3) or ""
+        if section == "Cluster-wide":
+            if kind == "ScaleUp":
+                cluster_scale_up = status
+        elif section == "NodeGroups" and current is not None:
+            counts = {k: int(v) for k, v in _TEXT_COUNT.findall(detail)}
+            if kind == "Health":
+                current.update(health=status, registered=counts.get("registered"), target=counts.get("cloudProviderTarget"),
+                               min_size=counts.get("minSize"), max_size=counts.get("maxSize"))
+            elif kind == "ScaleUp":
+                current["scale_up_status"] = status
+    if section is None or any(g["max_size"] is None or g["target"] is None for g in groups):
+        return {"available": False, "reason": "cluster-autoscaler-status (text format) could not be read completely"}
+    return {"available": True, "format": "text", "cluster_scale_up_status": cluster_scale_up, "node_groups": groups}
 
 
 def _group_at_max(group: dict) -> bool:
@@ -339,7 +397,7 @@ def ca_risks(ca: dict, nodes_needed: int | None, exceeds_every_node: bool = Fals
                     "level": "medium",
                     "message": (
                         f"Node group {group['name']} is in scale-up backoff ({detail or 'no detail'}); recent "
-                        "node provisioning failed, most likely an EC2 quota or capacity problem. If the new pods "
+                        "node provisioning failed (an EC2 quota, or no capacity for the instance type, common for spot). If the new pods "
                         "need a node from that group, they stay Pending."
                     ),
                 }

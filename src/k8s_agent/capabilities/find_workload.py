@@ -15,6 +15,11 @@ the part before the first dot, e.g. `ip-10-1-21-112`) resolves to
 finds no workload (or only the whole cluster): on-call prompts quote node names
 from findings while asking about a workload. A node is only ever looked at
 (check_health); this agent does not change nodes.
+
+A request to resize a disk (`policy.asks_disk_size_change`) that names a PVC verbatim resolves to
+`{"scope": "pvc", "kind": "PersistentVolumeClaim", namespace, name}` before anything else (2026-11-26): a chart
+often names its Deployment and its PVC alike. Only then; a health question about the same name stays with the
+workload.
 """
 
 import json
@@ -24,6 +29,7 @@ from common.capabilities_base import StepContext
 from common.llm_json import extract
 
 from ..stepkit import finish, options
+from ..tools import policy
 
 _SENTINEL = "RESOLUTION_JSON:"
 _MAX_CANDIDATES = 300
@@ -154,8 +160,54 @@ def _node_resolution(node: dict, reasoning: str) -> dict:
     )
 
 
+# How far from the PVC's name the disk word may stand: "the disk of X", "pvc X", "X 这个 pvc".
+_DISK_WORD_REACH = 12
+
+
+def _pvcs_mentioned(prompt: str, pvcs: list[dict]) -> list[dict]:
+    """PVCs named verbatim next to a disk word ("pvc X", "the disk of X", "X 的磁盘"): a chart's Deployment and
+    PVC often share a name, and only the disk word says which one is meant."""
+    text = prompt.lower()
+    hits = []
+    for p in pvcs:
+        name = (p.get("name") or "").lower()
+        for m in re.finditer(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text) if name else ():
+            if policy.names_disk(text[max(0, m.start() - _DISK_WORD_REACH) : m.end() + _DISK_WORD_REACH].replace(name, " ")):
+                hits.append(p)
+                break
+    return hits
+
+
+async def _pvc_resolution(ctx: StepContext, default_ns: str | None) -> dict | None:
+    """A request to resize a disk that names a PVC verbatim is about that PVC, even when a Deployment has the
+    same name (a chart's `prometheus-server` Deployment and PVC)."""
+    if not policy.asks_disk_size_change(ctx.prompt):
+        return None
+    hits = _prefer_namespace(_pvcs_mentioned(ctx.prompt, await ctx.tool("list_pvcs")(None)), ctx.prompt, default_ns)
+    if len(hits) == 1:
+        return finish(
+            {
+                "resolution": {"scope": "pvc", "kind": "PersistentVolumeClaim", "namespace": hits[0]["namespace"], "name": hits[0]["name"]},
+                "candidates": [],
+                "reasoning": "a request to resize a disk names this PVC verbatim",
+            }
+        )
+    if hits:
+        return finish(
+            {
+                "resolution": None,
+                "candidates": [f"{h['namespace']}/{h['name']} (PersistentVolumeClaim)" for h in hits][:20],
+                "reasoning": "several PVCs of this name; name the namespace",
+            }
+        )
+    return None
+
+
 async def run(ctx: StepContext) -> dict:
     default_ns = ctx.params.get("namespace") or options(ctx).get("namespace")
+    pvc = await _pvc_resolution(ctx, default_ns)
+    if pvc is not None:
+        return pvc
     workloads = await ctx.tool("list_workloads")(None)
     by_label = {_label(w): w for w in workloads}
     namespaces = {w["namespace"] for w in workloads}

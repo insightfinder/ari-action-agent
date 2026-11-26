@@ -405,6 +405,8 @@ def statefulset_view(raw: dict) -> dict:
     strategy = spec.get("updateStrategy") or {}
     return {
         **_workload_common(raw, "StatefulSet"),
+        # An operator that owns the StatefulSet may reconcile its PVCs too (expand_pvc refuses those).
+        "owner": _owner(raw),
         "observed_generation": status.get("observedGeneration"),
         "replicas": spec.get("replicas", 1),
         "selector": dict((spec.get("selector") or {}).get("matchLabels") or {}),
@@ -667,6 +669,56 @@ def pvc_full_view(raw: dict) -> dict:
         "access_modes": list(spec.get("accessModes") or []),
         "volume": spec.get("volumeName"),
         "conditions": _conditions(status),
+    }
+
+
+# Labels and annotations by which Helm, Flux or Argo CD mark an object they render and re-apply.
+_APPLIER_LABELS = (
+    "helm.toolkit.fluxcd.io/name",
+    "kustomize.toolkit.fluxcd.io/name",
+    "app.kubernetes.io/managed-by",
+    "argocd.argoproj.io/instance",
+)
+_APPLIER_ANNOTATION_PREFIXES = (
+    "meta.helm.sh/",
+    "argocd.argoproj.io/",
+    "kustomize.toolkit.fluxcd.io/",
+    "helm.toolkit.fluxcd.io/",
+    "kubectl.kubernetes.io/last-applied-configuration",
+)
+# Field managers of the same tools (server-side apply and Helm's own client).
+_APPLIER_MANAGERS = ("helm", "kustomize", "argocd", "flux")
+
+
+def pvc_change_view(raw: dict) -> dict:
+    """A PVC as `expand_pvc` judges it: its size (asked, allocated, actual), resize state, and every sign of a
+    tool that renders and re-applies it."""
+    meta = _meta(raw)
+    spec = raw.get("spec") or {}
+    status = raw.get("status") or {}
+    labels = meta.get("labels") or {}
+    annotations = meta.get("annotations") or {}
+    managers = sorted({str(f.get("manager") or "") for f in meta.get("managedFields") or []} - {""})
+    return {
+        "kind": "PersistentVolumeClaim",
+        "name": meta.get("name"),
+        "namespace": meta.get("namespace"),
+        "uid": meta.get("uid"),
+        "deleting": bool(meta.get("deletionTimestamp")),
+        "phase": status.get("phase"),
+        "storage_class": spec.get("storageClassName"),
+        "volume_mode": spec.get("volumeMode", "Filesystem"),
+        "requested": str(((spec.get("resources") or {}).get("requests") or {}).get("storage") or ""),
+        "capacity": str((status.get("capacity") or {}).get("storage") or ""),
+        "allocated": str((status.get("allocatedResources") or {}).get("storage") or ""),
+        "resize_status": (status.get("allocatedResourceStatuses") or {}).get("storage"),
+        "conditions": [c.get("type") for c in status.get("conditions") or [] if c.get("status") == "True"],
+        "owners": [{"kind": o.get("kind"), "name": o.get("name")} for o in meta.get("ownerReferences") or []],
+        "applier_labels": {k: v for k, v in labels.items() if k in _APPLIER_LABELS},
+        # Values kept only as markers: last-applied-configuration holds the whole manifest.
+        "applier_annotations": {k: str(v)[:120] for k, v in annotations.items() if k.startswith(_APPLIER_ANNOTATION_PREFIXES)},
+        "applier_managers": [m for m in managers if any(t in m.lower() for t in _APPLIER_MANAGERS)],
+        "labels": ownership_labels(raw),
     }
 
 

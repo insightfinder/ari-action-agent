@@ -31,13 +31,16 @@ label and email). Other fields are informational for the approver.
 - `id`, `action`, `action_name`, `namespace`, `deployment` — unchanged.
 - `target`: `{"kind", "namespace", "name"}` — the object the change is about. **Added II-25740.**
   `kind: "Deployment"`, except `resize_pod` and `delete_pod`, which set `kind: "Pod"` and still fill
-  `deployment` with the pod's owning Deployment (and add `pod`). Every change lands on a Deployment or one of
+  `deployment` with the pod's owning Deployment (and add `pod`), and `expand_pvc`, which sets
+  `kind: "PersistentVolumeClaim"` with `deployment` null. Every other change lands on a Deployment or one of
   its pods (decided 2026-11-26; see "Never"). A proposal without `target` (made before II-25740) is still
   applied.
 - Per-action fields (spread into the proposal beside the common ones; informational, the agent rebuilds the
   write from them), **added II-25740**: `restart_rollout`: `workload_kind` (`Deployment`), `workload`,
   `restarted_at` (the value the template's `kubectl.kubernetes.io/restartedAt` gets). `delete_pod`:
-  `workload_kind`, `workload`, `pod`, `pod_uid`. `resize_pod`: `pod`, `container`.
+  `workload_kind`, `workload`, `pod`, `pod_uid`. `resize_pod`: `pod`, `container`. `expand_pvc`: `pvc`,
+  `pvc_uid`, `storage` (the size asked, a Kubernetes quantity), `workload_kind` (`StatefulSet`), `workload`
+  (the StatefulSet whose claim template made the PVC); `before`/`after` are `{"storage": ...}`.
 - `persistence.needed`: `false` when nothing has to change in Git (a restart, a deleted pod, an in-place
   resize back to the template's own values); `reason` says why and `changes` is empty.
   `true` otherwise. **Added II-25740.**
@@ -67,6 +70,11 @@ UIE (`ran`).
   `verification.replacement` names it), `in_progress`, `new_pods_failing`, `unschedulable`. A pod that was
   already gone or replaced when the approval arrived counts as done: `applied.already_at_target` is true and
   nothing is deleted.
+- `status` for `expand_pvc` (2026-11-26): `succeeded` (the PVC's `status.capacity` reached the size;
+  `verification.capacity`), `resize_pending` (asked for, the volume has not reached it within the wait; it
+  grows on its own, a volume no pod mounts when next mounted), `resize_failed` (the driver or kubelet reported
+  it infeasible), `pvc_replaced` (the PVC was deleted or replaced while watched). A PVC already asking for the
+  size when the approval arrived counts as done (`applied.already_at_target`).
 - An approval is not applied (the step fails, nothing is written) when its target has become protected, when
   its kind is no longer changed (a StatefulSet or DaemonSet restart, or a delete of such a pod, proposed before
   2026-11-26), or for an action that no longer exists.
@@ -109,10 +117,30 @@ kind on the test cluster conformed.
 ### Action names (`action`)
 
 `scale_replicas`, `set_autoscaler_bounds`, `set_resources`, `resize_pod`, `restart_rollout`, `delete_pod`,
-today (`k8s_agent/actions/__init__.py`, `ACTIONS`). Every one changes a
+`expand_pvc`, today (`k8s_agent/actions/__init__.py`, `ACTIONS`). Every one but `expand_pvc` changes a
 Deployment, its autoscaler or one of its pods: StatefulSets, DaemonSets, CronJobs and nodes are read only, and
 `propose_change` refuses a change to one before asking the model (safety review with the user, 2026-11-26:
 nothing that could break a product environment).
+
+`expand_pvc` (**added II-25740, 2026-11-26**): grows ONE PVC to a size the request names; never smaller.
+- Resolved by `find_workload` when the request asks for a disk's size to change (`policy.asks_disk_size_change`)
+  and names the PVC verbatim: `{"scope": "pvc", "kind": "PersistentVolumeClaim", "namespace", "name"}`, ahead
+  of a Deployment of the same name (charts often name both alike). Planned by code alone: the size is read
+  from the request's words (`policy.requested_storage`: a unit is required; a size to reach, or an amount to
+  add ("by 10Gi", "加 10Gi"), which is added to the current capacity at proposal time, shown in
+  `requested.computed` ("10Gi + 10Gi = 20Gi") and written as the size it comes to, so an approval never adds
+  twice; both kinds together, or several sizes without one clear target, are refused); the model is not asked.
+- Only a PVC that a StatefulSet's `volumeClaimTemplates` created (name `<template>-<statefulset>-<ordinal>` of
+  a StatefulSet in its namespace, no Helm/Flux/Argo CD label, annotation or field manager, no owner but that
+  StatefulSet or its pod). Anything else is refused with "change the size in Git": checked on test, a
+  Helm-rendered PVC grown in the cluster makes the release's next upgrade fail (`field can not be less than
+  status.capacity`) and stall until Git catches up; a StatefulSet's claim-template PVC grown the same way did
+  not affect its release's upgrade.
+- The StatefulSet and the namespace must not be protected; the StorageClass must allow volume expansion; the
+  PVC must be Bound and not resizing; the size must be larger than the capacity and at most
+  max(2 x capacity, capacity + 50Gi). Tier `high` (permanent, costs more); on EBS, a note that the volume
+  can change again only after this change finishes optimizing, at most four times in 24 hours (AWS). A disk request about a StatefulSet itself is refused with its PVC
+  names.
 
 `resize_pod` (**added II-25740**): CPU/memory of one container of one running pod of a Deployment, in place
 through `pods/resize` — no rollout, same pod. Chosen only when the request asks for an in-place change (decided
@@ -145,8 +173,10 @@ says. The oncallari chart's `ariK8sAgent.protection` values hold both lists and 
 - a ValidatingAdmissionPolicy (Kubernetes >= 1.30; left out on an older cluster unless required, see RBAC) that
   has the API server deny the agent's ServiceAccount any write in a protected namespace, and to a protected
   Deployment, its pods (through their ReplicaSet) and its autoscalers (their target before and after the
-  request), and any change to what an autoscaler scales (`spec.scaleTargetRef`; the agent only changes bounds).
-  A dry run it denies comes back as a refusal (`protected: true`).
+  request), and any change to what an autoscaler scales (`spec.scaleTargetRef`; the agent only changes bounds);
+  from oncallari 0.3.19 also any write to a PVC that Helm, Flux or Argo CD marks, and to a PVC named like a
+  protected StatefulSet's claim (`<template>-<name>-<ordinal>`). A dry run it denies comes back as a refusal
+  (`protected: true`).
 - The code holds no workload names (they are installation-specific; the oncallari defaults below are
   InsightFinder's). A chart shipped for other installations should default `workloads` to empty: the agent's
   own API and worker are added anyway.
@@ -155,12 +185,6 @@ says. The oncallari chart's `ariK8sAgent.protection` values hold both lists and 
   insightfinder-mcp-service-worker, temporal-*, ari-coordinator; the chart always adds the agent's own API
   and worker. The agent runs beside the services it changes (`insightfinder` on test), so it and its approval
   path are protected by name, not by namespace.
-
-Planned under II-25740 (not built yet):
-- `expand_pvc` (grow only, never shrink: needs the StorageClass's `allowVolumeExpansion`, a per-request growth
-  cap, tier `high`; the protection check and the admission policy must cover PVCs too (vault's sit in a
-  protected namespace); irreversible and costs money, which the user accepts: it does not break anything; a
-  StatefulSet's `volumeClaimTemplates` cannot follow, so the proposal says what Git needs).
 
 Not to be built (decided 2026-11-26): `batch`, `flux_reconcile` (`patch` on HelmReleases/Kustomizations cannot
 be narrowed by RBAC to the reconcile annotation), `resize_pod` for StatefulSet pods, and the earlier "later"
@@ -173,6 +197,7 @@ Not to be added. A change to this list is a decision of its own, recorded here a
 - Reading Secrets (any verb), reading ConfigMap values (keys only), copying nested content of custom
   resources (top-level scalars only).
 - exec / attach / port-forward into pods.
+- Shrinking a PVC, or growing one that Helm, Flux or Argo CD applies (its size changes in Git).
 - Creating or deleting workloads, Services, Ingresses, Namespaces or PVCs (deleting one pod of a Deployment,
   which the Deployment replaces, is the only delete). This includes creating a Job from a CronJob ("run it
   now"): considered as `trigger_cronjob` and declined by the user on 2026-11-25. It also includes deleting a
@@ -211,7 +236,8 @@ Not to be added. A change to this list is a decision of its own, recorded here a
 `docs/examples/k8s-rbac.yaml` is the reference; the oncallari chart's
 `templates/ari-k8s-agent/ari-k8s-agent-rbac.yaml` (charts repo) mirrors it rule for rule. Writes, from
 oncallari 0.3.17: `patch` on `deployments` and `deployments/scale` (apps), `horizontalpodautoscalers`
-(autoscaling) and `scaledobjects` (keda.sh), `patch` on `pods/resize` and `delete` on `pods` (core). 0.3.15
+(autoscaling) and `scaledobjects` (keda.sh), `patch` on `pods/resize` and `delete` on `pods` (core); from
+0.3.19 also `patch` on `persistentvolumeclaims` (core) for `expand_pvc`. 0.3.15
 and 0.3.16 also granted `patch` on statefulsets, daemonsets and cronjobs; 0.3.17 drops them with the actions
 that used them. RBAC can only allow, so the protected namespaces and workloads are denied by the chart's
 ValidatingAdmissionPolicy (`templates/ari-k8s-agent/ari-k8s-agent-admission-policy.yaml`,
@@ -230,8 +256,8 @@ Recorded for their owners; not changed from this repository.
 
 | Repo | What | Why | Since |
 |---|---|---|---|
-| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout` and `delete_pod` ship with II-25740 (`rollback`, `set_image`, pause/resume and the CronJob actions were removed before shipping). | II-25740 |
-| insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship: changes are to Deployments only; StatefulSets, DaemonSets, CronJobs, nodes and protected namespaces/workloads are read only. | II-25740 |
+| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `delete_pod` and `expand_pvc` ship with II-25740 (`rollback`, `set_image`, pause/resume and the CronJob actions were removed before shipping). | II-25740 |
+| insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship: changes are to Deployments, plus growing a StatefulSet's claim-template PVC; StatefulSets, DaemonSets, CronJobs, nodes and protected namespaces/workloads are otherwise read only. | II-25740 |
 | test-fluxcd, eks-fluxcd | Set `ariK8sAgent.protection.admissionPolicy: true` in the ari-k8s HelmRelease values (the chart default `auto` silently leaves the policy out on a cluster without the API). | A missing policy should fail the release, not go unnoticed. | II-25740 |
 | eks-fluxcd | When the k8s agent is deployed to stg/prod: check `ariK8sAgent.protection.workloads` against that cluster's names (the defaults are bare names in the release namespace: insightfinder-mcp-service, insightfinder-mcp-service-worker, temporal-*, ari-coordinator) and add whatever runs the approval path there. | The agent and its approval path are protected by name; a name that differs there is not protected. | II-25740 |
 | insightfinder-mcp-service | Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. Do not have a model re-type the rows: 100+ rows exceed its output limit and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
@@ -264,3 +290,8 @@ Recorded for their owners; not changed from this repository.
   `protected`; protected namespaces and workloads (chart values, worker env, ValidatingAdmissionPolicy).
   oncallari 0.3.17 drops `patch` on statefulsets, daemonsets and cronjobs. `batch` and `flux_reconcile` will not
   be built.
+- **2026-11-26, II-25740** — new action `expand_pvc`: `pending_action.target.kind` can be
+  `PersistentVolumeClaim` (`deployment` null), per-action fields `pvc`, `pvc_uid`, `storage`, `workload_kind`,
+  `workload`; new `action_result.status` values `resize_pending`, `resize_failed`, `pvc_replaced`;
+  `find_workload` can answer `{"scope": "pvc", ...}`. oncallari 0.3.19 adds `patch` on persistentvolumeclaims
+  and PVC rules to the admission policy. Additive; nothing removed or renamed.
