@@ -71,6 +71,8 @@ class ActionSpec:
     # Set when the RBAC this action needs is newer than some deployed charts: a 403 on the dry run then
     # becomes a refusal naming the missing rule instead of a failed step.
     rbac_rule: str | None = None
+    # When `rbac_rule` applies only to some target kinds (a Deployment is patched with the rule every chart has).
+    rbac_rule_kinds: tuple[str, ...] | None = None
     # When the extracted action is not what the request itself asks for (`accepts` is False), plan this one
     # instead. Decided in code, never by the model.
     fallback: str | None = None
@@ -110,6 +112,17 @@ class ActionSpec:
         """The level the lifetime notice is listed at among the proposal's risks (None: not listed). A change
         to a GitOps- or Helm-owned object that the next reconcile or upgrade can undo is a `medium` risk."""
         return "medium" if (ownership or {}).get("class") != "unowned" else None
+
+    def missing_rule(self, action: dict) -> str | None:
+        """The RBAC rule a 403 on this action's dry run means is missing, or None (a 403 is then an error)."""
+        if self.rbac_rule_kinds is not None and self.target(action).get("kind") not in self.rbac_rule_kinds:
+            return None
+        return self.rbac_rule
+
+    async def plan_inputs(self, ctx, state: dict) -> dict:
+        """More reads `plan` needs that approving does not (they go into its `env`). Called from
+        `propose_change` only, so a read here can never fail an approved change."""
+        return {}
 
     def plan(self, ctx, state: dict, change: dict, env: dict):
         """`((action, facts), None)` or `(None, refusal)`."""
@@ -176,15 +189,16 @@ class DeploymentAction(ActionSpec):
         return {"labels": dep["labels"], "annotations": dep["annotations"]}
 
     def drift(self, proposal: dict, state: dict) -> list[str]:
-        """The autoscaler governing the Deployment, compared for every Deployment action: its appearance,
-        disappearance or change invalidates any approval."""
+        """The autoscaler governing the workload, compared for every Deployment action (and a StatefulSet
+        scale): its appearance, disappearance or change invalidates any approval."""
         snapshot = proposal["snapshot"]
+        kind = (state.get("workload") or {}).get("kind") or "Deployment"
         changes = []
         current_fp = governance.autoscaler_fingerprint(state.get("autoscaler"))
         proposed_fp = snapshot.get("autoscaler")
         if (current_fp is None) != (proposed_fp is None):
             changes.append(
-                "an autoscaler now governs this Deployment" if current_fp else "the autoscaler governing it is gone"
+                f"an autoscaler now governs this {kind}" if current_fp else "the autoscaler governing it is gone"
             )
         elif current_fp and proposed_fp:
             for key in ("kind", "name", "min", "max", "generation"):

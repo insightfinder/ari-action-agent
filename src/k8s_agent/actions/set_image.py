@@ -40,6 +40,7 @@ class SetImage(ActionSpec):
         "<registry/repository:tag>\"."
     )
     rbac_rule = 'patch on "statefulsets" and "daemonsets" (apps group; the oncallari chart grants it from 0.3.15)'
+    rbac_rule_kinds = ("StatefulSet", "DaemonSet")
 
     def accepts(self, prompt):
         return policy.asks_set_image(prompt)

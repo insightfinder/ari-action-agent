@@ -115,7 +115,7 @@ def _startup_estimate(dep: dict) -> int | None:
 
 
 _SCALE_DOWN_PDB = (
-    "It does not block this scale-down, which removes pods through the ReplicaSet rather than by eviction; with "
+    "It does not block this scale-down, which removes pods through the workload's controller rather than by eviction; with "
     "fewer replicas it leaves less room for voluntary disruptions such as node drains."
 )
 
@@ -176,6 +176,8 @@ async def run(ctx: StepContext) -> dict:
         autoscaler = await ctx.tool("find_autoscaler")(namespace, name)
     else:
         workload = await ctx.tool("get_workload")(kind, namespace, name)
+        if kind == "StatefulSet":
+            autoscaler = await ctx.tool("find_autoscaler")(namespace, name, "StatefulSet")
     change = await _extract(ctx, workload, autoscaler)
     spec = actions.REGISTRY.get(change.get("action"))
     if spec is not None and kind not in spec.workload_kinds:
@@ -214,6 +216,7 @@ async def run(ctx: StepContext) -> dict:
         nodes = await ctx.tool("list_nodes")()
         pods = await ctx.tool("list_pods")(None, None, True)
     env = {"threshold": threshold, "headroom": policy.headroom_ratio(opts), "nodes": nodes, "pods": pods}
+    env.update(await spec.plan_inputs(ctx, state))
     planned, refused = spec.plan(ctx, state, change, env)
     if refused:
         return refused
@@ -294,10 +297,11 @@ async def run(ctx: StepContext) -> dict:
         dry_run = await ctx.tool("dry_run_patch")(action)
     except RuntimeError as exc:
         # A new image can reach a cluster before the chart that grants its RBAC does.
-        if spec.rbac_rule and "HTTP 403" in str(exc):
+        missing = spec.missing_rule(action)
+        if missing and "HTTP 403" in str(exc):
             return refusal(
                 f"The agent is not allowed to make this change in this cluster yet: its ServiceAccount lacks "
-                f"{spec.rbac_rule}. Nothing was proposed. "
+                f"{missing}. Nothing was proposed. "
                 f"Dry-run answer: {exc}"
             )
         raise

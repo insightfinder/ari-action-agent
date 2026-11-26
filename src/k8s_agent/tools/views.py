@@ -385,6 +385,11 @@ def _owner(raw: dict) -> dict:
     return {"kind": owner.get("kind"), "name": owner.get("name")}
 
 
+def _controller(raw: dict) -> dict | None:
+    owner = next((o for o in _meta(raw).get("ownerReferences") or [] if o.get("controller")), None)
+    return {"kind": owner.get("kind"), "name": owner.get("name")} if owner else None
+
+
 def _workload_common(raw: dict, kind: str) -> dict:
     meta = _meta(raw)
     return {
@@ -410,7 +415,15 @@ def statefulset_view(raw: dict) -> dict:
         "selector": dict((spec.get("selector") or {}).get("matchLabels") or {}),
         "label_selector": label_selector(spec.get("selector") or {}),
         "service_name": spec.get("serviceName"),
+        # The object that manages this StatefulSet, when one does (an operator's custom resource sets
+        # spec.replicas itself).
+        "controller": _controller(raw),
         "pod_management_policy": spec.get("podManagementPolicy", "OrderedReady"),
+        "ordinals_start": (spec.get("ordinals") or {}).get("start", 0),
+        "pvc_retention": {
+            "when_deleted": (spec.get("persistentVolumeClaimRetentionPolicy") or {}).get("whenDeleted", "Retain"),
+            "when_scaled": (spec.get("persistentVolumeClaimRetentionPolicy") or {}).get("whenScaled", "Retain"),
+        },
         "strategy": {"type": strategy.get("type", "RollingUpdate"), "partition": (strategy.get("rollingUpdate") or {}).get("partition", 0)},
         "status": {
             "replicas": status.get("replicas", 0),

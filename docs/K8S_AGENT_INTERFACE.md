@@ -34,8 +34,9 @@ label and email). Other fields are informational for the approver.
   pod's owning Deployment (and adds `pod` and `container`). Actions on other kinds set it and may leave
   `deployment` empty (null): `restart_rollout` of a StatefulSet or DaemonSet (`kind` is that kind), and
   `delete_pod` (`kind: "Pod"`; `deployment` is filled only for a Deployment's pod), `set_image` of a
-  StatefulSet or DaemonSet, and the CronJob actions (`kind: "CronJob"`, `deployment` null). A proposal without
-  `target` (made before II-25740) is still applied.
+  StatefulSet or DaemonSet, the CronJob actions (`kind: "CronJob"`, `deployment` null), and `scale_replicas`
+  of a StatefulSet (`kind: "StatefulSet"`, `deployment` null). A proposal without `target` (made before
+  II-25740) is still applied.
 - Per-action fields (spread into the proposal beside the common ones; informational, the agent rebuilds the
   write from them): `restart_rollout`: `workload_kind`, `workload`, `restarted_at` (the value the template's
   `kubectl.kubernetes.io/restartedAt` gets). `rollback`: `from_revision`, `to_revision`, `replicaset`,
@@ -44,7 +45,8 @@ label and email). Other fields are informational for the approver.
   Write batch 2 (**added II-25740**): `set_image`: `workload_kind`, `workload`, `container`, `image`.
   `pause_rollout` / `resume_rollout`: `paused` (the value set), `pending_pods` (pods a resume will replace
   because the template changed while paused; 0 for a pause). `suspend_cronjob` / `resume_cronjob`: `cronjob`,
-  `suspend`.
+  `suspend`. `scale_replicas` (**added II-25740**, beside `replicas`): `workload_kind`, `workload` (also for a
+  Deployment, whose `deployment` stays filled).
 - `persistence.needed`: `false` when nothing has to change in Git (a restart, a deleted pod, an in-place
   resize back to the template's own values, a pause or resume); `reason` says why and
   `changes` is empty. `true` otherwise (a `set_image` names `image`, a CronJob suspend or resume `suspend`).
@@ -80,6 +82,9 @@ UIE (`ran`).
   change waited (`pending_pods` > 0) as a Deployment rollout, `reverted` meaning paused again.
   `suspend_cronjob` / `resume_cronjob`: `succeeded` (the value held for 45 s; `verification.active_jobs` lists
   runs active then — a resume may start one at once), `reverted`.
+- `scale_replicas` of a StatefulSet (II-25740): `succeeded` (`spec.replicas`, `status.replicas` and ready pods
+  all at the target, observed generation current, then stable), `in_progress`, `new_pods_failing`,
+  `unschedulable`, `reverted` (another count put back while watched). A Deployment scale is unchanged.
 
 ### `query_result`
 
@@ -163,6 +168,23 @@ batch 1; a refusal carries `asked_for`).
 - `find_workload` also resolves CronJobs (`{"scope": "workload", "kind": "CronJob", ...}`, also from a
   scheduled run's pod name); `check_health` of a CronJob covers its runs' pods and reports a suspended one
   (`Suspended`, info).
+
+StatefulSet scaling (II-25740): `scale_replicas` also takes a StatefulSet (not a DaemonSet). Same rules as for a
+Deployment (a stated count, never below 1, refused under an HPA or KEDA ScaledObject that targets the
+StatefulSet), plus:
+- Refused when another object controls the StatefulSet (a controller `ownerReference`, e.g. an operator's
+  custom resource), which would put its own count back; the refusal names it in `controller`.
+- Refused for a scale-down under `persistentVolumeClaimRetentionPolicy.whenScaled: Delete`: it would delete the
+  removed pods' PVCs, and this agent never deletes a PVC.
+- Tier `medium` up, `high` down. Risks and notes name the pods added or removed (by ordinal, from
+  `spec.ordinals.start`), the PVCs each new pod creates from the volume claim templates or mounts again with
+  old data (`medium` risk; read from a PVC list at proposal time only), the PVCs a scale-down keeps, and pods
+  not ready under `OrderedReady` (`medium`: the controller waits for them).
+- Written as a merge patch of `spec.replicas` on the StatefulSet itself (not `statefulsets/scale`), with the
+  `patch statefulsets` rule from oncallari 0.3.15: no new RBAC. A Deployment is still scaled through
+  `deployments/scale`.
+- The approval re-checks the count, the autoscaler, the controlling object, the PVC retention policy and the
+  uid.
 - RBAC (oncallari chart 0.3.16): `patch` on `cronjobs` (batch). Before it, both CronJob changes are refused
   with the missing rule named; the other batch 2 actions need no new rule.
 
@@ -174,7 +196,11 @@ now be `node` (with `kind: "Node"`, `name`, `namespace` null). `propose_change` 
 `cordon_node`, `uncordon_node` and `drain_node` were built and declined by the user on 2026-11-25 (see "Never").
 
 Planned under II-25740 (not built yet), in this order:
-- StatefulSet replica scaling, and `batch` (one approval for the same change on several targets).
+- `batch` (one approval for the same change on several targets). StatefulSet replica scaling, planned beside
+  it, was built on 2026-11-25 (above). Decided with the user on 2026-11-26: only `restart_rollout`,
+  `scale_replicas` and `set_image`; only targets the request writes out by name (no label selectors or "every
+  Deployment in X"), with a cap on their number; applied one target at a time, each verified before the
+  next, stopping at the first that fails and reporting which were done and which were not.
 - Added 2026-11-24 (user decision), in this order: `flux_reconcile` (set `reconcile.fluxcd.io/requestedAt` on a
   HelmRelease or Kustomization so a merged fix applies now; changes no desired state, tier `low`);
   `resize_pod` for StatefulSet pods (same rules as for Deployment pods; persistence hint points at the
@@ -232,7 +258,7 @@ Recorded for their owners; not changed from this repository.
 | Repo | What | Why | Since |
 |---|---|---|---|
 | insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `rollback`, `delete_pod`, `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob` and `resume_cronjob` ship with II-25740. | II-25740 |
-| insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship. | II-25740 |
+| insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship (including `scale_replicas` of a StatefulSet, and that nodes are read only). | II-25740 |
 | insightfinder-mcp-service | Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. Do not have a model re-type the rows: 100+ rows exceed its output limit and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
 | insightfinder-mcp-service | Confirm live that a follow-up chat turn ("in table format") can reach the previous turn's agent result, or that the coordinator calls the agent again. | Screenshot of 2026-11-19 (stg): the coordinator answered from memory. | II-25740 |
 
@@ -253,3 +279,7 @@ Recorded for their owners; not changed from this repository.
   (delete), with `deployment` null for a non-Deployment workload; `persistence.needed`; refusal `asked_for`;
   new `action_result.status` meanings listed above. RBAC adds `patch` on statefulsets/daemonsets and `delete`
   on pods (oncallari 0.3.15). Additive; nothing removed or renamed.
+- **2026-11-25, II-25740** — `scale_replicas` also scales a StatefulSet: `target.kind: "StatefulSet"` with
+  `deployment` null; new proposal fields `workload_kind` / `workload` on every `scale_replicas` (a Deployment's
+  `deployment` stays); refusal field `controller`. No new RBAC (patch on statefulsets, oncallari 0.3.15).
+  Additive; nothing removed or renamed.

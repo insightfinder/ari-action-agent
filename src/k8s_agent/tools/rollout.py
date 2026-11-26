@@ -590,6 +590,29 @@ def workload_rolled_out(view: dict) -> bool:
     return all((status.get(k) or 0) == desired for k in ("updated", "ready", "available"))
 
 
+def _statefulset_pace(view: dict, target: dict | None) -> str:
+    if view.get("kind") != "StatefulSet":
+        return ""
+    if (target or {}).get("kind") != "replicas":
+        return "; a StatefulSet replaces its pods one at a time"
+    if view.get("pod_management_policy") == "Parallel":
+        return ""
+    return "; a StatefulSet (OrderedReady) adds or removes its pods one at a time"
+
+
+def replicas_reached(view: dict, replicas: int) -> bool:
+    """A StatefulSet runs exactly `replicas` ready pods for its current spec. A scale is judged on the counts
+    alone, not on the template revision: a StatefulSet whose own rollout is pending (OnDelete, a partition, a
+    stuck update) scales all the same. `status.replicas` still counts a removed pod while it terminates."""
+    status = view.get("status") or {}
+    return (
+        (view.get("observed_generation") or 0) >= (view.get("generation") or 0)
+        and view.get("replicas") == replicas
+        and status.get("replicas") == replicas
+        and status.get("ready") == replicas
+    )
+
+
 async def wait_workload_rollout(
     kind: str,
     namespace: str,
@@ -602,7 +625,8 @@ async def wait_workload_rollout(
     """Poll a StatefulSet or DaemonSet after a template change (a restart, an image) until its controller
     reports the rollout complete, then watch the new pods for STABILITY_SECONDS. A StatefulSet replaces one pod
     at a time and waits for each to be ready, so a long one often ends `in_progress`: not a failure. With
-    `target` (`{"kind": "images", ...}`), an approved value put back while watched ends it as `reverted`."""
+    `target` (`{"kind": "images", ...}`), an approved value put back while watched ends it as `reverted`. A
+    `{"kind": "replicas", "replicas": n}` target (a StatefulSet scaled) is complete at `replicas_reached`."""
     applied = _parse(applied_at)
     started = time.monotonic()
     stable_since: float | None = None
@@ -641,7 +665,8 @@ async def wait_workload_rollout(
                     "failing": restarted[:10],
                     "detail": f"new pods restarted within {round(time.monotonic() - stable_since)}s of becoming ready",
                 }
-        if workload_rolled_out(view):
+        done = replicas_reached(view, target["replicas"]) if (target or {}).get("kind") == "replicas" else workload_rolled_out(view)
+        if done:
             if stable_since is None:
                 stable_since, baseline = time.monotonic(), _restart_counts(new)
             observed = time.monotonic() - stable_since
@@ -659,7 +684,7 @@ async def wait_workload_rollout(
                 "note": (
                     f"The change is applied but the {kind} had not finished rolling out when the wait window "
                     f"({int(max_wait_seconds)}s) ended"
-                    + ("; a StatefulSet replaces its pods one at a time" if kind == "StatefulSet" else "")
+                    + _statefulset_pace(view, target)
                     + ". This is not a failure; check it again later."
                 ),
             }
