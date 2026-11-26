@@ -220,6 +220,29 @@ nodeGroups:
 """
 
 
+# The free-text status older Cluster Autoscaler versions write (shape copied from stg/prod/eu, CA 1.25-1.27).
+CA_STATUS_TEXT = """Cluster-autoscaler status at 2026-11-26 07:18:21.287255465 +0000 UTC:
+Cluster-wide:
+  Health:      Healthy (ready=9 unready=0 (resourceUnready=0) notStarted=0 longNotStarted=0 registered=9 longUnregistered=0)
+               LastProbeTime:      2026-11-26 07:18:20.971900674 +0000 UTC m=+442905.996350407
+  ScaleUp:     InProgress (ready=9 registered=9)
+               LastProbeTime:      2026-11-26 07:18:20.971900674 +0000 UTC m=+442905.996350407
+  ScaleDown:   NoCandidates (candidates=0)
+
+NodeGroups:
+  Name:        eks-ng-general-4ecbd857
+  Health:      Healthy (ready=6 unready=0 (resourceUnready=0) notStarted=0 longNotStarted=0 registered=6 longUnregistered=0 cloudProviderTarget=6 (minSize=0, maxSize=50))
+               LastProbeTime:      2026-11-26 07:18:20.971900674 +0000 UTC m=+442905.996350407
+  ScaleUp:     NoActivity (ready=6 cloudProviderTarget=6)
+  ScaleDown:   NoCandidates (candidates=0)
+
+  Name:        eks-ng-spot-00cbe66c
+  Health:      Healthy (ready=3 unready=0 (resourceUnready=0) notStarted=0 longNotStarted=0 registered=3 longUnregistered=0 cloudProviderTarget=4 (minSize=1, maxSize=4))
+  ScaleUp:     Backoff (ready=3 cloudProviderTarget=4)
+  ScaleDown:   NoCandidates (candidates=0)
+"""
+
+
 def helmrelease(name="shop-release", namespace="flux-apps", inline_values=True):
     spec = {
         "chart": {"spec": {"chart": "shop-chart", "version": "1.4.2", "sourceRef": {"kind": "HelmRepository", "name": "charts"}}},
@@ -334,6 +357,8 @@ class FakeClient:
         self.deletes: list[dict] = []
         # When set, a real pod delete is followed at once by the controller's ready replacement.
         self.auto_replace = False
+        # When set, a real PVC size patch is followed at once by the volume reporting the new capacity.
+        self.auto_expand = False
         # What discovery and /version answer.
         self.resize_supported = True
         self.server_git_version = "v1.36.5-eks-91f89a9"
@@ -422,6 +447,8 @@ class FakeClient:
                 self._roll_out_workload(obj)
             if self.auto_resize and target_kind == "Pod" and subresource == "resize":
                 self._resize(obj, body)
+            if self.auto_expand and target_kind == "PersistentVolumeClaim":
+                obj.setdefault("status", {})["capacity"] = {"storage": obj["spec"]["resources"]["requests"]["storage"]}
         if kind == "Scale":
             return {"metadata": {"name": name}, "spec": {"replicas": merged["spec"]["replicas"]}}
         return copy.deepcopy(merged)
@@ -553,7 +580,17 @@ def replicaset(deployment="checkout", revision=1, image="registry.example/checko
     }
 
 
-def statefulset(name="db", namespace="shop", replicas=2, strategy="RollingUpdate", generation=3, labels=None):
+def statefulset(name="db", namespace="shop", replicas=2, strategy="RollingUpdate", generation=3, labels=None, claim_templates=None):
+    sts = _statefulset(name, namespace, replicas, strategy, generation, labels)
+    if claim_templates:
+        sts["spec"]["volumeClaimTemplates"] = [
+            {"metadata": {"name": t}, "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": size}}, "storageClassName": "gp3"}}
+            for t, size in claim_templates.items()
+        ]
+    return sts
+
+
+def _statefulset(name, namespace, replicas, strategy, generation, labels):
     return {
         "kind": "StatefulSet",
         "metadata": {"name": name, "namespace": namespace, "uid": f"uid-{name}", "generation": generation, "labels": labels or {}},
@@ -642,3 +679,27 @@ def job_pod(name, job, namespace="shop"):
     p["metadata"]["ownerReferences"] = [{"kind": "Job", "name": job}]
     p["metadata"]["labels"] = {"job-name": job}
     return p
+
+
+def pvc(name, namespace="shop", size="10Gi", requested=None, storage_class="gp3", phase="Bound", labels=None, annotations=None,
+        owners=None, managers=None, conditions=None, resize_status=None, uid=None):
+    meta = {"name": name, "namespace": namespace, "uid": uid or f"uid-pvc-{name}", "labels": labels or {}, "annotations": annotations or {}}
+    if owners:
+        meta["ownerReferences"] = [{"kind": k, "name": n} for k, n in owners]
+    if managers:
+        meta["managedFields"] = [{"manager": m, "operation": "Apply"} for m in managers]
+    status = {"phase": phase, "capacity": {"storage": size}}
+    if conditions:
+        status["conditions"] = [{"type": c, "status": "True"} for c in conditions]
+    if resize_status:
+        status["allocatedResourceStatuses"] = {"storage": resize_status}
+    return {
+        "kind": "PersistentVolumeClaim",
+        "metadata": meta,
+        "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": storage_class, "resources": {"requests": {"storage": requested or size}}},
+        "status": status,
+    }
+
+
+def storageclass(name="gp3", expansion=True, provisioner="ebs.csi.aws.com"):
+    return {"kind": "StorageClass", "metadata": {"name": name, "annotations": {}}, "provisioner": provisioner, "allowVolumeExpansion": expansion}

@@ -335,6 +335,44 @@ async def get_pvcs(namespace: str, names: list[str]) -> list[dict]:
     return out
 
 
+async def list_pvcs(namespace: str | None = None) -> list[dict]:
+    """`{namespace, name}` of every PVC (in `namespace`, or all). A list the ServiceAccount may not read is empty."""
+    try:
+        raws = await _list_dicts("PersistentVolumeClaim", namespace=namespace)
+    except Exception as exc:  # noqa: BLE001
+        if api_status(exc) in (403, 404):
+            return []
+        raise
+    return [{"namespace": r["metadata"].get("namespace"), "name": r["metadata"].get("name")} for r in raws]
+
+
+async def get_pvc(namespace: str, name: str) -> dict | None:
+    """The PVC as `expand_pvc` judges it, or None when it does not exist."""
+    try:
+        return views.pvc_change_view(await _get_dict("PersistentVolumeClaim", name, namespace))
+    except Exception as exc:  # noqa: BLE001
+        if api_status(exc) == 404:
+            return None
+        raise RuntimeError(f"could not read PersistentVolumeClaim {namespace}/{name}: {safe_error(exc)}") from None
+
+
+async def get_storageclass(name: str | None) -> dict | None:
+    """The StorageClass's view, or None when it is not named or does not exist."""
+    if not name:
+        return None
+    try:
+        return views.storageclass_view(await _get_dict("StorageClass", name))
+    except Exception as exc:  # noqa: BLE001
+        if api_status(exc) == 404:
+            return None
+        raise RuntimeError(f"could not read StorageClass {name}: {safe_error(exc)}") from None
+
+
+async def list_statefulsets(namespace: str) -> list[dict]:
+    """Every StatefulSet in `namespace` as its view (volume claim templates included)."""
+    return [catalog.get("StatefulSet").view(r) for r in await _list_dicts("StatefulSet", namespace=namespace)]
+
+
 # ---------------------------------------------------------------- ownership chain
 
 

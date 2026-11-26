@@ -6765,3 +6765,157 @@ found 0.3.17). Policy and binding `ari-k8s-protected` created; worker env carrie
 ServiceAccount can no longer patch statefulsets. Live, image `2611260419-test`: `rbac`, `refuse_self` (worker
 refused with `protected: true`), `admission_policy` (server dry runs as the SA: kube-system and the worker denied
 by the policy, e2e-plain allowed) all passed. Still open: `delete_pod` rerun once the find_workload fix is deployed.
+
+**delete_pod passes on the fixed build (2026-11-26).** Merge into test `80f1f62`; images ari-k8s-agent-worker and
+ari-agent-api `2611260543-test`. `delete_pod` (67 s, replacement pod named, old uid gone; e2e-plain back to 2/2)
+and `refuse_protected_namespace` passed. With the earlier runs every scenario of the safety build has passed on
+test (21 of 21). Not covered live: in-place `resize_pod` (no scenario in the script; its write path was checked
+on 2026-11-24 before the safety changes).
+PM doc "ARI Kubernetes agent: what you can ask" (Claude Docs, rev 20) updated to match: rollback, image, pause
+and CronJob rows removed; StatefulSet scaling note removed; delete pod never takes the only ready copy; "What it
+does not do" lists the removed changes, the read-only kinds and the protected namespaces/services; Planned keeps
+only disk growth.
+
+**`resize_pod` live scenario (2026-11-26).** The live script had no in-place resize scenario (the 2026-11-24
+check ran propose/apply locally against test, not through the deployed agent). Added `resize_pod`: one
+e2e-plain pod, "resize pod <pod> in namespace ari-k8s-e2e in place: cpu limit 100m"; passes when the result is
+`succeeded`, the pod uid is unchanged, spec and kubelet-reported cpu limit are 100m and restartCount did not
+move; the pod is resized back with kubectl. Run on test against `2611260543-test`: passed in 67 s (tier low,
+restarts 0->0); both e2e-plain pods back at 50m. tests/test_k8s_live_script.py: 59 passed.
+
+## 2026-11-26 - expand_pvc groundwork: a Helm-owned PVC grown by hand breaks the release's next upgrade (II-25740)
+
+**Checked on test** (helm-controller v1.6.3; temporary HelmRelease `e2e-pvchelm`, bjw-s app-template 5.3.0, one
+Deployment mounting a 1Gi gp3 PVC rendered by the chart, in ari-k8s-e2e; removed afterwards, PVC and PV gone).
+`kubectl patch pvc` 1Gi -> 2Gi: capacity 2Gi within seconds (EBS online expansion). Then an unrelated values
+change (a Deployment annotation): the upgrade FAILED, `server-side apply failed ... PersistentVolumeClaim ... is
+invalid: spec.resources.requests.storage: Forbidden: field can not be less than status.capacity`; the release
+went `Stalled=True RetriesExceeded` (revision 2 failed), although the Deployment change itself landed. Raising
+`persistence.data.size` to 2Gi in the values recovered it (revision 3 deployed). So a Helm-rendered PVC may only
+be grown through its chart values (Git); growing it in the cluster stalls every later upgrade of that release
+until Git catches up. A Kustomization-applied PVC fails the same way on its next apply (server-side apply of the
+smaller size; reasoned, not run). PVCs a StatefulSet's volumeClaimTemplates created carry no Helm/Flux
+ownership (test: redis, rabbitmq, loki, vault data) and are not re-applied by Helm or Flux.
+Not checked: stg (helm-controller v1.3.0) and prod (v1.1.0); older Helm uses a three-way merge patch rather than
+server-side apply, which also sends the chart's smaller size.
+
+**The StatefulSet case, run (same day).** Temporary HelmRelease `e2e-stshelm` (app-template 5.3.0 as a
+StatefulSet with a 1Gi `data` claim template; removed afterwards, PVC and PV deleted). The PVC
+`data-e2e-stshelm-0` carries only the chart's template labels (no Helm/Flux marker, no ownerReferences). Grown
+by hand 1Gi -> 2Gi, then an unrelated values change: upgrade succeeded (v2), StatefulSet template still 1Gi, PVC
+still 2Gi. Read-only census (`kubectl get pvc -A`): test, stg and prod have claim-template PVCs without markers
+(rabbitmq, kafka, redis, valkey, loki, alertmanager, temporal-stg-postgres) and Helm/Flux-rendered PVCs (ari-*
+task stores and caches, grafana, prometheus-server, modelserving) plus Kustomization ones (jaeger-badger-data,
+openvpn-pvc). Decision for `expand_pvc`: fail closed - only a PVC that a StatefulSet's volumeClaimTemplates
+created (name `<template>-<statefulset>-<ordinal>` of an existing StatefulSet, no Helm/Flux/Argo marker, no
+other owner) is grown; everything else is refused with "change the size in Git".
+
+**`expand_pvc` built (2026-11-26, last II-25740 phase; uncommitted).**
+- Action `actions/expand_pvc.py`, grow only. Target `PersistentVolumeClaim`; fields `pvc`, `pvc_uid`, `storage`,
+  `workload_kind`/`workload` (the StatefulSet). Eligible only: a StatefulSet claim-template PVC (name
+  `<template>-<sts>-<ordinal>`), no Helm/Flux/Argo label, annotation or field manager, no other owner, StatefulSet
+  and namespace not protected, StorageClass `allowVolumeExpansion`, Bound, not resizing. Size read by code
+  (`policy.requested_storage`: unit required; "by/add/加/增加 N" refused; several sizes need one "to" target
+  and the rest "from"). Cap max(2x capacity, capacity + 50Gi). Tier high; EBS 6-hour note; note that the
+  StatefulSet template keeps its size. Verified by `rollout.wait_pvc_expanded` (`succeeded` /
+  `resize_pending` / `resize_failed` / `pvc_replaced`).
+- `find_workload`: a disk-size request (`policy.asks_disk_size_change`) naming a PVC verbatim resolves to
+  `{"scope": "pvc", ...}` before workloads (the prometheus-server Deployment/PVC collision); a health question
+  about the same name stays with the Deployment. `stepkit.resolved_target` maps the kind to scope `pvc`
+  (check_health treats it as the namespace). `propose_change` plans a PVC without the model
+  (`_propose_pvc`); its tail is now `_proposal(...)`, shared. A disk request about a StatefulSet is refused
+  with its PVC names.
+- New reads `list_pvcs`, `get_pvc` (`views.pvc_change_view`), `get_storageclass`, `list_statefulsets`; tool
+  `wait_pvc_expanded`. Agent card, planner text, capability descriptions, interface doc, README, guide, e2e
+  README updated.
+- Charts branch `II-25740-k8s-agent-expand-pvc` (from main, no upstream), oncallari 0.3.19 (0.3.18 was taken
+  by II-25793): RBAC `patch` on persistentvolumeclaims; the admission policy also matches PVCs and denies a
+  write to a Helm/Flux/Argo-marked PVC and to a PVC named `<anything>-<protected workload>-<n>`.
+  `helm lint` clean. Probe on test (temporary copy of the policy bound to a temporary ServiceAccount
+  `ari-k8s-e2e/vap-probe` with patch on PVCs; all removed after; annotation patches, server dry run only):
+  denied vault/data-vault-0, monitoring/prometheus-server (Helm), monitoring/jaeger-badger-data (Kustomization),
+  insightfinder/ari-k8s-task-store, insightfinder/redis-data-redis-cluster-0 and valkey-data-valkey-primary-0
+  (probe-only protected patterns `redis-cluster`, `valkey-*`); allowed data-rabbitmq-0, storage-loki-0,
+  ashvat-test redis PVC. Which rule produced each denial message was not captured.
+- Live script: scenarios `expand_pvc` (recreates data-e2e-disk-0 at 1Gi first), `refuse_pvc_shrink`,
+  `refuse_pvc_helm`; `admission_policy` also checks a Helm-rendered PVC (denied) and data-e2e-disk-0
+  (allowed); RBAC lists updated. Fixture StatefulSet `e2e-disk` (1 replica, `data` 1Gi) added to fixtures.yaml
+  and applied on test.
+- Review fixes the same day: (1) the PVC shortcut now needs a disk word within 12 characters of the PVC's name
+  ("pvc X", "the disk of X", "X 这个 pvc") and no CPU/memory/replica/limit/ephemeral-storage/disk-pressure words in
+  the request, so "increase the memory limit of grafana to 2Gi, its volume is slow" stays with the Deployment
+  (charts name Deployment and PVC alike: prometheus-server, grafana, ari-coordinator, modelserving). (2) Also
+  refused: a PVC with `kubectl.kubernetes.io/last-applied-configuration` (kubectl apply; a StatefulSet's own PVCs
+  never carry it) and a PVC whose StatefulSet has an owner (an operator may reconcile its PVCs). Read-only check
+  of `get sts -A` on test, stg, prod: no StatefulSet with a claim template has an owner today.
+- Verified: suite on 3.12: 1284 passed, 11 skipped (new tests/test_k8s_expand_pvc.py, 60); a local run against test with my kubeconfig (find_workload +
+  propose_change, real reads and server dry runs, no model): data-e2e-disk-0 1Gi -> 2Gi proposed (high, dry run
+  ok); prometheus-server refused (Flux HelmRelease monitoring/prometheus), jaeger-badger-data refused
+  (Kustomization apps), data-vault-0 refused (protected namespace), shrink and 100Gi (cap 51Gi) refused; a
+  Chinese request for redis-data-redis-cluster-0 -> 10Gi was proposed (dry run only; size still 8Gi after).
+  Not yet: the deployed agent (needs merge, image, chart 0.3.19).
+
+**`expand_pvc` accepts an amount to add (2026-11-26, user).** The user asked why "加 10Gi" was refused; the refusal
+was my own caution, not needed. Now "by/add/+/加/增加/再加 N" is read as relative (`requested_storage(...)["relative"]`):
+the plan adds it to `status.capacity` at proposal time, writes that size (`_quantity`: 30Gi, 1536Mi, or bytes),
+and shows `requested.computed` ("10Gi + 10Gi = 20Gi"); a retried or late approval sets the same size, never adds
+again (drift refuses if the size changed meanwhile). A size to reach and an amount to add in one request are
+refused; "增加到 100Gi" is a size to reach. Cap and grow-only unchanged. "add"/"加" now count as asking for a size
+change. Suite on 3.12: 1295 passed, 11 skipped. Local run against test (dry run only): "by 1Gi" -> 1Gi to 2Gi,
+"增加 512Mi" -> 1Gi to 1536Mi; the PVC still 1Gi.
+
+**EBS limit corrected (2026-11-26).** The proposal's EBS note said "one change about every 6 hours"; that was an old
+rule. AWS docs now (ebs-modify-volume.html, Considerations; re:Post "VolumeModificationRateExceeded"): a size
+increase is usable once the modification reaches `optimizing` (seconds); the next modification of the same
+volume needs the previous one `completed` (optimizing can take minutes to 24 h+, scaling with size), and at most
+four modifications per volume in a rolling 24 hours. The note now says that.
+
+**Audit of AWS/EKS claims against current AWS docs and the clusters (2026-11-26, user asked after the EBS
+6-hour mistake).** Read-only `kubectl` on test, stg, prod, eu, prod-standby, prod-monitoring; AWS docs via the
+AWS documentation search.
+- EBS (docs: ebs-modify-volume.html, re:Post VolumeModificationRateExceeded and "stuck in optimizing"): size
+  usable once `optimizing` (seconds); the filesystem can be extended without waiting; next change after
+  `completed`; 4 per rolling 24 h. The proposal's note matches now. Online expansion with the CSI driver also
+  seen live on test (1Gi -> 2Gi with the pod running).
+- Fixed: the EBS note was shown only for provisioner `ebs.csi.aws.com`; eu's gp3 and every cluster's gp2 use the
+  in-tree name `kubernetes.io/aws-ebs` (migrated to the CSI driver, still EBS). Now both. Test added.
+- Fixed wording: Cluster Autoscaler scale-up failures were called "most often an EC2 quota"; with mostly spot
+  node groups (test mng-spot 8 of 9 nodes, stg 38 of 53, prod 42 of 68) missing instance capacity is as likely,
+  so the text says both (capacity.py, rollout.py). "Every EKS cluster has CA" softened: prod-monitoring has none.
+- resize_pod's comment named prod 1.34 / eu 1.33; now generic. Live versions: test, stg, prod 1.37.3 (user),
+  prod-standby 1.35.9, prod-monitoring 1.34.12, eu 1.33.13 (so in-place resize is refused on eu and
+  prod-monitoring by the 1.35 floor, as intended).
+- Found, not changed: the agent parses `cluster-autoscaler-status` only in the YAML format newer CA writes. test
+  (CA v1.36.1) and prod-standby (v1.35.0) write it; stg (v1.25.0), prod (v1.27.3) and eu (v1.26.2) write the old
+  free-text format, so there the capacity outlook says "Cluster Autoscaler state unknown" (an info risk; no
+  backoff or max-size warnings). Known since the parser was written ("older ones a free-text block ... reported
+  as unrecognised"), but not that stg/prod are on it.
+Suite on 3.12: 1296 passed, 11 skipped.
+
+**Older Cluster Autoscaler status read too (2026-11-26, user).** `capacity.parse_ca_status` falls back to
+`_parse_ca_text` for the free-text format CA 1.25-1.27 writes (stg, prod, eu): node group name, min/max size,
+cloudProviderTarget, registered, health, scale-up state (`Backoff` counts as backoff; this format has no error
+code or message, so the warning says "no detail"), and the cluster-wide scale-up state. A group missing its sizes
+makes the whole status "could not be read completely" rather than half-read. Checked on the live texts
+(`kubectl get cm cluster-autoscaler-status`, read only): stg 11 groups, prod 12, eu 7, every group with sizes
+(e.g. prod webapp 7/15/60, stg webapp 1/8/8 at max). The live texts show only Healthy/NoActivity, so the Backoff
+line in the test fixture follows the format, not an observed backoff. Suite on 3.12: 1298 passed, 11 skipped.
+
+**Security review of the expand_pvc commits (2026-11-26), two fixes, one accepted.**
+- Chart (oncallari 0.3.20, charts branch `II-25740-k8s-agent-pvc-grow-only`; 0.3.19 was merged as PR #115 before this fix): `patch` on PVCs let the ServiceAccount change any PVC field the API
+  allows: labels, annotations, finalizers (dropping `kubernetes.io/pvc-protection`), ownerReferences (a bogus
+  owner gets the PVC garbage-collected, and with reclaimPolicy Delete its volume) or volumeAttributesClassName.
+  The admission policy now allows a PVC UPDATE only when the storage request grows (CEL `quantity(...)
+  .isGreaterThan`) and labels, annotations, ownerReferences, finalizers, volumeAttributesClassName and limits are
+  unchanged. Probe on test (temporary policy copy + ServiceAccount, server dry runs, removed after): 1Gi -> 2Gi
+  and -> 1536Mi allowed; same size, annotation, label, grow + label, finalizers cleared, ownerReference added
+  denied with that message; vault and prometheus-server still denied by their own rules. The live
+  `admission_policy` scenario now dry-runs a larger size (allowed) and an annotation (denied).
+- Code: a PVC name can fit two StatefulSets (`data-a-b-0`: template `data` of `a-b`, or `data-a` of `b`); the
+  first match was taken, possibly the unprotected one. Now every match is collected and more than one is refused.
+  Test added. Suite on 3.12: 1299 passed, 11 skipped.
+- Accepted, not changed: the policy finds a protected StatefulSet's PVCs by name pattern only; a PVC of a
+  protected workload that is neither claim-template-named nor Helm/Flux/Argo-marked passes the policy. The
+  agent's code refuses it (it grows only claim-template PVCs), and with the grow-only rule the most any allowed
+  PVC write can do is make a disk larger.
+

@@ -340,6 +340,34 @@ spec:
             requests: {cpu: 10m, memory: 16Mi}
             limits: {cpu: 50m, memory: 32Mi}
 ---
+# A StatefulSet with a 1Gi claim template: expand_pvc grows its PVC
+# data-e2e-disk-0 (the live scenario recreates it at 1Gi first). Default
+# StorageClass, which must allow volume expansion.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: e2e-disk, namespace: ari-k8s-e2e}
+spec:
+  replicas: 1
+  serviceName: e2e-disk
+  selector: {matchLabels: {app: e2e-disk}}
+  template:
+    metadata: {labels: {app: e2e-disk}}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 1Gi}}
+---
 # One tiny pod per schedulable node.
 apiVersion: apps/v1
 kind: DaemonSet

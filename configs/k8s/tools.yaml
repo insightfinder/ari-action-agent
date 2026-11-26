@@ -87,6 +87,22 @@ tools:
     module: k8s_agent.tools.read
     function: get_pvcs
 
+  list_pvcs:            # namespace/name of every PVC (resolution of a disk-resize request)
+    module: k8s_agent.tools.read
+    function: list_pvcs
+
+  get_pvc:              # one PVC as expand_pvc judges it (size, resize state, who applies it)
+    module: k8s_agent.tools.read
+    function: get_pvc
+
+  get_storageclass:
+    module: k8s_agent.tools.read
+    function: get_storageclass
+
+  list_statefulsets:    # a namespace's StatefulSets with their claim templates
+    module: k8s_agent.tools.read
+    function: list_statefulsets
+
   get_flux_chain:
     module: k8s_agent.tools.read
     function: get_flux_chain
@@ -102,6 +118,10 @@ tools:
   wait_pod_replaced:    # a deleted pod: old uid gone, replacement ready and stable
     module: k8s_agent.tools.rollout
     function: wait_pod_replaced
+
+  wait_pvc_expanded:    # a grown PVC: its capacity reaches the approved size
+    module: k8s_agent.tools.rollout
+    function: wait_pvc_expanded
 
   # ---- writes
   dry_run_patch:        # always dryRun=All — cannot change the cluster

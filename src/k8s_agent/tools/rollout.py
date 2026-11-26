@@ -9,7 +9,7 @@ short timeout would report healthy rollouts as failures.
 Pods that cannot be scheduled are classified from Cluster Autoscaler's
 events and status (see `capacity.classify_pending`): a scale-up in
 progress is waited for; a node group that cannot grow, or provisioning
-that keeps failing (typically an EC2 quota), ends the wait early with the
+that keeps failing (an EC2 quota, or no spot capacity), ends the wait early with the
 reason. Nothing here ever rolls a change back — that is a change of its
 own and needs its own request and approval.
 
@@ -560,3 +560,57 @@ async def wait_pod_replaced(
                 ),
             }
         await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
+
+
+async def wait_pvc_expanded(
+    namespace: str,
+    pvc: str,
+    uid: str,
+    storage: str,
+    max_wait_seconds: float,
+    poll_seconds: float = POLL_SECONDS,
+) -> dict:
+    """Poll after a PVC's size was raised until the volume reports it.
+
+    `succeeded` needs the PVC's own status: its capacity at least the approved size (the storage driver grew the
+    volume and, for a mounted filesystem, the kubelet grew the filesystem). A resize the driver or the kubelet
+    reports as infeasible is `resize_failed`. Still short when the wait ends is `resize_pending`, not a failure:
+    the size is asked for and the volume grows on its own (a volume no pod mounts grows its filesystem when next
+    mounted). The same PVC (uid) throughout, or `pvc_replaced`.
+    """
+    target = quantities.memory_bytes(storage)
+    started = time.monotonic()
+    while True:
+        current = await read.get_pvc(namespace, pvc)
+        if current is None or current.get("uid") != uid:
+            return {
+                "status": "pvc_replaced",
+                "detail": f"PVC {namespace}/{pvc} " + ("no longer exists" if current is None else "was replaced (new uid)") + " after the change.",
+            }
+        observed = {
+            "requested": current.get("requested"),
+            "capacity": current.get("capacity"),
+            "allocated": current.get("allocated") or None,
+            "resize_status": current.get("resize_status"),
+            "conditions": current.get("conditions") or [],
+        }
+        capacity = quantities.memory_bytes(current["capacity"]) if current.get("capacity") else 0
+        if capacity >= target:
+            return {"status": "succeeded", **observed, "detail": f"The volume now has {current.get('capacity')} (asked {storage})."}
+        if str(current.get("resize_status") or "").endswith("Infeasible"):
+            return {
+                "status": "resize_failed",
+                **observed,
+                "detail": f"The resize to {storage} was rejected as infeasible ({current.get('resize_status')}); the volume keeps {current.get('capacity')}.",
+            }
+        if time.monotonic() - started >= max_wait_seconds:
+            return {
+                "status": "resize_pending",
+                **observed,
+                "detail": (
+                    f"{storage} is asked for and the volume still has {current.get('capacity')} after "
+                    f"{int(max_wait_seconds)} s (state: {current.get('resize_status') or ', '.join(observed['conditions']) or 'none reported'}). "
+                    "It grows on its own; a volume no pod mounts grows its filesystem when it is next mounted."
+                ),
+            }
+        await asyncio.sleep(poll_seconds)

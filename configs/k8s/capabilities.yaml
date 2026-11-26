@@ -13,10 +13,10 @@ capabilities:
     description: >
       Resolves which workload (Deployment, StatefulSet, DaemonSet or
       CronJob) or node the request is about (or that it is about a whole namespace or the whole
-      cluster). The answer must exist in the live cluster; ambiguous matches
+      cluster); for a request to resize a disk, the PVC it names. The answer must exist in the live cluster; ambiguous matches
       come back as candidates instead of a guess. Read-only. Almost always
       the first step. Optional param: `namespace`.
-    tools: [list_workloads, list_nodes, llm_complete]
+    tools: [list_workloads, list_nodes, list_pvcs, llm_complete]
     retry:
       max_attempts: 2
       backoff_seconds: 5
@@ -60,8 +60,10 @@ capabilities:
       min or max, CPU/memory requests/limits (rolls its pods), CPU/memory of
       one of its running pods in place (no rollout; needs Kubernetes
       in-place pod resize, read live from the cluster), a rolling restart,
-      deleting one of its pods (never the only ready one). StatefulSets, DaemonSets, CronJobs and nodes
-      are read only: a change to one is refused.
+      deleting one of its pods (never the only ready one); and growing a
+      disk (a PVC a StatefulSet's claim template created, to a size the
+      request names; never smaller). StatefulSets, DaemonSets, CronJobs and nodes
+      are otherwise read only: a change to one is refused.
       Actions without a stated value only when the request itself asks for
       them. Works out the exact change,
       checks it (autoscaler rules, replica floor of 1, node-capacity cap,
@@ -82,6 +84,9 @@ capabilities:
       - get_pod
       - get_resize_support
       - get_workload
+      - get_pvc
+      - get_storageclass
+      - list_statefulsets
       - dry_run_patch
     retry:
       max_attempts: 2
@@ -97,7 +102,7 @@ capabilities:
       cluster state (rollout progress, failing new pods, pods that cannot be
       scheduled and why; for an in-place pod resize, the values the kubelet
       reports as applied on the same pod; for a deleted pod, its replacement
-      ready and stable). Never planned directly — reachable only through
+      ready and stable; for a grown disk, the PVC's capacity). Never planned directly — reachable only through
       the approval of a propose_change proposal.
     tools:
       - get_deployment
@@ -111,6 +116,10 @@ capabilities:
       - wait_rollout
       - wait_resize
       - wait_pod_replaced
+      - get_pvc
+      - get_storageclass
+      - list_statefulsets
+      - wait_pvc_expanded
       - get_flux_chain
     # A second attempt (the worker died, or a read failed, mid-step) finds the
     # approved values already in place and verifies instead of writing again.

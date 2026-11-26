@@ -32,9 +32,9 @@ def resolved_target(ctx: StepContext) -> dict:
         "kind": resolution.get("kind") or "Deployment",
     }
     if target.get("name"):
-        # A Deployment keeps the scope every caller has always seen; a StatefulSet or DaemonSet is a "workload"
-        # (check_health then looks at its namespace).
-        target["scope"] = {"Deployment": "deployment", "Node": "node"}.get(target["kind"], "workload")
+        # A Deployment keeps the scope every caller has always seen; a StatefulSet or DaemonSet is a "workload";
+        # a PVC (resolved only for a disk size change) is "pvc", which check_health reads as its namespace.
+        target["scope"] = {"Deployment": "deployment", "Node": "node", "PersistentVolumeClaim": "pvc"}.get(target["kind"], "workload")
     return target
 
 

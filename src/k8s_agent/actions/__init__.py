@@ -3,10 +3,13 @@
 Removed by decision (2026-11-26, nothing that could break a product environment): rollback, set_image,
 pause/resume_rollout, suspend/resume_cronjob, and every change to a StatefulSet or DaemonSet. See the "Never"
 list in docs/K8S_AGENT_INTERFACE.md.
+
+`expand_pvc` (2026-11-26) is the one change not on a Deployment: it grows a StatefulSet's claim-template PVC.
 """
 
 from .base import ActionSpec, Operation, target_of
 from .delete_pod import DeletePod
+from .expand_pvc import ExpandPvc
 from .resize_pod import ResizePod
 from .restart_rollout import RestartRollout
 from .scale_replicas import ScaleReplicas
@@ -23,6 +26,7 @@ REGISTRY: dict[str, ActionSpec] = {
         ResizePod(),
         RestartRollout(),
         DeletePod(),
+        ExpandPvc(),
     )
 }
 ACTIONS = tuple(REGISTRY)

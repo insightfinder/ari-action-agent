@@ -342,6 +342,25 @@ def test_ca_status_parsing_and_risks():
     assert not capacity.parse_ca_status("free text status").get("available")
 
 
+def test_the_older_text_status_is_read_too():
+    ca = capacity.parse_ca_status(fx.CA_STATUS_TEXT)
+    assert ca["available"] and ca["format"] == "text" and ca["cluster_scale_up_status"] == "InProgress"
+    general, spot = ca["node_groups"]
+    assert (general["name"], general["min_size"], general["target"], general["max_size"], general["registered"]) == (
+        "eks-ng-general-4ecbd857", 0, 6, 50, 6)
+    assert spot["scale_up_status"] == "Backoff" and spot["target"] == spot["max_size"] == 4
+    risks = capacity.ca_risks(ca, 1)
+    assert any(r["level"] == "medium" and "eks-ng-spot-00cbe66c is in scale-up backoff (no detail)" in r["message"] for r in risks)
+    # The general group can still grow, so not every group is at its max.
+    assert not any("Every node group" in r["message"] for r in risks)
+
+
+def test_a_text_status_missing_a_groups_sizes_is_not_half_read():
+    broken = fx.CA_STATUS_TEXT.replace(" (minSize=0, maxSize=50)", "")
+    ca = capacity.parse_ca_status(broken)
+    assert ca["available"] is False and "could not be read completely" in ca["reason"]
+
+
 def test_classify_pending_precedence():
     pending = [{"name": "p1"}]
     ok_ca = capacity.parse_ca_status(fx.CA_STATUS_YAML)
