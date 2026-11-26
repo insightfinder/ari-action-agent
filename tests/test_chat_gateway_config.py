@@ -100,3 +100,39 @@ def test_settings_do_not_read_a_dotenv_file_from_the_working_directory(tmp_path)
     (tmp_path / ".env.chat-gateway").write_text("LLM_API_KEY=from-file\n", encoding="utf-8")
     (tmp_path / ".env").write_text("LLM_API_KEY=from-env-file\n", encoding="utf-8")
     assert GatewaySettings().llm_api_key == ""
+
+
+def test_jenkins_config_is_absent_until_a_jenkins_url_is_set():
+    assert GatewaySettings().jenkins_config() is None
+
+
+def test_jenkins_config_carries_the_address_credentials_and_tls_choice():
+    settings = GatewaySettings(jenkins_url="http://jenkins.example:8080/", jenkins_user="ci", jenkins_token=" t0k \n")
+    assert settings.jenkins_config() == {
+        "base_url": "http://jenkins.example:8080",
+        "auth": {"type": "api_token", "token": "t0k", "user": "ci"},
+        "verify_tls": True,
+    }
+    bearer = GatewaySettings(jenkins_url="https://ci.example", jenkins_token="t", jenkins_auth_type="bearer", jenkins_verify_tls=False)
+    assert bearer.jenkins_config() == {"base_url": "https://ci.example", "auth": {"type": "bearer", "token": "t"}, "verify_tls": False}
+
+
+@pytest.mark.parametrize(
+    "values, message",
+    [
+        ({"jenkins_url": "http://ci.example", "jenkins_user": "ci"}, "JENKINS_TOKEN"),
+        ({"jenkins_url": "http://ci.example", "jenkins_token": "t"}, "JENKINS_USER"),
+        ({"jenkins_url": "ftp://ci.example", "jenkins_user": "ci", "jenkins_token": "t"}, "http or https"),
+        ({"jenkins_url": "https://ci:t@ci.example", "jenkins_user": "ci", "jenkins_token": "t"}, "credentials"),
+        ({"jenkins_url": "https://ci.example", "jenkins_user": "ci", "jenkins_token": "t", "jenkins_auth_type": "oauth"}, "JENKINS_AUTH_TYPE"),
+    ],
+)
+def test_jenkins_config_refuses_incomplete_or_unsafe_settings(values, message):
+    with pytest.raises(ConfigError, match=message):
+        GatewaySettings(**values).jenkins_config()
+
+
+def test_the_jenkins_token_is_masked():
+    shown = GatewaySettings(jenkins_url="https://ci.example", jenkins_user="ci", jenkins_token="secret-token").masked()
+    assert shown["jenkins_token"] == "secr…"
+    assert shown["jenkins_user"] == "ci"

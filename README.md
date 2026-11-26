@@ -106,9 +106,20 @@ ari-action-agent/
 │   ├── chat_gateway/        # Slack/Teams/CLI chat front end
 │   ├── coordinator/         # routes chat requests to the agents
 │   ├── ari_cli/             # the `ari` CLI
+│   ├── mcp_gateway/         # remote MCP server for Claude, Cursor and other AI apps
 │   └── api/                 # thin entrypoints: api.main (A2A server), api.worker (Temporal worker)
 └── tests/
 ```
+
+## Where people use it
+
+The agents are reached the same way from every front end, through the
+[Coordinator](docs/COORDINATOR.md) or a single agent:
+
+- **Slack and Microsoft Teams**: [`docs/CHAT_GATEWAY.md`](docs/CHAT_GATEWAY.md)
+- **A terminal**: the `ari` CLI, [`docs/CLI.md`](docs/CLI.md)
+- **Claude, Cursor, Claude Code and other MCP apps**: a remote MCP server with GitHub sign-in,
+  [`docs/MCP_GATEWAY.md`](docs/MCP_GATEWAY.md)
 
 ## Extending it
 

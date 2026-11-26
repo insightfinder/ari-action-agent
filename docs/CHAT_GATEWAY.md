@@ -92,6 +92,7 @@ Set `SLACK_SESSION_FILE` so a restart does not lose the conversations. In the im
 | `ARI_AGENT_URL`, `ARI_API_KEY` | Where requests go and the key for it: an agent's A2A endpoint and one of its `AGENT_API_KEYS`, or, to reach several agents from one chat, the [Coordinator](COORDINATOR.md) and one of its keys. |
 | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL` | Sent with every request; the agent has no model key of its own. |
 | `GITHUB_PAT` | Lets the agent push branches and open pull requests. |
+| `JENKINS_URL`, `JENKINS_USER`, `JENKINS_TOKEN` | The Jenkins the [Jenkins agent](../src/jenkins_agent) works on, sent with every request as its `jenkins` block. Empty `JENKINS_URL`: no Jenkins. `JENKINS_AUTH_TYPE` is `api_token` (default), `basic` or `bearer` (no user); `JENKINS_VERIFY_TLS=false` accepts a self-signed certificate. Through the Coordinator, only an agent whose `forward_config` lists `jenkins` receives it. |
 | `DEFAULT_REPO_URL`, `DEFAULT_REPO_REF` | The repository used when a message names none. |
 | `REPO_MAP` | Per-channel repositories, `C0123=https://github.com/org/a,C0456=https://github.com/org/b`. |
 | `ALLOWED_REPO_HOSTS` | Hosts a `repo=` URL may point at. The token is never sent anywhere else. Default `github.com`. |
