@@ -123,7 +123,7 @@ def _capability_tools(capability):
     return spec[capability]["tools"]
 
 
-def _ctx(capability, prompt, results=None, params=None, llm=None, confirmed=False, options=None):
+def _ctx(capability, prompt, results=None, params=None, llm=None, confirmed=False, options=None, attempt=None):
     return StepContext(
         request_id="req-k8s",
         workspace="/tmp/ws",
@@ -135,6 +135,7 @@ def _ctx(capability, prompt, results=None, params=None, llm=None, confirmed=Fals
         tools=_tools(_capability_tools(capability), llm),
         confirmed=confirmed,
         step_deadline_seconds=900,
+        attempt=attempt,
     )
 
 
@@ -721,6 +722,40 @@ async def test_a_patch_call_that_errors_is_judged_by_the_cluster(cluster, landed
     else:
         with pytest.raises(RuntimeError, match="read timed out"):
             await apply_approved_change.run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_autoscaler_bounds_someone_else_already_set_are_not_reported_as_applied(cluster):
+    from common.capabilities_base import StepRefused
+
+    pa = await _proposal(
+        cluster, "set the KEDA max replicas to 10 for worker",
+        _change(action="set_autoscaler_bounds", max=10, max_quote="max replicas to 10"), "worker",
+    )
+    so = next(o for o in cluster.objects["ScaledObject"] if o["metadata"]["name"] == "worker-so")
+    so["spec"]["maxReplicaCount"] = 10
+    so["metadata"]["generation"] = (so["metadata"].get("generation") or 1) + 1
+    ctx = _ctx("apply_approved_change", "", params=pa, confirmed=True, attempt=1)
+    with pytest.raises(StepRefused, match="already holds what was approved, done by someone else"):
+        await apply_approved_change.run(ctx)
+    assert not [p for p in cluster.patches if not p["dry_run"]]
+
+
+@pytest.mark.asyncio
+async def test_resources_someone_else_already_set_are_not_reported_as_applied(cluster):
+    from common.capabilities_base import StepRefused
+
+    pa = await _proposal(
+        cluster, "set memory limit to 3Gi on checkout",
+        _change(action="set_resources", container="app", resources={"limits": {"memory": {"value": "3Gi", "quote": "limit to 3Gi"}}}),
+        "checkout",
+    )
+    dep = next(d for d in cluster.objects["Deployment"] if d["metadata"]["name"] == "checkout")
+    dep["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"] = "3Gi"
+    ctx = _ctx("apply_approved_change", "", params=pa, confirmed=True, attempt=1)
+    with pytest.raises(StepRefused, match="container app resources changed since the proposal; it already holds what was approved"):
+        await apply_approved_change.run(ctx)
+    assert not [p for p in cluster.patches if not p["dry_run"]]
 
 
 @pytest.mark.asyncio

@@ -97,6 +97,30 @@ def test_the_disk_fixture_makes_the_pvc_the_scenarios_name():
     assert template["spec"]["resources"]["requests"]["storage"] == "1Gi"
 
 
+def test_the_late_approval_volume_uses_the_fixtures_own_storageclass():
+    fixtures = _fixtures()
+    sc = fixtures[("StorageClass", live.VOL_CLASS)]
+    assert sc["allowVolumeExpansion"] is True and "namespace" not in sc["metadata"]
+    sts = fixtures[("StatefulSet", live.VOL_STS)]
+    [template] = sts["spec"]["volumeClaimTemplates"]
+    assert sts["metadata"]["namespace"] == live.NAMESPACE
+    assert f"{template['metadata']['name']}-{live.VOL_STS}-0" == live.VOL_PVC
+    assert template["spec"]["storageClassName"] == live.VOL_CLASS
+
+
+def test_the_ambiguous_statefulset_would_name_the_disk_pvc():
+    """late_pvc_ambiguous creates StatefulSet AMBIGUOUS_STS with claim template `data-e2e`: its PVC 0 must be
+    named exactly like the disk fixture's, and no fixture may already be called that."""
+    assert f"data-e2e-{live.AMBIGUOUS_STS}-0" == live.DISK_PVC
+    assert ("StatefulSet", live.AMBIGUOUS_STS) not in _fixtures()
+
+
+def test_the_memory_fixture_restarts_on_a_memory_resize():
+    """late_resize_pod_usage resizes e2e-memuse's memory in place; resize_pod refuses that under NotRequired."""
+    [container] = _fixtures()[("Deployment", "e2e-memuse")]["spec"]["template"]["spec"]["containers"]
+    assert {"resourceName": "memory", "restartPolicy": "RestartContainer"} in container["resizePolicy"]
+
+
 def test_the_cronjob_fixture_never_fires_on_its_own_and_its_job_ends():
     cron = _fixtures()[("CronJob", "e2e-cron")]
     assert cron["metadata"]["namespace"] == live.NAMESPACE and cron["spec"]["schedule"] == "0 0 1 1 *"
@@ -106,3 +130,20 @@ def test_the_cronjob_fixture_never_fires_on_its_own_and_its_job_ends():
 
 def test_every_scenario_says_what_it_checks():
     assert all((fn.__doc__ or "").strip() for fn in live.SCENARIOS.values())
+
+
+_FAILED = "Completing activity as failed ({'activity_id': '3', 'attempt': 1, 'workflow_id': '%s', 'workflow_type': 'AriAgentWorkflow'})"
+
+
+def test_a_refusal_is_read_from_the_worker_log_in_either_shape():
+    old = "\n".join([_FAILED % "t-1", "Traceback (most recent call last):", '  File "x.py", line 1, in run',
+                     "RuntimeError: apply_approved_change: the cluster changed (a). Nothing was changed."])
+    new = "\n".join([_FAILED % "t-2", "Traceback (most recent call last):",
+                     "common.capabilities_base.StepRefused: apply_approved_change: the cluster changed (b). Nothing was changed.",
+                     "", "The above exception was the direct cause of the following exception:", "",
+                     "temporalio.exceptions.ApplicationError: StepRefused: apply_approved_change: the cluster changed (b). Nothing was changed."])
+    other = "\n".join([_FAILED % "t-3", "RuntimeError: apply_approved_change: someone else's task."])
+    logs = "\n".join([old, new, other])
+    assert live._refusals_in(logs, "t-1") == ["the cluster changed (a). Nothing was changed."]
+    assert live._refusals_in(logs, "t-2") == ["the cluster changed (b). Nothing was changed."]
+    assert live._refusals_in(logs, "t-9") == []

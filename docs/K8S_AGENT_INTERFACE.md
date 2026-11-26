@@ -68,15 +68,21 @@ UIE (`ran`).
   or restarted again). **Added II-25740.** The other actions keep their statuses.
 - `status` for `restart_rollout` (II-25740): `succeeded`, `in_progress`, `new_pods_failing`, `rollout_failed`,
   `unschedulable`. `delete_pod`: `succeeded` (the old uid is gone and a replacement is ready and stable;
-  `verification.replacement` names it), `in_progress`, `new_pods_failing`, `unschedulable`. A pod that was
-  already gone or replaced when the approval arrived counts as done: `applied.already_at_target` is true and
-  nothing is deleted.
+  `verification.replacement` names it), `in_progress`, `new_pods_failing`, `unschedulable`. A pod already
+  gone or terminating when the approval arrives was deleted by someone else: refused (see below).
 - `status` for `expand_pvc` (2026-11-26): `succeeded` (the PVC's `status.capacity` reached the size;
   `verification.capacity`), `resize_pending` (asked for, the volume has not reached it within the wait; it
   grows on its own, a volume no pod mounts when next mounted; a `ControllerResizeError` / `NodeResizeError`
   condition is named in `verification.detail`, and the resizer retries it), `resize_failed` (the driver or kubelet reported
   it infeasible), `pvc_replaced` (the PVC was deleted or replaced while watched). A PVC already asking for the
-  size when the approval arrived counts as done (`applied.already_at_target`).
+  size when the approval arrives was grown by someone else: refused (see below).
+- Done by someone else (2026-11-26, every action): when the approval arrives and the target already holds what
+  was approved (replicas at the number, the container's resources, the autoscaler bounds, the pod's resources,
+  the PVC's size, the pod gone), someone else did it and this agent did nothing, so the approval is refused (the
+  step fails; the reason says "it already holds what was approved, done by someone else, not this agent"),
+  never reported as this agent's change. Only a retried attempt of the step, after its own first attempt may
+  have written (the worker was lost), finds the change in place and verifies it: `applied.already_at_target`
+  is true. A restart cannot be done by someone else: its approved `restartedAt` is the proposal's own.
 - An approval is not applied (the step fails, nothing is written) when its target has become protected, when
   its kind is no longer changed (a StatefulSet or DaemonSet restart, or a delete of such a pod, proposed before
   2026-11-26), for an action that no longer exists, when the proposal is older than `proposal_max_age_hours`,
@@ -328,6 +334,12 @@ Recorded for their owners; not changed from this repository.
   proposed restart (`snapshot.revision`), or when a PVC's StorageClass no longer allows expansion or it is no
   longer `Bound`; `applied.changed_since_proposal` on an already-applied result. The `expand_pvc` write carries
   the PVC's uid (`metadata.uid` in the patch). Additive; nothing removed or renamed.
+- **2026-11-26, II-25740** — an approval whose target already holds the approved result, done by someone else
+  (a pod already deleted, replicas/resources/bounds/size already set), is refused instead of reported as
+  `succeeded` with `applied.already_at_target` (user decision, every action); only a retried attempt after the
+  step's own write still verifies and sets `already_at_target`. Refusals at approval are no longer retried by
+  the worker (one attempt, not two). The too-old refusal states ages as "40 seconds", "12 minutes", "25.5
+  hours". No field added or removed; such an approval now ends as a failed task with no `action_result`.
 - **2026-11-26, II-25740** — lowering CPU/memory (`set_resources`, `resize_pod`): a memory decrease below 1.2 x the
   container's current usage, or with no usage to read, is refused, at proposal and at approval; any decrease is
   `high`; `set_resources` under Recreate is `high`. `propose_change` and `apply_approved_change` read

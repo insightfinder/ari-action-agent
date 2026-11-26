@@ -231,8 +231,9 @@ def _step_payload(tmp_path, results):
 class _Info:
     """Enough of `activity.info()` for execute_step."""
 
-    def __init__(self, start_to_close):
+    def __init__(self, start_to_close, attempt=1):
         self.start_to_close_timeout = start_to_close
+        self.attempt = attempt
 
 
 @pytest.mark.asyncio
@@ -318,6 +319,49 @@ async def test_the_step_is_told_the_activitys_own_deadline(tmp_path, monkeypatch
     await activities.execute_step(_step_payload(tmp_path, {}))
 
     assert seen["deadline"] == 44.86
+
+
+@pytest.mark.asyncio
+async def test_the_step_is_told_which_attempt_it_is(tmp_path, monkeypatch):
+    # apply_approved_change tells "nothing of this step has run yet" (attempt 1) from a retry.
+    seen = {}
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=60), attempt=2))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+
+    async def capture(name, ctx):
+        seen["attempt"] = ctx.attempt
+        return {}
+
+    monkeypatch.setattr(activities, "run_capability", capture)
+    await activities.execute_step(_step_payload(tmp_path, {}))
+
+    assert seen["attempt"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_is_reported_as_not_retryable(tmp_path, monkeypatch):
+    from temporalio.exceptions import ApplicationError
+
+    from common.capabilities_base import StepRefused
+
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=60)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+    monkeypatch.setattr(activities, "run_capability", AsyncMock(side_effect=StepRefused("the target moved. Nothing was changed.")))
+
+    with pytest.raises(ApplicationError) as raised:
+        await activities.execute_step(_step_payload(tmp_path, {}))
+    assert raised.value.non_retryable is True and raised.value.type == "StepRefused"
+    assert raised.value.message == "the target moved. Nothing was changed."
+
+
+@pytest.mark.asyncio
+async def test_any_other_error_stays_retryable(tmp_path, monkeypatch):
+    monkeypatch.setattr(activities.activity, "info", lambda: _Info(timedelta(seconds=60)))
+    monkeypatch.setattr(activities.activity, "heartbeat", lambda *a: None)
+    monkeypatch.setattr(activities, "run_capability", AsyncMock(side_effect=RuntimeError("read timed out")))
+
+    with pytest.raises(RuntimeError, match="read timed out"):
+        await activities.execute_step(_step_payload(tmp_path, {}))
 
 
 @pytest.mark.asyncio

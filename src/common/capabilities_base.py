@@ -17,6 +17,12 @@ _OPENCODE_CAPABILITIES = {
 }
 
 
+class StepRefused(RuntimeError):
+    """A capability's deliberate refusal, decided from its inputs and the state it read: running it again
+    would refuse again, or worse, find a state that a refusal moments earlier ruled out and act on it. The
+    activity reports it as a non-retryable failure, so the step's retry policy never re-runs it."""
+
+
 @dataclass
 class StepContext:
     request_id: str
@@ -48,6 +54,9 @@ class StepContext:
     # `timeout_seconds`: Temporal clamps start_to_close down to whatever the
     # pipeline budget has left, and the guard has to track the smaller one.
     step_deadline_seconds: float | None = None
+    # The Temporal attempt this step is running as (1 for the first), from `activity.info()`; None outside
+    # an activity. A capability that writes can tell from it that no earlier attempt of the step has run.
+    attempt: int | None = None
 
     def tool(self, name: str) -> Callable:
         return self.tools[name]

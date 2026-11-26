@@ -9,10 +9,11 @@ from dataclasses import replace
 
 import structlog
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from common import tracing
 from common.agent_meta import get_agent_meta
-from common.capabilities_base import StepContext
+from common.capabilities_base import StepContext, StepRefused
 from common.capabilities_registry import get_capability, run_capability
 from common.planner import create_plan
 from common.sandbox import cleanup_workspace as _cleanup_workspace
@@ -237,6 +238,7 @@ async def execute_step(payload: dict) -> dict:
         step_deadline_seconds=(
             info.start_to_close_timeout.total_seconds() if info.start_to_close_timeout else None
         ),
+        attempt=info.attempt,
     )
     logger.info("execute_step", request_id=ctx.request_id, capability=payload["capability"])
 
@@ -245,7 +247,11 @@ async def execute_step(payload: dict) -> dict:
         try:
             with _activity_span(f"capability:{ctx.capability}", ctx.config) as span:
                 await _reclone_if_the_sandbox_is_gone(ctx)
-                result = await run_capability(payload["capability"], ctx)
+                try:
+                    result = await run_capability(payload["capability"], ctx)
+                except StepRefused as exc:
+                    # Not retried: the same step would refuse again, or act on a state its refusal ruled out.
+                    raise ApplicationError(str(exc), type="StepRefused", non_retryable=True) from exc
                 _describe_step_result(span, result)
         except Exception as exc:
             # The workflow falls back to a canned reply once `respond` is out
