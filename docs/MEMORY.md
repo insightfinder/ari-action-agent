@@ -6161,3 +6161,65 @@ skipped); HelmRelease reports `Helm upgrade succeeded ... oncallari@0.3.20`; Clu
 Not run live: the text-format Cluster Autoscaler status (test runs CA 1.36, YAML format); covered by unit tests
 and the read-only parse of the stg/prod/eu texts above. `data-e2e-disk-0` is left at 2Gi (the scenario recreates
 it at 1Gi on its next run).
+
+
+## 2026-11-26 - II-25740 branch review: fixes, and approvals that arrive late
+
+Full review of the branch against `origin/main` (code-review pass plus a manual read of the write path, RBAC
+three ways: code, docs/examples/k8s-rbac.yaml, oncallari 0.3.20). Write path held: target kind and protection
+re-checked at approval, `patch_workload` only on `apply_approved_change`, RBAC identical in all three. Fixed:
+
+- **Intent gates.** `asks_restart` / `asks_delete_pod` took health reports and questions as requests
+  ("pod 重启了很多次，请检查" passed both; "why does it restart?", "rollout restart failed" passed restart). The
+  verbs now exclude `restart failed/failing/errors`, `重启了很多次/好几次/N 次`, `重启失败/不了`; the words right
+  before the verb are checked for negations and for reports or questions (`why`, `does it`, `为什么`, `一直在`,
+  `反复`, `正在`, `在`; `现在重启` still counts; a question word followed by "and"/"then"/a comma before the verb
+  does not count: "check why it fails and restart checkout" is a request). The delete-pod patterns are split per word order so the check
+  looks before the verb itself: "checkout-1 这个 pod 不要删掉" used to count as a request.
+- **PVC names in the disk check.** `asks_disk_size_change(prompt, names)` leaves the PVC names and namespaces out
+  (namespace `memory-db` had the same problem) before looking
+  for cpu/memory/replicas/limit words: `redis-data-redis-replicas-0` (Bitnami Redis) could never be grown. None
+  of the PVC names on test/stg/prod hit it (checked read-only). find_workload lists PVCs once a disk word
+  appears (a failed list only skips the PVC match), then judges without their names.
+- **expand_pvc write carries the PVC's uid** (`metadata.uid` in the merge patch). Checked on test with server
+  dry runs as `system:serviceaccount:insightfinder:ari-k8s` on `data-e2e-disk-0`: matching uid allowed through
+  RBAC and the admission policy, a different uid answered 422 `metadata.uid ... field is immutable`; nothing
+  written (still 2Gi).
+- `wait_pvc_expanded`: a `ControllerResizeError` / `NodeResizeError` at the end of the wait is named in the
+  `resize_pending` detail (the resizer retries; EBS waits out its modification cooldown) instead of "it grows
+  on its own".
+- find_workload lists nodes only after no single workload settled the request, and a failed node list only
+  loses the node match.
+- expand_pvc on a chart whose ServiceAccount cannot read StatefulSets/StorageClasses (older than 0.3.14) is a
+  refusal naming the rule, not a raw 403.
+- Removed what only the dropped actions used: `create` verb, `Kube.create`, JSON patch, the async
+  `build_operations` hook, the fake's RFC 6902 support and their tests; non-Deployment branches in
+  restart_rollout/delete_pod. Stale comments (rollback, StatefulSet pod names, CronJob suspend) and
+  DEVELOPER_GUIDE's "rolled-back image" fixed. `resize_pod.plan`'s local `policy` renamed (it shadowed the
+  module). Test files renamed to what they hold now: `test_k8s_cronjob_read_only.py`,
+  `test_k8s_nodes_read_only.py` (plain `mv`, not staged). Sync tests no longer carry the module asyncio mark.
+
+**Late approvals (user question).** An approval can arrive hours later; image automation, a Helm upgrade or a
+person may have moved the target. What each action already compared: replicas, the container's whole
+resources dict, autoscaler identity/bounds/generation, restartedAt/paused/strategy, pod uid and siblings'
+readiness, PVC uid/requested size/eligibility. Added:
+- Deployment uid in every Deployment action's snapshot (`deployment_uid`): deleted and made again is refused.
+- restart_rollout snapshots the Deployment's `deployment.kubernetes.io/revision` (new `revision` in the
+  Deployment view): a rollout since the proposal already replaced the pods, so the restart is refused. Its own
+  retried write still verifies (the write moves restartedAt, so `at_target` holds).
+- expand_pvc re-checks at approval that the PVC is Bound and its StorageClass still allows expansion.
+- A scale-up is refused when its containers' CPU/memory changed since the proposal (its estimate of where the
+  new pods fit was made from the old requests); a scale-down does not depend on them and still applies.
+- `options.proposal_max_age_hours` (default 24, read from the approving request; 0 off): an older proposal is
+  refused before any write, but a retry whose earlier attempt already wrote still verifies. The on-call path
+  (mcp-service) closes its approval window after 25 minutes anyway; this covers chat and direct A2A callers.
+- An already-applied result lists `applied.changed_since_proposal` (the drift found).
+Deliberately still not compared: the Deployment's generation/image for scale and resources changes (image
+automation bumps it several times an hour, see 2026-10-13), and the cluster's free capacity (nodes come and go;
+a scale-up that no longer fits shows as `unschedulable` at verification).
+
+Verified: suite on Python 3.12, 1332 passed, 11 skipped, 2 failed — `test_a2a_agent_card` and
+`test_a2a_executor`, which fail the same way on `origin/main` and pass alone (test-order leak, not this branch).
+Not run: the live e2e script (needs a merge into test and a deploy). Docs: K8S_AGENT_INTERFACE.md (request
+option, refusal list, change log), DEVELOPER_GUIDE.md. Open, other repo: insightfinder-mcp-service still lists
+only three action names in `KUBERNETES_CHANGE_ACTIONS` and maps none of the new statuses.
