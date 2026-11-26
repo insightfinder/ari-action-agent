@@ -200,6 +200,16 @@ async def test_a_namespace_named_like_a_common_word_is_not_picked_from_inside_an
 
 
 @pytest.mark.asyncio
+async def test_a_pod_named_in_a_namespace_that_shares_a_deployments_name_resolves_to_the_pods_owner(cluster):
+    cluster.objects["Deployment"] += [fx.deployment("shop", namespace="shop")]
+    llm = ScriptedLLM()
+    prompt = f"delete pod checkout-{fx.TEMPLATE_HASH}-x2k4q in namespace shop"
+    result = await find_workload.run(_ctx("find_workload", prompt, llm=llm))
+    assert result["resolution"] == {"scope": "deployment", "namespace": "shop", "name": "checkout"}
+    assert llm.prompts == []
+
+
+@pytest.mark.asyncio
 async def test_find_workload_still_shortcuts_a_deployment_named_like_its_namespace(cluster):
     cluster.objects["Deployment"] += [fx.deployment("cert-manager", namespace="cert-manager")]
     llm = ScriptedLLM()

@@ -160,7 +160,13 @@ async def run(ctx: StepContext) -> dict:
     by_label = {_label(w): w for w in workloads}
     namespaces = {w["namespace"] for w in workloads}
 
-    hits = _prefer_namespace(_mentioned(ctx.prompt, workloads) or _pods_mentioned(ctx.prompt, workloads), ctx.prompt, default_ns)
+    named = _mentioned(ctx.prompt, workloads)
+    pods = _pods_mentioned(ctx.prompt, workloads)
+    # "delete pod e2e-plain-<hash>-<id> in namespace ari-k8s-e2e" names a pod; a Deployment that happens to share
+    # the namespace's name is mentioned only as that namespace.
+    if pods and all(h["name"] in namespaces and _names_namespace(ctx.prompt, h["name"]) for h in named):
+        named = []
+    hits = _prefer_namespace(named or pods, ctx.prompt, default_ns)
     nodes = _nodes_mentioned(ctx.prompt, await ctx.tool("list_nodes")())
     node = nodes[0] if len(nodes) == 1 else None
     # One workload named verbatim settles it without the model, unless the prompt uses that name for a
