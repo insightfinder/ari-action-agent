@@ -6745,3 +6745,23 @@ resize_pod, restart_rollout, delete_pod (Deployments only). Suite on 3.12: 1216 
 - `delete_pod` approval: a pod delete proposed before 2026-11-26 for a StatefulSet's or DaemonSet's pod has
   target kind `Pod`, which the target-kind guard lets through; its drift check now refuses unless the pod's
   owner (and the proposal's `workload_kind`) is a Deployment. Test added. Suite on 3.12: 1217 passed, 11 skipped.
+
+**Safety build e2e on test (2026-11-26, image `2611260419-test`, chart still 0.3.16).** 18 scenarios with
+`--allow-writes`: 17 passed (health, health_statefulset, health_cronjob, health_node, refuse_managed,
+refuse_zero, high_replicas, drift, persist, scale, keda_max, hpa_min, restart_deployment, refuse_node_change,
+node_beside_workload, refuse_statefulset_change, refuse_protected_namespace). Fixtures back to e2e-plain 2,
+e2e-keda 1/3, e2e-hpa 1/3. `delete_pod` failed: "delete pod e2e-plain-<hash>-<id> in namespace ari-k8s-e2e" came
+back "Which workload to change is not clear; candidates: ari-k8s-e2e/ari-k8s-e2e". Cause in `find_workload`: a
+workload named verbatim was looked for before a pod name, and the fixture Deployment `ari-k8s-e2e` (named like
+its namespace; re-applied 2026-11-25, after the last delete_pod pass) matched the namespace in the prompt, so the
+pod's name was never looked at. Fix: when every workload-name hit is only the prompt's namespace, a pod named
+verbatim decides. Test added (fails without the fix). Suite on 3.12: 1218 passed, 11 skipped. Not yet verified
+live (needs a new image); `rbac`, `refuse_self` and `admission_policy` wait for chart 0.3.17 with
+`admissionPolicy: true` in test-fluxcd.
+
+**Chart 0.3.17 on test (2026-11-26).** test-fluxcd `41cc16cd`: ari-k8s on oncallari 0.3.17 with
+`ariK8sAgent.protection.admissionPolicy: true` (the HelmRepository index had to be refreshed before the release
+found 0.3.17). Policy and binding `ari-k8s-protected` created; worker env carries both protection lists; the
+ServiceAccount can no longer patch statefulsets. Live, image `2611260419-test`: `rbac`, `refuse_self` (worker
+refused with `protected: true`), `admission_policy` (server dry runs as the SA: kube-system and the worker denied
+by the policy, e2e-plain allowed) all passed. Still open: `delete_pod` rerun once the find_workload fix is deployed.
