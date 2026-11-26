@@ -1012,6 +1012,36 @@ def scenario_set_image_statefulset(args):
     return _set_image(args, "statefulset", "e2e-sts")
 
 
+def _sts_replicas(name: str) -> int:
+    return int(_kubectl("-n", NAMESPACE, "get", "statefulset", name, "-o", "jsonpath={.spec.replicas}") or 0)
+
+
+def _pvc_exists(name: str) -> bool:
+    return bool(_kubectl("-n", NAMESPACE, "get", "pvc", "--ignore-not-found", name, "-o", "name"))
+
+
+def scenario_scale_statefulset(args):
+    """Scale the StatefulSet e2e-sts-pvc from 1 to 2 (a new pod and its PVC), then back to 1 (high risk; the
+    PVC of the removed pod is kept), each verified by the StatefulSet's own counts."""
+    sts, claim = "e2e-sts-pvc", "data-e2e-sts-pvc-1"
+    try:
+        ok, pending, result, note = _round_trip(args, f"scale the statefulset {sts} in namespace {NAMESPACE} to 2 replicas", "scale_replicas")
+        pending = pending or {}
+        said = any(claim in n for n in pending.get("notes") or []) or any(claim in r.get("message", "") for r in pending.get("risks") or [])
+        shape = (pending.get("target") or {}).get("kind") == "StatefulSet" and pending.get("risk_tier") in ("medium", "high") and said
+        if not ok:
+            return (False if ok is False else (shape and _sts_replicas(sts) == 1)), f"{note}; proposal_shape={shape}"
+        up = shape and result.get("status") == "succeeded" and _sts_replicas(sts) == 2 and _pvc_exists(claim)
+        ok2, pending2, result2, note2 = _round_trip(args, f"scale the statefulset {sts} in namespace {NAMESPACE} to 1 replica", "scale_replicas")
+        pending2 = pending2 or {}
+        high = pending2.get("risk_tier") == "high" and any("kept with their data" in n for n in pending2.get("notes") or [])
+        down = bool(ok2) and high and result2.get("status") == "succeeded" and _sts_replicas(sts) == 1 and _pvc_exists(claim)
+        return up and down, f"{note}; up={up}; {note2}; down={down} (tier {pending2.get('risk_tier')}, {claim} kept={_pvc_exists(claim)})"
+    finally:
+        if args.allow_writes and _sts_replicas(sts) != 1:
+            _kubectl("-n", NAMESPACE, "scale", "statefulset", sts, "--replicas=1")
+
+
 def _paused(name: str) -> bool:
     return _kubectl("-n", NAMESPACE, "get", "deploy", name, "-o", "jsonpath={.spec.paused}") == "true"
 
@@ -1266,6 +1296,7 @@ SCENARIOS = {
     "rollback_revision": scenario_rollback_revision,
     "set_image": scenario_set_image,
     "set_image_statefulset": scenario_set_image_statefulset,
+    "scale_statefulset": scenario_scale_statefulset,
     "pause_resume": scenario_pause_resume,
     "health_cronjob": scenario_health_cronjob,
     "suspend_resume_cronjob": scenario_suspend_resume_cronjob,

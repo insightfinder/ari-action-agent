@@ -520,7 +520,9 @@ a request never carries cluster credentials.
   image pull failures, unschedulable pods, restarts, warning events, usage
   near limits — plus the gaps it could not check. Artifact: `health_report`.
 - **Changes**, always proposed first and applied only after approval:
-  - replica count of a Deployment that no autoscaler manages;
+  - replica count of a Deployment or StatefulSet that no autoscaler manages
+    (nor, for a StatefulSet, an operator that owns it; a StatefulSet
+    scale-down is `high` risk and refused where it would delete PVCs);
   - min and/or max of the KEDA ScaledObject or HPA that manages a
     Deployment — **only when the request names the autoscaler and the
     values** (a plain "scale X to 5" on a managed Deployment is refused,

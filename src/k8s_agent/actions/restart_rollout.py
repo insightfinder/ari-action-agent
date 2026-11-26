@@ -98,6 +98,7 @@ class RestartRollout(ActionSpec):
     )
     # Deployments are patched with the rule every chart has; StatefulSets and DaemonSets need the newer one.
     rbac_rule = 'patch on "statefulsets" and "daemonsets" (apps group; the oncallari chart grants it from 0.3.15)'
+    rbac_rule_kinds = ("StatefulSet", "DaemonSet")
 
     def accepts(self, prompt):
         return policy.asks_restart(prompt)

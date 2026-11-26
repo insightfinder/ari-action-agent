@@ -5812,3 +5812,46 @@ unchanged. Its rerun went through propose_change, which refused with "This agent
 paths seen. Final: 6 scenarios, 0 failed (health and refuse_node_change on the rerun). The product-facing
 capability list for PMs is a Claude Docs doc ("ARI Kubernetes agent: what you can ask"), test capabilities only
 plus a Planned section.
+
+**StatefulSet replica scaling built (2026-11-25, II-25740).** Next phase of the plan, kept inside
+`scale_replicas` (no new action name): `workload_kinds`/`target_kinds` are Deployment and StatefulSet (a
+DaemonSet is not scaled). A StatefulSet is written as a merge patch of `spec.replicas` on the StatefulSet
+itself, with `patch statefulsets` from oncallari 0.3.15, so no chart change (the `statefulsets/scale`
+subresource would have needed a new rule); a Deployment still goes through `deployments/scale`. Refused for a
+StatefulSet: an HPA/KEDA ScaledObject that targets it (`governance.find_autoscaler` and `read.find_autoscaler`
+now take the target kind; the refusal points at the autoscaler's own definition, since `set_autoscaler_bounds`
+is Deployment-only), a controller `ownerReference` (an operator's CR would reset the count; new view field
+`controller`), and a scale-down under `persistentVolumeClaimRetentionPolicy.whenScaled: Delete` (it would
+delete PVCs, which the Never list forbids). Tier `medium` up, `high` down. Risks/notes name the pods by ordinal
+(`ordinals_start`), the PVCs a scale-up creates from the volume claim templates or mounts again with old data
+(medium risk; a PVC list read through the new `ActionSpec.plan_inputs` hook, propose side only, so an approval
+never depends on it; `list_views` added to propose_change's tools), the PVCs a scale-down keeps, and not-ready
+pods under OrderedReady (the controller waits for them). The approval re-checks count, autoscaler, controller,
+retention policy and uid. Verified by `rollout.replicas_reached` (observed generation current, `spec.replicas`,
+`status.replicas` and ready all at the target; `status.replicas` still counts a terminating pod) inside
+`wait_workload_rollout` for a `{"kind": "replicas"}` target, not by `workload_rolled_out`, which would never
+finish for a StatefulSet with a pending template update. Proposals now carry `workload_kind`/`workload` on
+every scale; old Deployment proposals (only `deployment`, `snapshot.deployment_replicas`) still apply (test).
+`_SCALE_DOWN_PDB` no longer says "ReplicaSet". Checked on test (read-only): e2e-sts status carries replicas,
+readyReplicas, current/updateRevision; every StatefulSet on test has Retain/Retain and no controller owner;
+storage class gp3 is the default. New e2e fixture `e2e-sts-pvc` (1 replica, 1Gi PVC template; `volumeClaimTemplates`
+is immutable, so not added to e2e-sts) and live scenario `scale_statefulset` (1 -> 2 -> 1; checks the PVC
+named in the proposal, tier high on the way down, PVC kept). Tests: `tests/test_k8s_scale_statefulset.py` (27,
+including e2e-sts / e2e-sts-pvc resolving exactly despite the shared prefix). A 403 on the dry run now names the
+missing rule only for the kinds that rule covers (`ActionSpec.rbac_rule_kinds` / `missing_rule`): before, a
+Deployment restart, image change or scale that got a 403 would have blamed the statefulsets rule.
+
+Checked live on test before any deploy (local code, kubeconfig; scratchpad probe): only the `e2e-sts-pvc`
+object was applied (not the whole fixtures.yaml). The real plan read the real PVC list; the ServiceAccount's
+server dry run (impersonated) was allowed and left replicas at 1. Scaled 1 -> 2 for real: the real
+`wait_workload_rollout` returned `succeeded` after 64 s (no false `unschedulable` while the gp3 volume was
+provisioned), PVC `data-e2e-sts-pvc-1` created. 2 -> 1: proposal tier high, the kept PVC named; `succeeded` after
+65 s; the PVC stayed. A third proposal (1 -> 2, not applied) carried the medium "already exist" risk for
+`data-e2e-sts-pvc-1`. The fixture is at 1 replica with both PVCs. Suite on 3.12: 1307 passed, 11 skipped. Not yet
+deployed through the agent (live scenario `scale_statefulset` not run).
+
+**`batch` decisions (2026-11-26, user).** Before building it, the StatefulSet scaling phase is committed,
+merged into test and e2e-tested on its own (the two phases are not mixed). Batchable actions: `restart_rollout`,
+`scale_replicas`, `set_image` only. Targets: only names the request writes out, capped; no label selector and no
+"all Deployments in a namespace". Execution: one target at a time, each verified before the next, stop at the
+first failure and report done / not done. Recorded in docs/K8S_AGENT_INTERFACE.md "Planned".

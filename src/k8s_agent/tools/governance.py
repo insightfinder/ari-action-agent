@@ -16,21 +16,21 @@ from datetime import datetime, timedelta, timezone
 KEDA_GENERATED_HPA_PREFIX = "keda-hpa-"
 
 
-def find_autoscaler(deployment_name: str, scaledobjects: list[dict], hpas: list[dict]) -> dict | None:
-    """The autoscaler governing `deployment_name`, KEDA first.
+def find_autoscaler(name: str, scaledobjects: list[dict], hpas: list[dict], kind: str = "Deployment") -> dict | None:
+    """The autoscaler governing the `kind` named `name` (a Deployment or a StatefulSet), KEDA first.
 
     A KEDA-generated HPA (`keda-hpa-*`, owned by a ScaledObject) is never
     returned as the thing to change — KEDA would overwrite it — but if it is
-    all that is visible, the Deployment is still reported as KEDA-managed.
+    all that is visible, the workload is still reported as KEDA-managed.
     """
     for so in scaledobjects:
         target = so.get("target") or {}
-        if target.get("name") == deployment_name and (target.get("kind") or "Deployment") == "Deployment":
+        if target.get("name") == name and (target.get("kind") or "Deployment") == kind:
             return so
     keda_hpa = None
     for hpa in hpas:
         target = hpa.get("target") or {}
-        if target.get("name") != deployment_name or (target.get("kind") or "Deployment") != "Deployment":
+        if target.get("name") != name or (target.get("kind") or "Deployment") != kind:
             continue
         if hpa.get("owned_by_scaledobject") or (hpa.get("name") or "").startswith(KEDA_GENERATED_HPA_PREFIX):
             keda_hpa = hpa

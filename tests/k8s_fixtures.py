@@ -172,13 +172,13 @@ def scaledobject(name, target, namespace="shop", min_=1, max_=5, generation=2, l
     }
 
 
-def hpa(name, target, namespace="shop", min_=2, max_=6, owned_by_so=False, generation=1):
+def hpa(name, target, namespace="shop", min_=2, max_=6, owned_by_so=False, generation=1, kind="Deployment"):
     meta = {"name": name, "namespace": namespace, "generation": generation}
     if owned_by_so:
         meta["ownerReferences"] = [{"kind": "ScaledObject", "name": target}]
     return {
         "metadata": meta,
-        "spec": {"scaleTargetRef": {"kind": "Deployment", "name": target}, "minReplicas": min_, "maxReplicas": max_},
+        "spec": {"scaleTargetRef": {"kind": kind, "name": target}, "minReplicas": min_, "maxReplicas": max_},
         "status": {"currentReplicas": min_, "desiredReplicas": min_},
     }
 
@@ -568,6 +568,15 @@ def statefulset(name="db", namespace="shop", replicas=2, strategy="RollingUpdate
             "observedGeneration": generation, "replicas": replicas, "readyReplicas": replicas, "availableReplicas": replicas,
             "updatedReplicas": replicas, "currentRevision": "rev-1", "updateRevision": "rev-1",
         },
+    }
+
+
+def pvc(name, namespace="shop", storage="1Gi", created=None):
+    return {
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": name, "namespace": namespace, "creationTimestamp": created or iso(60 * 24)},
+        "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "gp3", "resources": {"requests": {"storage": storage}}},
+        "status": {"phase": "Bound", "capacity": {"storage": storage}},
     }
 
 

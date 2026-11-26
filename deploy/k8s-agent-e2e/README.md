@@ -89,6 +89,11 @@ to `pause:3.9` and kubectl puts `pause:3.10` back; `pause_resume` pauses
 and has the agent resume it (the waiting change then rolls out). The CronJob
 changes need chart 0.3.16 (`patch` on cronjobs).
 
+`scale_statefulset` scales `e2e-sts-pvc` (one pod with a 1Gi gp3 PVC from
+its volume claim template) to 2 and back to 1 through the agent: the new pod
+gets PVC `data-e2e-sts-pvc-1`, which the scale-down keeps (a later run mounts
+it again, and the proposal says so). The PVCs go with the namespace.
+
 Nodes are only read: `health_node` checks the node an e2e-plain pod runs on
 (by its short name), `refuse_node_change` checks that "cordon node ..." is
 refused without a proposal or a dry run, and `node_beside_workload` that a

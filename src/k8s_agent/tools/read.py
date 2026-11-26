@@ -290,9 +290,10 @@ async def list_hpas(namespace: str) -> list[dict]:
         raise RuntimeError(f"could not list HPAs in {namespace}: {safe_error(exc)}") from None
 
 
-async def find_autoscaler(namespace: str, deployment: str) -> dict | None:
+async def find_autoscaler(namespace: str, name: str, kind: str = "Deployment") -> dict | None:
+    """The HPA or KEDA ScaledObject that scales the `kind` (Deployment or StatefulSet) named `name`, or None."""
     scaledobjects, hpas = await asyncio.gather(list_scaledobjects(namespace), list_hpas(namespace))
-    return governance.find_autoscaler(deployment, scaledobjects, hpas)
+    return governance.find_autoscaler(name, scaledobjects, hpas, kind)
 
 
 # ---------------------------------------------------------------- capacity context
