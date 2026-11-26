@@ -54,15 +54,22 @@ def _quantity(num_bytes: int) -> str:
     return str(num_bytes)
 
 
-def claim_template_owner(pvc: dict, statefulsets: list[dict]) -> tuple[dict, str, int] | None:
-    """`(statefulset, template, ordinal)` when the PVC's name is `<template>-<statefulset>-<ordinal>` of one of
-    `statefulsets`; None otherwise."""
+def claim_template_matches(pvc: dict, statefulsets: list[dict]) -> list[tuple[dict, str, int]]:
+    """Every `(statefulset, template, ordinal)` for which the PVC's name is `<template>-<statefulset>-<ordinal>`.
+    Names can be read more than one way (template `data` of `a-b`, template `data-a` of `b`)."""
+    found = []
     for sts in statefulsets:
         for template in sts.get("volume_claim_templates") or []:
             m = re.fullmatch(rf"{re.escape(template.get('name') or '')}-{re.escape(sts.get('name') or '')}-(\d+)", pvc.get("name") or "")
             if template.get("name") and m:
-                return sts, template["name"], int(m.group(1))
-    return None
+                found.append((sts, template["name"], int(m.group(1))))
+    return found
+
+
+def claim_template_owner(pvc: dict, statefulsets: list[dict]) -> tuple[dict, str, int] | None:
+    """The one StatefulSet whose claim template the PVC's name fits; None when none or more than one fits."""
+    found = claim_template_matches(pvc, statefulsets)
+    return found[0] if len(found) == 1 else None
 
 
 def applier(pvc: dict) -> str | None:
@@ -113,6 +120,12 @@ def eligibility(state: dict) -> tuple[str | None, bool]:
             "Git is changed. Change the size in Git (the chart values or the manifest) instead; nothing was proposed."
         ), False
     owner = state.get("owner")
+    if state.get("ambiguous_owners"):
+        return (
+            f"{ref}'s name fits the claim templates of several StatefulSets ("
+            + ", ".join(state["ambiguous_owners"])
+            + "), so which one it belongs to is not clear; nothing was proposed."
+        ), False
     if owner is None:
         return (
             f"{ref} was not created by a StatefulSet's volumeClaimTemplates, so this agent cannot tell whether "
@@ -151,7 +164,8 @@ class ExpandPvc(ActionSpec):
         pvc = await ctx.tool("get_pvc")(target["namespace"], target["name"])
         if pvc is None:
             return {"pvc": None}
-        found = claim_template_owner(pvc, await ctx.tool("list_statefulsets")(target["namespace"]))
+        matches = claim_template_matches(pvc, await ctx.tool("list_statefulsets")(target["namespace"]))
+        found = matches[0] if len(matches) == 1 else None
         owner = None
         if found:
             sts, template, ordinal = found
@@ -159,7 +173,12 @@ class ExpandPvc(ActionSpec):
             owner = {"statefulset": sts["name"], "template": template, "ordinal": ordinal, "replicas": sts.get("replicas"),
                      "sts_owner": f"{sts_owner['kind']} {sts_owner.get('name')}" if sts_owner.get("kind") else None,
                      "template_storage": next((t.get("storage") for t in sts.get("volume_claim_templates") or [] if t.get("name") == template), None)}
-        return {"pvc": pvc, "owner": owner, "storage_class": await ctx.tool("get_storageclass")(pvc.get("storage_class"))}
+        return {
+            "pvc": pvc,
+            "owner": owner,
+            "ambiguous_owners": [m[0]["name"] for m in matches] if len(matches) > 1 else [],
+            "storage_class": await ctx.tool("get_storageclass")(pvc.get("storage_class")),
+        }
 
     def target(self, action):
         return {"kind": "PersistentVolumeClaim", "namespace": action.get("namespace"), "name": action.get("pvc")}

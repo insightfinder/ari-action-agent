@@ -6128,3 +6128,21 @@ makes the whole status "could not be read completely" rather than half-read. Che
 (e.g. prod webapp 7/15/60, stg webapp 1/8/8 at max). The live texts show only Healthy/NoActivity, so the Backoff
 line in the test fixture follows the format, not an observed backoff. Suite on 3.12: 1298 passed, 11 skipped.
 
+**Security review of the expand_pvc commits (2026-11-26), two fixes, one accepted.**
+- Chart (follow-up commit on the charts branch): `patch` on PVCs let the ServiceAccount change any PVC field the API
+  allows: labels, annotations, finalizers (dropping `kubernetes.io/pvc-protection`), ownerReferences (a bogus
+  owner gets the PVC garbage-collected, and with reclaimPolicy Delete its volume) or volumeAttributesClassName.
+  The admission policy now allows a PVC UPDATE only when the storage request grows (CEL `quantity(...)
+  .isGreaterThan`) and labels, annotations, ownerReferences, finalizers, volumeAttributesClassName and limits are
+  unchanged. Probe on test (temporary policy copy + ServiceAccount, server dry runs, removed after): 1Gi -> 2Gi
+  and -> 1536Mi allowed; same size, annotation, label, grow + label, finalizers cleared, ownerReference added
+  denied with that message; vault and prometheus-server still denied by their own rules. The live
+  `admission_policy` scenario now dry-runs a larger size (allowed) and an annotation (denied).
+- Code: a PVC name can fit two StatefulSets (`data-a-b-0`: template `data` of `a-b`, or `data-a` of `b`); the
+  first match was taken, possibly the unprotected one. Now every match is collected and more than one is refused.
+  Test added. Suite on 3.12: 1299 passed, 11 skipped.
+- Accepted, not changed: the policy finds a protected StatefulSet's PVCs by name pattern only; a PVC of a
+  protected workload that is neither claim-template-named nor Helm/Flux/Argo-marked passes the policy. The
+  agent's code refuses it (it grows only claim-template PVCs), and with the grow-only rule the most any allowed
+  PVC write can do is make a disk larger.
+

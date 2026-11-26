@@ -401,6 +401,15 @@ def test_a_disk_resize_is_asked_for_in_words(prompt, asks):
     assert policy.asks_disk_size_change(prompt) is asks
 
 
+async def test_a_pvc_name_two_statefulsets_could_have_made_is_refused(cluster, monkeypatch):
+    # data-a-b-0: template "data" of StatefulSet "a-b", or template "data-a" of StatefulSet "b".
+    cluster.objects["StatefulSet"] += [fx.statefulset("a-b", claim_templates={"data": "10Gi"}), fx.statefulset("b", claim_templates={"data-a": "10Gi"})]
+    cluster.objects["PersistentVolumeClaim"].append(fx.pvc("data-a-b-0"))
+    monkeypatch.setenv("K8S_AGENT_PROTECTED_WORKLOADS", "")
+    result = await _propose("expand pvc data-a-b-0 in namespace shop to 20Gi", "data-a-b-0")
+    assert "several StatefulSets" in result["refusal"]["reason"] and not cluster.patches
+
+
 def test_the_claim_template_rule():
     sts = [{"name": "redis-cluster", "volume_claim_templates": [{"name": "redis-data"}]}]
     assert expand_pvc.claim_template_owner({"name": "redis-data-redis-cluster-3"}, sts)[1:] == ("redis-data", 3)

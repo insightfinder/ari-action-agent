@@ -1064,11 +1064,11 @@ def scenario_admission_policy(_args):
     sa = _kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.template.spec.serviceAccountName}")
     body = json.dumps({"metadata": {"annotations": {"ari-e2e/probe": "1"}}})
 
-    def dry_run(ns, name, kind="deploy"):
+    def dry_run(ns, name, kind="deploy", patch=body):
         context = os.environ.get("KUBE_CONTEXT")
         cmd = [
             "kubectl", *(["--context", context] if context else []), f"--as=system:serviceaccount:{namespace}:{sa}",
-            "-n", ns, "patch", kind, name, "--type", "merge", "-p", body, "--dry-run=server",
+            "-n", ns, "patch", kind, name, "--type", "merge", "-p", patch, "--dry-run=server",
         ]
         out = subprocess.run(cmd, capture_output=True, text=True)
         return out.returncode == 0, (out.stderr or out.stdout).strip()
@@ -1083,12 +1083,17 @@ def scenario_admission_policy(_args):
         None,
     )
     helm_ok, helm_msg = dry_run(namespace, helm_pvc, "pvc") if helm_pvc else (True, "no Helm-rendered PVC found")
-    disk_ok, disk_msg = dry_run(NAMESPACE, DISK_PVC, "pvc")
-    by_policy = all("ValidatingAdmissionPolicy" in m for m in (system_msg, self_msg, helm_msg))
-    ok = not system_ok and not self_ok and e2e_ok and not helm_ok and disk_ok and by_policy
+    # The policy lets the agent only raise a PVC's storage request: a larger size passes, an annotation does not.
+    requested = _pvc_size(DISK_PVC)[0]
+    larger = json.dumps({"spec": {"resources": {"requests": {"storage": f"{int(requested.removesuffix('Gi')) + 1}Gi"}}}})
+    disk_ok, disk_msg = dry_run(NAMESPACE, DISK_PVC, "pvc", larger)
+    note_ok, note_msg = dry_run(NAMESPACE, DISK_PVC, "pvc")
+    by_policy = all("ValidatingAdmissionPolicy" in m for m in (system_msg, self_msg, helm_msg, note_msg))
+    ok = not system_ok and not self_ok and e2e_ok and not helm_ok and disk_ok and not note_ok and by_policy
     return ok, (
         f"kube-system denied={not system_ok} self denied={not self_ok} e2e-plain allowed={e2e_ok} "
-        f"helm pvc {helm_pvc} denied={not helm_ok} {DISK_PVC} allowed={disk_ok} :: {helm_msg[:140]}"
+        f"helm pvc {helm_pvc} denied={not helm_ok} {DISK_PVC} grow allowed={disk_ok} annotate denied={not note_ok} "
+        f":: {helm_msg[:140]}"
     )
 
 

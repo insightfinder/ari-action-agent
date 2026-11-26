@@ -175,7 +175,8 @@ says. The oncallari chart's `ariK8sAgent.protection` values hold both lists and 
   Deployment, its pods (through their ReplicaSet) and its autoscalers (their target before and after the
   request), and any change to what an autoscaler scales (`spec.scaleTargetRef`; the agent only changes bounds);
   from oncallari 0.3.19 also any write to a PVC that Helm, Flux or Argo CD marks, and to a PVC named like a
-  protected StatefulSet's claim (`<template>-<name>-<ordinal>`). A dry run it denies comes back as a refusal
+  protected StatefulSet's claim (`<template>-<name>-<ordinal>`), and any PVC update other than a larger storage
+  request (labels, annotations, owners, finalizers, volumeAttributesClassName and limits must stay as they are). A dry run it denies comes back as a refusal
   (`protected: true`).
 - The code holds no workload names (they are installation-specific; the oncallari defaults below are
   InsightFinder's). A chart shipped for other installations should default `workloads` to empty: the agent's
