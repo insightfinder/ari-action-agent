@@ -35,7 +35,7 @@ from common.capabilities_base import StepContext
 from .. import actions
 from ..actions.base import artifact_int as _int, target_of
 from ..stepkit import finish
-from ..tools import governance, persistence
+from ..tools import governance, persistence, protection
 
 _VERIFY_MARGIN_SECONDS = 60
 _DEFAULT_STEP_SECONDS = 900
@@ -72,6 +72,15 @@ async def run(ctx: StepContext) -> dict:
     spec = actions.get(proposal["action"])
     target = target_of(proposal)
     namespace = target["namespace"]
+    # A proposal made before a kind of target was withdrawn (2026-11-26: StatefulSets, DaemonSets) is not applied.
+    if target["kind"] not in spec.target_kinds:
+        raise RuntimeError(
+            f"apply_approved_change: this agent no longer changes a {target['kind']} with {proposal['action']}. "
+            "Nothing was changed."
+        )
+    protected = protection.why_protected(namespace, proposal.get("deployment") or proposal.get("workload") or target["name"])
+    if protected:
+        raise RuntimeError(f"apply_approved_change: {protected}")
     action = spec.patch_action(proposal)
 
     state = await spec.load_state(ctx, target)

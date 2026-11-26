@@ -41,7 +41,7 @@ _PAGE_SIZE = 500
 
 PATCH_MERGE = "application/merge-patch+json"
 PATCH_STRATEGIC = "application/strategic-merge-patch+json"
-# RFC 6902: replaces a whole subtree (a rollback's pod template) and can `test` a value first.
+# RFC 6902: replaces a whole subtree and can `test` a value first.
 PATCH_JSON = "application/json-patch+json"
 
 # Flux source kind -> kinds to try, newest API version first.

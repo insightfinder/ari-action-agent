@@ -56,14 +56,12 @@ capabilities:
   propose_change:
     module: k8s_agent.capabilities.propose_change
     description: >
-      For any requested change — Deployment or StatefulSet replicas, a KEDA/HPA min or
-      max, CPU/memory requests/limits of a Deployment (rolls its pods),
-      CPU/memory of one running pod in place (no rollout; needs Kubernetes
-      in-place pod resize, read live from the cluster), a rolling restart of
-      a Deployment, StatefulSet or DaemonSet, a Deployment rollback to an
-      earlier revision, deleting one pod a workload controller replaces, a
-      container's image, pausing or resuming a Deployment's rollouts,
-      or suspending or resuming a CronJob.
+      For any requested change to a Deployment — its replicas, its KEDA/HPA
+      min or max, CPU/memory requests/limits (rolls its pods), CPU/memory of
+      one of its running pods in place (no rollout; needs Kubernetes
+      in-place pod resize, read live from the cluster), a rolling restart,
+      deleting one of its pods (never the only ready one). StatefulSets, DaemonSets, CronJobs and nodes
+      are read only: a change to one is refused.
       Actions without a stated value only when the request itself asks for
       them. Works out the exact change,
       checks it (autoscaler rules, replica floor of 1, node-capacity cap,
@@ -84,8 +82,6 @@ capabilities:
       - get_pod
       - get_resize_support
       - get_workload
-      - list_replicasets
-      - list_views
       - dry_run_patch
     retry:
       max_attempts: 2
@@ -101,9 +97,7 @@ capabilities:
       cluster state (rollout progress, failing new pods, pods that cannot be
       scheduled and why; for an in-place pod resize, the values the kubelet
       reports as applied on the same pod; for a deleted pod, its replacement
-      ready and stable; for a paused or resumed Deployment, the
-      controller's own report; for a suspended or resumed CronJob, that
-      the value holds). Never planned directly — reachable only through
+      ready and stable). Never planned directly — reachable only through
       the approval of a propose_change proposal.
     tools:
       - get_deployment
@@ -111,16 +105,12 @@ capabilities:
       - get_pod
       - get_resize_support
       - get_workload
-      - list_replicasets
       - list_pods
       - list_nodes
       - patch_workload
       - wait_rollout
       - wait_resize
       - wait_pod_replaced
-      - wait_workload_rollout
-      - wait_paused
-      - wait_cronjob_suspend
       - get_flux_chain
     # A second attempt (the worker died, or a read failed, mid-step) finds the
     # approved values already in place and verifies instead of writing again.

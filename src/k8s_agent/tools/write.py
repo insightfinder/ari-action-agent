@@ -44,7 +44,7 @@ async def _run(action: dict, dry_run: bool) -> dict:
     kube = get_client()
     try:
         operations = await spec.build_operations(action, kube)
-    except Exception as exc:  # noqa: BLE001 — a read the operations need (a rollback's ReplicaSet) failed
+    except Exception as exc:  # noqa: BLE001 — a read the operations need failed
         raise RuntimeError(f"could not prepare {action.get('action')}: {safe_error(exc)}") from None
     summaries = []
     for op in operations:

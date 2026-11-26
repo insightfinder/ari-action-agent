@@ -1,92 +1,54 @@
-"""`restart_rollout`: a rolling restart of every pod of a Deployment, StatefulSet or DaemonSet, the way
-`kubectl rollout restart` does it. The pod template gets a `kubectl.kubernetes.io/restartedAt` annotation and
-the workload's own controller replaces its pods under its own update strategy. No setting changes.
+"""`restart_rollout`: a rolling restart of every pod of a Deployment, the way `kubectl rollout restart` does it.
+The pod template gets a `kubectl.kubernetes.io/restartedAt` annotation and the Deployment's controller replaces
+its pods under its own update strategy. No setting changes. StatefulSets and DaemonSets are not restarted
+(decided 2026-11-26: stateful systems and node-level agents can break in ways a restart does not undo).
 
 - Proposed only when the request itself asks for a restart (`policy.asks_restart`): an on-call prompt that
   quotes "restarted 5 times" while asking about memory is not one.
 - The annotation's value is fixed when the proposal is made and is part of what is approved, so a retried
   apply finds it in place and verifies instead of restarting a second time.
-- Refused where the controller would not act on it: a paused Deployment, an `OnDelete` update strategy, or a
-  workload with no pods.
+- Refused where the controller would not act on it: a paused Deployment, or one with no pods.
 - There is nothing to keep in Git: the hint says so.
 """
 
 from datetime import datetime, timezone
 
 from ..stepkit import refusal
-from ..tools import governance, policy
+from ..tools import policy
 from ..tools.views import RESTARTED_AT
 from .base import ActionSpec, Operation
 
 
-def workload_pods(view: dict) -> int:
-    if view.get("kind") == "DaemonSet":
-        return (view.get("status") or {}).get("desired") or 0
-    return view.get("replicas") or 0
-
-
 def rollout_blocked(w: dict, what: str) -> str | None:
-    """Why the workload's controller would not roll out a template change (`what`, e.g. "a restart"), or None."""
-    ref = f"{w['kind']} {w['namespace']}/{w['name']}"
-    if w.get("kind") == "Deployment" and w.get("paused"):
-        return f"{ref} is paused (spec.paused), so its controller would not roll out {what}. Resume it first."
-    if (w.get("strategy") or {}).get("type") == "OnDelete":
-        return (
-            f"{ref} uses the OnDelete update strategy: {what} would change its template but replace no pod until "
-            "each pod is deleted by hand, so it is not proposed."
-        )
+    """Why the Deployment's controller would not roll out a template change (`what`, e.g. "a restart"), or None."""
+    if w.get("paused"):
+        return f"Deployment {w['namespace']}/{w['name']} is paused (spec.paused), so its controller would not roll out {what}."
     return None
 
 
 def rollout_effects(w: dict) -> tuple[list[dict], list[str]]:
-    """`(risks, notes)` of rolling every pod of the workload under its own update strategy."""
-    kind = w["kind"]
-    strategy = (w.get("strategy") or {}).get("type")
-    risks: list[dict] = []
-    notes: list[str] = []
-    if kind == "Deployment":
-        if strategy == "Recreate":
-            risks.append(
-                {
-                    "level": "high",
-                    "message": "Strategy Recreate: every pod is stopped before the new ones start, so the "
-                    "Deployment serves nothing until the new pods are ready.",
-                }
-            )
-        else:
-            s = w.get("strategy") or {}
-            notes.append(
-                f"Rolling update: up to {s.get('max_surge')} extra and {s.get('max_unavailable')} unavailable pods "
-                "at a time, as the Deployment's own strategy sets."
-            )
-    elif kind == "StatefulSet":
-        partition = (w.get("strategy") or {}).get("partition") or 0
-        notes.append(
-            "A StatefulSet replaces its pods one at a time, highest ordinal first, each after the previous one "
-            "is ready; each keeps its name and its PersistentVolumeClaims."
+    """`(risks, notes)` of rolling every pod of the Deployment under its own update strategy."""
+    s = w.get("strategy") or {}
+    if s.get("type") == "Recreate":
+        return [
+            {
+                "level": "high",
+                "message": "Strategy Recreate: every pod is stopped before the new ones start, so the "
+                "Deployment serves nothing until the new pods are ready.",
+            }
+        ], []
+    return [], [
+        (
+            f"Rolling update: up to {s.get('max_surge')} extra and {s.get('max_unavailable')} unavailable pods "
+            "at a time, as the Deployment's own strategy sets."
         )
-        if partition:
-            notes.append(f"Update partition {partition}: only pods with an ordinal of {partition} or more are replaced.")
-        if workload_pods(w) == 1:
-            risks.append(
-                {
-                    "level": "high",
-                    "message": "The StatefulSet has one pod: it is stopped before its replacement starts, so the "
-                    "StatefulSet serves nothing until the new pod is ready.",
-                }
-            )
-    else:
-        notes.append(
-            "A DaemonSet replaces its pods node by node; while a node's pod is replaced that node runs without "
-            "it (maxUnavailable {}).".format((w.get("strategy") or {}).get("max_unavailable"))
-        )
-    return risks, notes
+    ]
 
 
 class RestartRollout(ActionSpec):
     name = "restart_rollout"
-    workload_kinds = governance.WORKLOAD_KINDS
-    target_kinds = governance.WORKLOAD_KINDS
+    workload_kinds = ("Deployment",)
+    target_kinds = ("Deployment",)
     prompt_line = (
         "restart every pod of the workload with a rolling restart (like kubectl rollout restart). Changes no "
         "setting. Only when the request asks for a restart of the workload; a request to restart one named pod is "
@@ -96,9 +58,6 @@ class RestartRollout(ActionSpec):
         "The request does not itself ask for a restart, so none was proposed. To have one proposed, ask for it "
         "directly, e.g. \"restart the {kind} {name} in namespace {namespace}\"."
     )
-    # Deployments are patched with the rule every chart has; StatefulSets and DaemonSets need the newer one.
-    rbac_rule = 'patch on "statefulsets" and "daemonsets" (apps group; the oncallari chart grants it from 0.3.15)'
-    rbac_rule_kinds = ("StatefulSet", "DaemonSet")
 
     def accepts(self, prompt):
         return policy.asks_restart(prompt)
@@ -117,8 +76,8 @@ class RestartRollout(ActionSpec):
         kind, ref = w["kind"], f"{w['kind']} {w['namespace']}/{w['name']}"
         blocked = rollout_blocked(w, "a restart")
         if blocked:
-            return None, refusal(blocked + (" Ask for a specific pod to be deleted instead." if "OnDelete" in blocked else ""))
-        pods = workload_pods(w)
+            return None, refusal(blocked)
+        pods = w.get("replicas") or 0
         if pods < 1:
             return None, refusal(f"{ref} has no pods to restart.")
 
@@ -205,10 +164,7 @@ class RestartRollout(ActionSpec):
         return {"kind": "restart", "restarted_at": action["restarted_at"]}
 
     async def verify(self, ctx, action, proposal, before, applied_at, max_wait):
-        kind = action.get("workload_kind") or "Deployment"
-        if kind == "Deployment":
-            return await ctx.tool("wait_rollout")(action["namespace"], action["workload"], self.verify_target(action), applied_at, max_wait)
-        return await ctx.tool("wait_workload_rollout")(kind, action["namespace"], action["workload"], applied_at, max_wait)
+        return await ctx.tool("wait_rollout")(action["namespace"], action["workload"], self.verify_target(action), applied_at, max_wait)
 
     def base_tier(self, facts):
         return "medium"

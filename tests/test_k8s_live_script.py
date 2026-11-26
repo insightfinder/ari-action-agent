@@ -76,23 +76,17 @@ def _fixtures() -> dict:
     [
         ("Deployment", "e2e-plain"),
         ("PodDisruptionBudget", "e2e-plain-pdb"),
-        ("Deployment", "e2e-rollback"),
         ("StatefulSet", "e2e-sts"),
         ("DaemonSet", "e2e-ds"),
     ],
 )
-def test_the_batch_1_scenarios_have_their_fixtures(kind, name):
+def test_the_write_scenarios_have_their_fixtures(kind, name):
     obj = _fixtures().get((kind, name))
     assert obj is not None and obj["metadata"]["namespace"] == live.NAMESPACE
 
 
-def test_the_rollback_fixture_starts_on_the_image_the_scenario_rolls_back_to():
-    rollback = _fixtures()[("Deployment", "e2e-rollback")]
-    assert rollback["spec"]["template"]["spec"]["containers"][0]["image"] == "registry.k8s.io/pause:3.10"
-
-
-def test_the_statefulset_fixture_has_the_pod_the_delete_scenario_names():
-    assert _fixtures()[("StatefulSet", "e2e-sts")]["spec"]["replicas"] >= 2  # e2e-sts-1
+def test_the_refusal_scenarios_have_their_fixtures():
+    assert _fixtures()[("StatefulSet", "e2e-sts")]["metadata"]["namespace"] == live.NAMESPACE
 
 
 def test_the_cronjob_fixture_never_fires_on_its_own_and_its_job_ends():
@@ -100,12 +94,6 @@ def test_the_cronjob_fixture_never_fires_on_its_own_and_its_job_ends():
     assert cron["metadata"]["namespace"] == live.NAMESPACE and cron["spec"]["schedule"] == "0 0 1 1 *"
     job = cron["spec"]["jobTemplate"]["spec"]
     assert job["template"]["spec"]["restartPolicy"] == "Never" and job["template"]["spec"]["containers"][0]["name"] == "run"
-
-
-def test_the_image_scenarios_start_from_the_fixture_images():
-    for kind, name in (("Deployment", "e2e-plain"), ("StatefulSet", "e2e-sts")):
-        [container] = _fixtures()[(kind, name)]["spec"]["template"]["spec"]["containers"]
-        assert container["name"] == "app" and container["image"] == live.PAUSE_OLD
 
 
 def test_every_scenario_says_what_it_checks():

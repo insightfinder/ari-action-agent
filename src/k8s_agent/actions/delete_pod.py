@@ -1,14 +1,15 @@
-"""`delete_pod`: delete ONE pod that a Deployment, StatefulSet or DaemonSet owns, so its controller replaces it
-from the unchanged template (a stuck or misbehaving pod). The only delete this agent makes.
+"""`delete_pod`: delete ONE pod of a Deployment, so its controller replaces it from the unchanged template (a
+stuck or misbehaving pod). The only delete this agent makes.
 
 - Proposed only when the request itself asks for a pod to be deleted (`policy.asks_delete_pod`) and names the
   pod exactly; there is no "the only pod" shortcut, as there is for an in-place resize.
-- Only a pod some workload controller will replace: a bare pod, a Job's pod or a static (mirror) pod is refused.
-- The delete carries a uid precondition, so it removes exactly the approved pod: a StatefulSet reuses a pod's
-  name for its replacement, and an approval hours later must not delete that one.
+- Only a Deployment's pod (through its ReplicaSet). A StatefulSet's or DaemonSet's pod, a bare pod, a Job's pod
+  or a static (mirror) pod is refused: nothing that could break a product environment (2026-11-26).
+- Refused when no other pod of the Deployment is ready, at proposal and again at approval: the Deployment would
+  serve nothing until the replacement is ready.
+- The delete carries a uid precondition, so it removes exactly the approved pod, not a later one.
 - A plain delete, not an eviction: it does not wait for a PodDisruptionBudget, which the proposal says when
-  one covers the pod. With no other ready pod, the workload serves nothing until the replacement is ready
-  (risk `high`).
+  one covers the pod.
 - Verified by positive evidence (`rollout.wait_pod_replaced`): the old uid gone and a new pod ready and stable.
 """
 
@@ -21,7 +22,7 @@ from .base import ActionSpec, Operation
 
 class DeletePod(ActionSpec):
     name = "delete_pod"
-    workload_kinds = governance.WORKLOAD_KINDS
+    workload_kinds = ("Deployment",)
     target_kinds = ("Pod",)
     prompt_line = (
         "delete ONE pod so its controller replaces it — also what restarting one named pod means. Only when the "
@@ -80,33 +81,19 @@ class DeletePod(ActionSpec):
         ref = f"pod {pod['namespace']}/{pod['name']}"
         if pod.get("deleting"):
             return None, refusal(f"{ref} is already being deleted.")
-        if w is None:
+        if w is None or w.get("kind") != "Deployment":
             return None, refusal(
-                f"{ref} is not owned by a Deployment, StatefulSet or DaemonSet (owner: "
-                f"{pod.get('owner_kind') or 'none'}), so nothing would replace it; this agent deletes only pods a "
-                "workload controller recreates."
+                f"{ref} is not a Deployment's pod (owner: {pod.get('owner_kind') or 'none'}); this agent deletes only "
+                "pods a Deployment recreates."
             )
         kind, wref = w["kind"], f"{w['kind']} {w['namespace']}/{w['name']}"
-        siblings = state.get("siblings") or []
-        ready_others = [p for p in siblings if p["name"] != pod["name"] and not p.get("deleting") and _ready(p)]
+        if not _ready_others(pod["name"], state.get("siblings") or []):
+            return None, refusal(
+                f"No other pod of {wref} is ready, so deleting {ref} would leave it serving nothing until the "
+                "replacement is ready. Nothing was proposed."
+            )
         risks: list[dict] = []
         notes = [f"{wref} recreates the pod from its unchanged template."]
-        if kind == "StatefulSet":
-            notes.append("The replacement has the same name and mounts the same PersistentVolumeClaims.")
-        if kind == "DaemonSet":
-            risks.append(
-                {
-                    "level": "medium",
-                    "message": f"Node {pod.get('node_name')} runs without this DaemonSet's pod until the replacement is ready.",
-                }
-            )
-        elif not ready_others:
-            risks.append(
-                {
-                    "level": "high",
-                    "message": f"No other pod of {wref} is ready: it serves nothing until the replacement is ready.",
-                }
-            )
         action = {
             "action": "delete_pod",
             "namespace": pod["namespace"],
@@ -168,6 +155,12 @@ class DeletePod(ActionSpec):
             return [f"pod {name} was already replaced (new uid)"]
         if pod.get("deleting"):
             return [f"pod {name} is already being deleted"]
+        # A proposal made before only Deployment pods were deleted (2026-11-26) may name another kind's pod.
+        owner = (state.get("workload") or {}).get("kind")
+        if owner != "Deployment" or (proposal.get("workload_kind") or "Deployment") != "Deployment":
+            return [f"pod {name} is a {owner or 'bare'} pod; this agent deletes only a Deployment's pods"]
+        if not _ready_others(name, state.get("siblings") or []):
+            return [f"no other pod of {proposal.get('workload')} is ready now"]
         return []
 
     def at_target(self, action, state):
@@ -194,6 +187,10 @@ class DeletePod(ActionSpec):
 
     def lifetime_risk(self, ownership):
         return "info"
+
+
+def _ready_others(name: str, siblings: list[dict]) -> list[dict]:
+    return [p for p in siblings if p["name"] != name and not p.get("deleting") and _ready(p)]
 
 
 def _ready(pod: dict) -> bool:
