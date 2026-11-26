@@ -25,16 +25,24 @@ The write happens at most once. A retried attempt (the worker restarted,
 or a read failed, after the patch landed) finds the cluster already at the
 approved values and skips straight to verification instead of refusing or
 writing again; a patch call that errored is judged the same way, by
-re-reading the target. Once the patch is in, nothing below it may turn the
+re-reading the target. On the first attempt nothing of this step's own can
+have been written, so a target already holding the approved result (a pod
+already gone, replicas already at the number, a PVC already that size) was
+put there by someone else: refused, never reported as this agent's change
+(user, 2026-11-26). Refusals raise `StepRefused`, which is never retried: a
+retry would find the same state, or one a refusal seconds earlier ruled
+out, and act on it. Once the patch is in, nothing below it may turn the
 run into "nothing was executed": a verification that cannot finish is
 reported as `verification_unavailable` with the change applied. The
 outcome is otherwise verified from cluster state (tools/rollout.py), never
 assumed from the API's acknowledgement.
 """
 
+import re
+
 from datetime import datetime, timedelta, timezone
 
-from common.capabilities_base import StepContext
+from common.capabilities_base import StepContext, StepRefused
 
 from .. import actions
 from ..actions.base import artifact_int as _int, target_of
@@ -44,11 +52,13 @@ from ..tools import governance, persistence, protection
 _VERIFY_MARGIN_SECONDS = 60
 _DEFAULT_STEP_SECONDS = 900
 DEFAULT_PROPOSAL_MAX_AGE_HOURS = 24.0
+# How tools/client.safe_error writes an API error that says the object was not there, or not the one named.
+_NOT_THERE = re.compile(r"\bHTTP (404|409)\b")
 
 
 def _require_confirmed(ctx: StepContext) -> dict:
     if not ctx.confirmed:
-        raise RuntimeError(
+        raise StepRefused(
             "apply_approved_change: refusing to change the cluster without an approved proposal. This step runs "
             "only from a confirmed propose_change pending_action (plan_task's confirmation bypass); it is never "
             "something a plan should schedule directly."
@@ -58,7 +68,7 @@ def _require_confirmed(ctx: StepContext) -> dict:
     missing = [k for k in ("id", "action", "snapshot") if not params.get(k)]
     missing += [f"target {k}" for k in ("kind", "namespace", "name") if not target.get(k)]
     if params.get("action") not in actions.ACTIONS or missing:
-        raise RuntimeError(
+        raise StepRefused(
             f"apply_approved_change: the confirmed proposal is not one this agent made (action="
             f"{params.get('action')!r}, missing fields: {missing or 'none'}). Ask again and a fresh one is proposed."
         )
@@ -93,10 +103,20 @@ def _too_old(ctx: StepContext, proposal: dict) -> str | None:
     if age <= timedelta(hours=hours):
         return None
     return (
-        f"apply_approved_change: this proposal was made {age.total_seconds() / 3600:.1f} hours ago, more than the "
-        f"{hours:g} hours an approval stays valid; its risks and estimates describe the cluster as it was then. "
-        "Nothing was changed. Ask again so a fresh proposal reflects the current state."
+        f"apply_approved_change: this proposal was made {_duration(age.total_seconds())} ago, more than the "
+        f"{_duration(hours * 3600)} an approval stays valid; its risks and estimates describe the cluster as it "
+        "was then. Nothing was changed. Ask again so a fresh proposal reflects the current state."
     )
+
+
+def _duration(seconds: float) -> str:
+    """A length of time as people say it: "40 seconds", "12 minutes", "24 hours", "25.5 hours", "3 days"."""
+    for limit, size, unit in ((90, 1, "second"), (90 * 60, 60, "minute"), (48 * 3600, 3600, "hour"), (None, 86400, "day")):
+        if limit is None or seconds < limit:
+            amount = round(seconds / size, 0 if size < 3600 else 1)
+            text = f"{amount:g}"
+            return f"{text} {unit}" + ("" if text == "1" else "s")
+    raise AssertionError("unreachable")
 
 
 async def run(ctx: StepContext) -> dict:
@@ -106,30 +126,36 @@ async def run(ctx: StepContext) -> dict:
     namespace = target["namespace"]
     # A proposal made before a kind of target was withdrawn (2026-11-26: StatefulSets, DaemonSets) is not applied.
     if target["kind"] not in spec.target_kinds:
-        raise RuntimeError(
+        raise StepRefused(
             f"apply_approved_change: this agent no longer changes a {target['kind']} with {proposal['action']}. "
             "Nothing was changed."
         )
     protected = protection.why_protected(namespace, proposal.get("deployment") or proposal.get("workload") or target["name"])
     if protected:
-        raise RuntimeError(f"apply_approved_change: {protected}")
+        raise StepRefused(f"apply_approved_change: {protected}")
     action = spec.patch_action(proposal)
 
     state = await spec.load_state(ctx, target)
     dep = state.get("deployment") or {}
     drift = spec.drift(proposal, state)
-    already = bool(drift) and spec.at_target(action, state)
+    # The approved result already in place. From the second attempt on, the earlier attempt may have written it
+    # (the worker was lost after the write): verify instead of refusing or writing again. On the first attempt
+    # nothing of this step's own has run, so someone else put it there and this agent did nothing: refused.
+    at_target = bool(drift) and spec.at_target(action, state)
+    already = at_target and ctx.attempt != 1
     if drift and not already:
-        raise RuntimeError(
+        done_elsewhere = "; it already holds what was approved, done by someone else, not this agent" if at_target else ""
+        raise StepRefused(
             "apply_approved_change: the cluster changed after this proposal was made ("
             + "; ".join(drift)
+            + done_elsewhere
             + "). Nothing was changed. Ask again so a fresh proposal reflects the current state."
         )
 
     # Too old to write, but not too old to verify what an earlier attempt of this step already wrote.
     stale = None if already else _too_old(ctx, proposal)
     if stale:
-        raise RuntimeError(stale)
+        raise StepRefused(stale)
 
     # Second precision on pod creation timestamps: back off a little so pods
     # created by this very patch are never mistaken for older ones.
@@ -138,7 +164,7 @@ async def run(ctx: StepContext) -> dict:
     # that expects one container restart counts it from here.
     before_write = None if already else state
     if already:
-        # An earlier attempt of this step (or someone else) already put the approved values in place.
+        # An earlier attempt of this step (or, between it and this one, someone else) put the approved values in place.
         applied = {
             "already_at_target": True,
             "note": "the cluster already held the approved values; nothing was written again",
@@ -156,6 +182,13 @@ async def run(ctx: StepContext) -> dict:
             dep = state.get("deployment") or dep
             if not spec.at_target(action, state):
                 raise
+            # The API answered "not there" (404) or "not that object" (409, a uid precondition): this write did
+            # nothing; someone else got there between the re-check above and the write.
+            if ctx.attempt == 1 and _NOT_THERE.search(str(exc)):
+                raise StepRefused(
+                    f"apply_approved_change: {target['kind']} {namespace}/{target['name']} had already been changed "
+                    f"by someone else when this agent's write reached the API ({exc}). Nothing was changed by this agent."
+                ) from None
             applied = {"applied_despite_error": f"{type(exc).__name__}: {exc}"}
 
     try:

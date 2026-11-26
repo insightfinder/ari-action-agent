@@ -329,6 +329,17 @@ async def test_an_approved_growth_is_applied_once_and_verified(cluster):
 
 
 @pytest.mark.asyncio
+async def test_a_size_someone_else_already_asked_for_is_not_reported_as_applied(cluster):
+    from common.capabilities_base import StepRefused
+
+    pa = await _approved(cluster)
+    _pvc(cluster, "data-db-0")["spec"]["resources"]["requests"]["storage"] = "20Gi"
+    with pytest.raises(StepRefused, match="already holds what was approved, done by someone else"):
+        await _apply(pa, attempt=1)
+    assert not cluster.patches
+
+
+@pytest.mark.asyncio
 async def test_a_retried_approval_finds_the_size_asked_and_does_not_write_again(cluster):
     pa = await _approved(cluster)
     _pvc(cluster, "data-db-0")["spec"]["resources"]["requests"]["storage"] = "20Gi"

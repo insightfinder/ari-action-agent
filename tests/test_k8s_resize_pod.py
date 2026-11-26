@@ -219,6 +219,16 @@ async def test_apply_refuses_when_the_pod_is_gone(cluster):
         await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True))
 
 
+async def test_a_resize_someone_else_already_made_is_not_reported_as_applied(cluster):
+    from common.capabilities_base import StepRefused
+
+    pa = await _approved(cluster, "resize pod checkout-1 in place: cpu limit 2", _CPU_LIMIT)
+    _set_limits(cluster, cpu="2")
+    with pytest.raises(StepRefused, match="already holds what was approved, done by someone else"):
+        await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True, attempt=1))
+    assert not [p for p in cluster.patches if not p["dry_run"]]
+
+
 async def test_a_retried_apply_after_the_patch_landed_verifies_instead_of_refusing(cluster):
     pa = await _approved(cluster, "resize pod checkout-1 in place: cpu limit 2", _CPU_LIMIT)
     cluster.auto_resize = True

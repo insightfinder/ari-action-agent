@@ -8,6 +8,8 @@ stuck or misbehaving pod). The only delete this agent makes.
 - Refused when no other pod of the Deployment is ready, at proposal and again at approval: the Deployment would
   serve nothing until the replacement is ready.
 - The delete carries a uid precondition, so it removes exactly the approved pod, not a later one.
+- A pod already gone or terminating when the approval arrives was deleted by someone else (or evicted): refused,
+  never reported as this agent's delete (apply_approved_change, first attempt).
 - A plain delete, not an eviction: it does not wait for a PodDisruptionBudget, which the proposal says when
   one covers the pod.
 - Verified by positive evidence (`rollout.wait_pod_replaced`): the old uid gone and a new pod ready and stable.

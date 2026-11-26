@@ -23,6 +23,7 @@ import test_k8s_capabilities as base  # noqa: E402
 from test_k8s_capabilities import ScriptedLLM, _change, _ctx, _resolved  # noqa: E402
 
 from k8s_agent.capabilities import apply_approved_change, check_health, find_workload, propose_change  # noqa: E402
+from common.capabilities_base import StepRefused  # noqa: E402
 from k8s_agent.tools import policy, read, rollout, write  # noqa: E402
 
 _RESTARTED_AT = "kubectl.kubernetes.io/restartedAt"
@@ -76,8 +77,9 @@ async def _approved(cluster, prompt, change, results=None):
     return fx.a2a_round_trip(result["pending_action"])
 
 
-async def _apply(pa):
-    return (await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True)))["action_result"]
+async def _apply(pa, attempt=None):
+    ctx = _ctx("apply_approved_change", "", params=pa, confirmed=True, attempt=attempt)
+    return (await apply_approved_change.run(ctx))["action_result"]
 
 
 def _obj(cluster, kind, name):
@@ -319,13 +321,75 @@ async def test_delete_apply_verifies_the_replacement(cluster):
 
 @pytest.mark.asyncio
 async def test_delete_already_done_is_verified_not_repeated(cluster):
+    """A retry (attempt 2) after the first attempt's delete landed: verified, not refused, not deleted again."""
     pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
     cluster.auto_replace = True
-    await _apply(pa)
+    await _apply(pa, attempt=1)
     cluster.deletes.clear()
-    again = await _apply(pa)
+    again = await _apply(pa, attempt=2)
     assert again["applied"]["already_at_target"] is True and not cluster.deletes and again["status"] == "succeeded"
     assert again["applied"]["changed_since_proposal"] == ["pod checkout-1 no longer exists"]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_already_gone_at_the_first_attempt_is_not_reported_as_deleted(cluster):
+    """Someone else deleted the pod before the approval: this agent deleted nothing, so it is a refusal, not a
+    success (user, 2026-11-26)."""
+    pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
+    cluster.objects["Pod"].remove(_obj(cluster, "Pod", "checkout-1"))
+    with pytest.raises(StepRefused, match="pod checkout-1 no longer exists.*Nothing was changed"):
+        await _apply(pa, attempt=1)
+    assert not cluster.deletes
+
+
+@pytest.mark.asyncio
+async def test_a_pod_already_terminating_at_the_first_attempt_is_not_reported_as_deleted(cluster):
+    pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
+    _obj(cluster, "Pod", "checkout-1")["metadata"]["deletionTimestamp"] = fx.iso(0)
+    with pytest.raises(StepRefused, match="pod checkout-1 is already being deleted"):
+        await _apply(pa, attempt=1)
+    assert not cluster.deletes
+
+
+@pytest.mark.asyncio
+async def test_a_pod_deleted_by_someone_else_just_before_the_write_is_not_reported_as_deleted(cluster, monkeypatch):
+    """Gone between the re-check and the delete call: the API's 404 says this write did nothing."""
+    pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
+    real_delete = cluster.delete
+
+    async def someone_else_first(kind, name, namespace, dry_run, grace_period_seconds=None, preconditions=None):
+        if not dry_run:
+            cluster.objects["Pod"].remove(_obj(cluster, "Pod", name))
+        return await real_delete(kind, name, namespace, dry_run, grace_period_seconds, preconditions)
+
+    monkeypatch.setattr(cluster, "delete", someone_else_first)
+    with pytest.raises(StepRefused, match="had already been changed by someone else when this agent's write reached the API"):
+        await _apply(pa, attempt=1)
+    assert not cluster.deletes
+
+
+@pytest.mark.asyncio
+async def test_a_scale_someone_else_already_made_is_not_reported_as_applied(cluster):
+    """The same rule for every action (user, 2026-11-26): replicas already at the approved number on the first
+    attempt were set by someone else, so the approval is refused, not reported as this agent's change."""
+    from k8s_agent.tools.client import PATCH_MERGE
+
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    # Someone else's kubectl scale, before the approval.
+    await cluster.patch("Deployment", "checkout", "shop", {"spec": {"replicas": 5}}, PATCH_MERGE, False)
+    with pytest.raises(StepRefused, match="replicas changed from 3 to 5; it already holds what was approved, done by someone else"):
+        await _apply(pa, attempt=1)
+    assert len(cluster.patches) == 1  # only someone else's
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_its_own_scale_still_verifies(cluster):
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    cluster.auto_rollout = True
+    await _apply(pa, attempt=1)
+    cluster.patches.clear()
+    again = await _apply(pa, attempt=2)
+    assert again["applied"]["already_at_target"] is True and again["status"] == "succeeded" and not cluster.patches
 
 
 @pytest.mark.asyncio
@@ -448,6 +512,16 @@ async def test_an_approval_older_than_a_day_is_not_applied(cluster):
     with pytest.raises(RuntimeError, match="more than the 24 hours an approval stays valid"):
         await _apply(pa)
     assert not cluster.patches
+
+
+@pytest.mark.parametrize(
+    "seconds,said",
+    [(1, "1 second"), (7.2, "7 seconds"), (89, "89 seconds"), (600, "10 minutes"), (3600, "60 minutes"),
+     (86400, "24 hours"), (91800, "25.5 hours"), (3 * 86400, "3 days"), (3.5 * 86400, "3.5 days")],
+)
+def test_ages_and_limits_read_as_people_say_them(seconds, said):
+    """Not "0.0 hours" or "0.002 hours" (user, 2026-11-26)."""
+    assert apply_approved_change._duration(seconds) == said
 
 
 @pytest.mark.parametrize("options", [{"proposal_max_age_hours": 48}, {"proposal_max_age_hours": 0}])

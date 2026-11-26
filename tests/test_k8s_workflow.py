@@ -216,3 +216,67 @@ async def test_an_approved_apply_that_refuses_is_still_nothing_executed(k8s_kind
     assert second["status"] == "failed"
     assert "apply_approved_change" not in second["data"]
     assert "NOTHING WAS EXECUTED" in llm.prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_is_not_retried(k8s_kind, monkeypatch):
+    """The step allows 2 attempts, but a refusal is final: a second look 10 s later could find a state the first
+    one ruled out (a sibling pod ready again) and act on it."""
+    from common.capabilities_base import StepRefused
+
+    calls = []
+
+    async def refuses(ctx):
+        calls.append(ctx.attempt)
+        raise StepRefused("apply_approved_change: the cluster changed after this proposal was made (x). Nothing was changed.")
+
+    second, llm = await _propose_then_approve(monkeypatch, refuses)
+
+    assert calls == [1]
+    assert second["status"] == "failed" and "apply_approved_change" not in second["data"]
+    assert "the cluster changed after this proposal was made (x)" in llm.prompts[-1]
+    assert "NOTHING WAS EXECUTED" in llm.prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_any_other_failure_is_still_retried(k8s_kind, monkeypatch):
+    calls = []
+
+    async def fails(ctx):
+        calls.append(ctx.attempt)
+        raise RuntimeError("read timed out")
+
+    second, _llm = await _propose_then_approve(monkeypatch, fails)
+
+    assert calls == [1, 2] and second["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_pod_someone_else_deleted_before_the_approval_is_reported_as_not_deleted(k8s_kind, monkeypatch):
+    """The real apply step through the real worker: the approved pod is gone before the approval, so the task
+    fails as refused (not `already_at_target`), the step runs once, and nothing is deleted."""
+    import common.llm.client as llm_client
+    import common.planner as planner
+    from k8s_agent.actions.delete_pod import DeletePod
+    from k8s_agent.tools import read, write
+
+    fake = fx.FakeClient(k8s_tests._cluster())
+    monkeypatch.setattr(read, "get_client", lambda: fake)
+    monkeypatch.setattr(write, "get_client", lambda: fake)
+    llm = _LLM(plan={"steps": [{"capability": "propose_change"}], "rationale": "delete"}, change={"action": "delete_pod", "pod": "checkout-1"})
+    monkeypatch.setattr(planner, "complete", llm)
+    monkeypatch.setattr(llm_client, "complete", llm)
+    config = {"llm": {"provider": "openai", "api_key": "sk-test", "model": "gpt-x"}, "options": {}}
+    first = await _run({"prompt": "delete pod checkout-1 of deployment checkout", "history": [], "config": config, "confirmed_action": None})
+    assert first["status"] == "needs_approval" and first["pending_action"]["action"] == "delete_pod", first.get("refusal") or first["data"]
+
+    checks = []
+    real_drift = DeletePod.drift
+    monkeypatch.setattr(DeletePod, "drift", lambda self, proposal, state: checks.append(1) or real_drift(self, proposal, state))
+    fake.objects["Pod"] = [p for p in fake.objects["Pod"] if p["metadata"]["name"] != "checkout-1"]
+    second = await _run({"prompt": "approved", "history": [], "config": config, "confirmed_action": fx.a2a_round_trip(first["pending_action"])})
+
+    assert second["status"] == "failed" and "action_result" not in second
+    assert checks == [1]
+    assert not [d for d in fake.deletes if not d["dry_run"]]
+    assert "pod checkout-1 no longer exists" in llm.prompts[-1]
