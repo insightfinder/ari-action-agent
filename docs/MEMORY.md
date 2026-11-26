@@ -6919,3 +6919,18 @@ line in the test fixture follows the format, not an observed backoff. Suite on 3
   agent's code refuses it (it grows only claim-template PVCs), and with the grow-only rule the most any allowed
   PVC write can do is make a disk larger.
 
+
+**expand_pvc live on test (2026-11-26).** test-fluxcd moved ari-k8s from oncallari 0.3.17 to 0.3.20 (0.3.19
+skipped); HelmRelease reports `Helm upgrade succeeded ... oncallari@0.3.20`; ClusterRole `ari-k8s` has `patch` on
+`persistentvolumeclaims`; policy `ari-k8s-protected` carries the three PVC rules. Images
+`ari-k8s-agent-worker` / `ari-agent-api` `2611260734-test` (from merge `b0509a8`; `expand_pvc.py` with
+`ambiguous_owners` and `capacity._parse_ca_text` present in the worker). Live script, `--allow-writes`:
+- `rbac`, `admission_policy` (Helm-rendered PVC `ari-coordinator` denied, `data-e2e-disk-0` grow allowed,
+  annotation denied), `expand_pvc` (1Gi -> 2Gi, status succeeded, 64s), `refuse_pvc_shrink`, `refuse_pvc_helm`,
+  `delete_pod`, `resize_pod`: 7 passed.
+- Regression: health (namespace/StatefulSet/CronJob/node/cluster), refuse_managed, refuse_zero, high_replicas,
+  drift, persist, scale, keda_max, hpa_min, restart_deployment, refuse_node_change, node_beside_workload,
+  refuse_statefulset_change, refuse_protected_namespace, refuse_self, ambiguous: 20 passed.
+Not run live: the text-format Cluster Autoscaler status (test runs CA 1.36, YAML format); covered by unit tests
+and the read-only parse of the stg/prod/eu texts above. `data-e2e-disk-0` is left at 2Gi (the scenario recreates
+it at 1Gi on its next run).
