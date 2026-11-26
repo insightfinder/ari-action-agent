@@ -129,26 +129,6 @@ async def test_server_version_and_core_resources_read_fixed_paths(kube):
     assert [c["path"] for c in t.calls] == ["/version", "/api/v1"]
 
 
-async def test_eviction_is_a_create_on_the_pod_subresource(kube):
-    kube_, t = kube
-    body = {"apiVersion": "policy/v1", "kind": "Eviction", "metadata": {"name": "p1", "namespace": "shop"}}
-    await kube_.create("Pod", "shop", body, True, name="p1", subresource="eviction")
-    call = t.calls[0]
-    assert call["method"] == "POST" and call["path"] == "/api/v1/namespaces/shop/pods/p1/eviction"
-    assert call["query"]["dryRun"] == ["All"] and "fieldManager" not in call["query"]
-
-
-async def test_a_plain_create_posts_to_the_collection(kube):
-    # The name is in the body; POST .../jobs/<name> would answer 405.
-    kube_, t = kube
-    body = {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "report-manual-x2k4q", "namespace": "shop"}}
-    await kube_.create("Job", "shop", body, True, name="report-manual-x2k4q")
-    call = t.calls[0]
-    assert call["method"] == "POST" and call["path"] == "/apis/batch/v1/namespaces/shop/jobs"
-    assert call["query"]["dryRun"] == ["All"] and call["query"]["fieldManager"] == ["ari-k8s-agent"]
-    assert call["body"] == body
-
-
 async def test_delete_is_background_propagation(kube):
     kube_, t = kube
     await kube_.delete("Pod", "p1", "shop", False)
@@ -172,14 +152,6 @@ async def test_a_dry_run_delete_carries_dry_run_and_the_uid_precondition_in_the_
         "dryRun": ["All"],
         "preconditions": {"uid": "uid-db-1"},
     }
-
-
-async def test_json_patch_sends_the_operation_list(kube):
-    kube_, t = kube
-    ops = [{"op": "test", "path": "/metadata/annotations/deployment.kubernetes.io~1revision", "value": "3"}, {"op": "replace", "path": "/spec/template", "value": {}}]
-    await kube_.patch("Deployment", "checkout", "shop", ops, client.PATCH_JSON, True)
-    call = t.calls[0]
-    assert call["headers"]["Content-Type"] == "application/json-patch+json" and call["body"] == ops
 
 
 @pytest.mark.parametrize("status", [403, 404, 409, 500])

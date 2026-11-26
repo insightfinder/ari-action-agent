@@ -181,9 +181,17 @@ def _pvcs_mentioned(prompt: str, pvcs: list[dict]) -> list[dict]:
 async def _pvc_resolution(ctx: StepContext, default_ns: str | None) -> dict | None:
     """A request to resize a disk that names a PVC verbatim is about that PVC, even when a Deployment has the
     same name (a chart's `prometheus-server` Deployment and PVC)."""
-    if not policy.asks_disk_size_change(ctx.prompt):
+    if not policy.names_disk(ctx.prompt):
         return None
-    hits = _prefer_namespace(_pvcs_mentioned(ctx.prompt, await ctx.tool("list_pvcs")(None)), ctx.prompt, default_ns)
+    try:
+        pvcs = await ctx.tool("list_pvcs")(None)
+    except Exception:  # noqa: BLE001 — only decides whether a PVC is meant; workloads are resolved as before
+        return None
+    hits = _prefer_namespace(_pvcs_mentioned(ctx.prompt, pvcs), ctx.prompt, default_ns)
+    # Judged without the PVC names and namespaces: `redis-data-redis-replicas-0` or namespace `memory-db` does not
+    # make it a request about replicas or memory.
+    if not hits or not policy.asks_disk_size_change(ctx.prompt, [n for h in hits for n in (h["name"], h["namespace"])]):
+        return None
     if len(hits) == 1:
         return finish(
             {
@@ -219,8 +227,6 @@ async def run(ctx: StepContext) -> dict:
     if pods and all(h["name"] in namespaces and _names_namespace(ctx.prompt, h["name"]) for h in named):
         named = []
     hits = _prefer_namespace(named or pods, ctx.prompt, default_ns)
-    nodes = _nodes_mentioned(ctx.prompt, await ctx.tool("list_nodes")())
-    node = nodes[0] if len(nodes) == 1 else None
     # One workload named verbatim settles it without the model, unless the prompt uses that name for a
     # namespace: "the pods in the cert-manager namespace" is not about the cert-manager Deployment alone.
     if len(hits) == 1 and not (hits[0]["name"] in namespaces and _names_namespace(ctx.prompt, hits[0]["name"])):
@@ -231,6 +237,13 @@ async def run(ctx: StepContext) -> dict:
                 "reasoning": "the workload name, or one of its pods' names, appears verbatim in the request",
             }
         )
+
+    # Nodes are read only when no single workload settles it, and a failed read only loses the node match.
+    try:
+        nodes = _nodes_mentioned(ctx.prompt, await ctx.tool("list_nodes")())
+    except Exception:  # noqa: BLE001
+        nodes = []
+    node = nodes[0] if len(nodes) == 1 else None
 
     shortlist = hits or _shortlist(ctx.prompt, workloads, default_ns)
     user_prompt = (

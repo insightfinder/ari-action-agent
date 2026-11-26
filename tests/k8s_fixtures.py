@@ -54,10 +54,12 @@ def deployment(
         "metadata": {
             "name": name,
             "namespace": namespace,
+            "uid": f"uid-deploy-{namespace}-{name}",
             "generation": generation,
             "labels": labels or {},
             "annotations": {
                 "kubectl.kubernetes.io/last-applied-configuration": json.dumps({"env": CANARY}),
+                "deployment.kubernetes.io/revision": "3",
                 **(annotations or {}),
             },
         },
@@ -433,10 +435,11 @@ class FakeClient:
         if obj is None:
             raise _not_found(kind, name)
         self.patches.append({"kind": kind, "name": name, "namespace": namespace, "body": body, "dry_run": dry_run, "content_type": content_type})
-        if "json-patch" in content_type:
-            merged = _json_patch(obj, body)
-        else:
-            merged = _deep_merge(obj, body, strategic="strategic" in content_type)
+        uid = ((body or {}).get("metadata") or {}).get("uid")
+        if uid and uid != (obj.get("metadata") or {}).get("uid"):
+            # As the API server answers a patch whose metadata.uid is not the object's (seen on test).
+            raise api_error(422, f'{kind} "{name}" is invalid: metadata.uid: Invalid value: "{uid}": field is immutable', "Invalid")
+        merged = _deep_merge(obj, body, strategic="strategic" in content_type)
         if not dry_run:
             merged["metadata"]["generation"] = (obj["metadata"].get("generation") or 0) + 1
             obj.clear()
@@ -528,25 +531,6 @@ class FakeClient:
         if isinstance(entry, dict):  # {"previous": ..., "current": ...}
             return entry.get("previous" if previous else "current", "")
         return entry
-
-
-def _json_patch(obj: dict, ops: list) -> dict:
-    """RFC 6902, the two operations a rollback sends: `test` (a mismatch is a 422, as from the API server) and
-    `replace`."""
-    out = copy.deepcopy(obj)
-    for op in ops:
-        keys = [k.replace("~1", "/").replace("~0", "~") for k in op["path"].lstrip("/").split("/")]
-        parent = out
-        for key in keys[:-1]:
-            parent = parent[key]
-        if op["op"] == "test":
-            if parent.get(keys[-1]) != op["value"]:
-                raise api_error(422, f"the server rejected our request due to an error in our request: test failed at {op['path']}", "Invalid")
-        elif op["op"] == "replace":
-            parent[keys[-1]] = copy.deepcopy(op["value"])
-        else:
-            raise ValueError(f"unsupported op {op['op']}")
-    return out
 
 
 def replicaset(deployment="checkout", revision=1, image="registry.example/checkout:1.1", template_hash="5c8d7f6b4", namespace="shop", replicas=0):

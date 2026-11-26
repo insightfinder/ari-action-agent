@@ -97,7 +97,7 @@ class DeletePod(ActionSpec):
         action = {
             "action": "delete_pod",
             "namespace": pod["namespace"],
-            "deployment": w["name"] if kind == "Deployment" else None,
+            "deployment": w["name"],
             "workload_kind": kind,
             "workload": w["name"],
             "pod": pod["name"],

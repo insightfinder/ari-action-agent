@@ -8,6 +8,7 @@ Uses the fake cluster of test_k8s_capabilities.py, with checkout's revision hist
 
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,6 @@ from test_k8s_capabilities import ScriptedLLM, _change, _ctx, _resolved  # noqa:
 from k8s_agent.capabilities import apply_approved_change, check_health, find_workload, propose_change  # noqa: E402
 from k8s_agent.tools import policy, read, rollout, write  # noqa: E402
 
-pytestmark = pytest.mark.asyncio
 _RESTARTED_AT = "kubectl.kubernetes.io/restartedAt"
 
 
@@ -89,7 +89,18 @@ def _obj(cluster, kind, name):
 
 @pytest.mark.parametrize(
     "prompt",
-    ["restart checkout", "do a rollout restart of deployment checkout", "重启 checkout", "please bounce the checkout pods", "滚动重启 db"],
+    [
+        "restart checkout",
+        "do a rollout restart of deployment checkout",
+        "重启 checkout",
+        "please bounce the checkout pods",
+        "滚动重启 db",
+        "现在重启一下 checkout",
+        "can you restart checkout?",
+        "Why is it slow? Restart checkout.",
+        "check why it fails and restart checkout",
+        "检查为什么失败，然后重启 checkout",
+    ],
 )
 def test_restart_is_asked_for(prompt):
     assert policy.asks_restart(prompt)
@@ -105,6 +116,15 @@ def test_restart_is_asked_for(prompt):
         "checkout 重启了 5 次，内存加到 4Gi",
         "don't restart anything, just check checkout",
         "what is the restartPolicy of checkout?",
+        # Health reports and questions, not requests.
+        "pod 重启了很多次，请检查",
+        "checkout 重启了好几次",
+        "checkout 一直在重启",
+        "checkout 重启失败了",
+        "为什么 checkout 重启",
+        "why does it restart?",
+        "did checkout restart?",
+        "kubectl rollout restart failed, check deploy checkout",
     ],
 )
 def test_restart_is_not_asked_for(prompt):
@@ -128,12 +148,19 @@ def test_delete_pod_is_asked_for(prompt):
         "pod checkout-3 restart count is 9, raise memory to 4Gi",
         "pod checkout-3 重启了 5 次",
         "pod checkout-3 的重启次数是 9",
+        "pod 重启了很多次，请检查",
+        "pod checkout-1 一直在重启",
+        "why does pod checkout-1 restart",
+        "pod checkout-1 restart failed",
+        # The negation stands between the pod and the verb.
+        "checkout-1 这个 pod 不要删掉",
     ],
 )
 def test_delete_pod_is_not_asked_for(prompt):
     assert not policy.asks_delete_pod(prompt)
 
 
+@pytest.mark.asyncio
 async def test_a_restart_the_request_does_not_ask_for_is_refused(cluster):
     result = await _propose("checkout-3 restarted 9 times, what is wrong?", _change(action="restart_rollout"))
     assert result["refusal"]["asked_for"] == "restart_rollout"
@@ -142,12 +169,14 @@ async def test_a_restart_the_request_does_not_ask_for_is_refused(cluster):
 
 
 @pytest.mark.parametrize("kind,name", [("StatefulSet", "db"), ("DaemonSet", "agent")])
+@pytest.mark.asyncio
 async def test_a_change_to_a_statefulset_or_daemonset_is_refused(cluster, kind, name):
     llm = ScriptedLLM(_change(action="restart_rollout"))
     result = await propose_change.run(_ctx("propose_change", f"restart {name}", results=_workload(kind, name), llm=llm))
     assert "changes only Deployments" in result["refusal"]["reason"] and llm.prompts == [] and not cluster.patches
 
 
+@pytest.mark.asyncio
 async def test_a_statefulset_restart_proposed_before_the_removal_is_not_applied(cluster):
     pa = await _approved(cluster, "restart checkout", _change(action="restart_rollout"))
     pa.update({"workload_kind": "StatefulSet", "workload": "db", "deployment": None, "target": {"kind": "StatefulSet", "namespace": "shop", "name": "db"}})
@@ -159,6 +188,7 @@ async def test_a_statefulset_restart_proposed_before_the_removal_is_not_applied(
 # ---------------------------------------------------------------- restart_rollout
 
 
+@pytest.mark.asyncio
 async def test_restart_of_a_deployment_is_proposed(cluster):
     result = await _propose("restart checkout", _change(action="restart_rollout"))
     pa = result["pending_action"]
@@ -175,18 +205,21 @@ async def test_restart_of_a_deployment_is_proposed(cluster):
     assert fx.CANARY not in json.dumps(result)
 
 
+@pytest.mark.asyncio
 async def test_restart_of_a_paused_deployment_is_refused(cluster):
     _obj(cluster, "Deployment", "checkout")["spec"]["paused"] = True
     result = await _propose("restart checkout", _change(action="restart_rollout"))
     assert "is paused" in result["refusal"]["reason"]
 
 
+@pytest.mark.asyncio
 async def test_restart_under_recreate_is_high_risk(cluster):
     _obj(cluster, "Deployment", "checkout")["spec"]["strategy"] = {"type": "Recreate"}
     pa = (await _propose("restart checkout", _change(action="restart_rollout")))["pending_action"]
     assert pa["risk_tier"] == "high" and any("Recreate" in r["message"] for r in pa["risks"])
 
 
+@pytest.mark.asyncio
 async def test_restart_apply_writes_once_and_verifies(cluster):
     pa = await _approved(cluster, "restart checkout", _change(action="restart_rollout"))
     cluster.auto_rollout = True
@@ -201,6 +234,30 @@ async def test_restart_apply_writes_once_and_verifies(cluster):
     assert again["applied"]["already_at_target"] is True and not cluster.patches
 
 
+@pytest.mark.asyncio
+async def test_restart_is_not_applied_after_a_rollout_replaced_the_pods(cluster):
+    # Image automation or a Helm upgrade rolled the Deployment while the approval waited: its pods are new already.
+    pa = await _approved(cluster, "restart checkout", _change(action="restart_rollout"))
+    assert pa["snapshot"]["revision"] == "3"
+    _obj(cluster, "Deployment", "checkout")["metadata"]["annotations"]["deployment.kubernetes.io/revision"] = "4"
+    with pytest.raises(RuntimeError, match=r"already replaced its pods \(revision 3 -> 4\)"):
+        await _apply(pa)
+    assert not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_a_retried_restart_verifies_although_its_own_rollout_moved_the_revision(cluster):
+    pa = await _approved(cluster, "restart checkout", _change(action="restart_rollout"))
+    cluster.auto_rollout = True
+    await _apply(pa)
+    _obj(cluster, "Deployment", "checkout")["metadata"]["annotations"]["deployment.kubernetes.io/revision"] = "4"
+    cluster.patches.clear()
+    again = await _apply(pa)
+    assert again["applied"]["already_at_target"] is True and not cluster.patches
+    assert any("revision 3 -> 4" in c for c in again["applied"]["changed_since_proposal"])
+
+
+@pytest.mark.asyncio
 async def test_restart_apply_refuses_after_someone_else_restarted(cluster):
     pa = await _approved(cluster, "restart checkout", _change(action="restart_rollout"))
     _obj(cluster, "Deployment", "checkout")["spec"]["template"]["metadata"]["annotations"] = {_RESTARTED_AT: "2026-11-24T00:00:00Z"}
@@ -212,6 +269,7 @@ async def test_restart_apply_refuses_after_someone_else_restarted(cluster):
 # ---------------------------------------------------------------- delete_pod
 
 
+@pytest.mark.asyncio
 async def test_delete_of_a_named_pod_is_proposed(cluster):
     result = await _propose("delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
     pa = result["pending_action"]
@@ -224,17 +282,20 @@ async def test_delete_of_a_named_pod_is_proposed(cluster):
     assert fx.CANARY not in json.dumps(result)
 
 
+@pytest.mark.asyncio
 async def test_delete_needs_the_pod_named(cluster):
     result = await _propose("delete a checkout pod", _change(action="delete_pod"))
     assert result["refusal"]["pods"] == ["checkout-1", "checkout-2", "checkout-3"]
     assert not cluster.deletes
 
 
+@pytest.mark.asyncio
 async def test_delete_of_the_only_ready_pod_is_refused(cluster):
     result = await _propose("delete pod worker-1", _change(action="delete_pod", pod="worker-1"), _resolved("worker"))
     assert "No other pod" in result["refusal"]["reason"] and not cluster.deletes
 
 
+@pytest.mark.asyncio
 async def test_delete_is_not_applied_once_the_other_pods_stopped_being_ready(cluster):
     pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
     for name in ("checkout-2", "checkout-3"):
@@ -245,6 +306,7 @@ async def test_delete_is_not_applied_once_the_other_pods_stopped_being_ready(clu
     assert not cluster.deletes
 
 
+@pytest.mark.asyncio
 async def test_delete_apply_verifies_the_replacement(cluster):
     pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
     cluster.auto_replace = True
@@ -255,6 +317,7 @@ async def test_delete_apply_verifies_the_replacement(cluster):
     assert result["target"] == {"kind": "Pod", "namespace": "shop", "name": "checkout-1"}
 
 
+@pytest.mark.asyncio
 async def test_delete_already_done_is_verified_not_repeated(cluster):
     pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
     cluster.auto_replace = True
@@ -262,8 +325,10 @@ async def test_delete_already_done_is_verified_not_repeated(cluster):
     cluster.deletes.clear()
     again = await _apply(pa)
     assert again["applied"]["already_at_target"] is True and not cluster.deletes and again["status"] == "succeeded"
+    assert again["applied"]["changed_since_proposal"] == ["pod checkout-1 no longer exists"]
 
 
+@pytest.mark.asyncio
 async def test_a_statefulset_pod_delete_proposed_before_the_removal_is_not_applied(cluster):
     pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
     uid = _obj(cluster, "Pod", "db-1")["metadata"]["uid"]
@@ -275,6 +340,7 @@ async def test_a_statefulset_pod_delete_proposed_before_the_removal_is_not_appli
     assert not cluster.deletes
 
 
+@pytest.mark.asyncio
 async def test_a_pod_name_only_inside_a_longer_one_is_not_taken(cluster):
     import copy
 
@@ -285,6 +351,7 @@ async def test_a_pod_name_only_inside_a_longer_one_is_not_taken(cluster):
     assert "not clear" in result["refusal"]["reason"] and not cluster.deletes
 
 
+@pytest.mark.asyncio
 async def test_delete_apply_on_an_older_chart_is_refused_with_the_rule(cluster, monkeypatch):
     async def forbidden(*_a, **_k):
         raise fx.api_error(403, 'pods "checkout-1" is forbidden: cannot delete resource "pods"', "Forbidden")
@@ -297,6 +364,7 @@ async def test_delete_apply_on_an_older_chart_is_refused_with_the_rule(cluster, 
 # ---------------------------------------------------------------- find_workload / check_health with other kinds
 
 
+@pytest.mark.asyncio
 async def test_find_workload_resolves_a_statefulset_by_name(cluster):
     llm = ScriptedLLM()
     result = await find_workload.run(_ctx("find_workload", "restart statefulset db", llm=llm))
@@ -304,6 +372,7 @@ async def test_find_workload_resolves_a_statefulset_by_name(cluster):
     assert llm.prompts == []
 
 
+@pytest.mark.asyncio
 async def test_find_workload_resolves_statefulset_and_daemonset_pods(cluster):
     result = await find_workload.run(_ctx("find_workload", "delete pod db-1", llm=ScriptedLLM()))
     assert result["resolution"]["kind"] == "StatefulSet"
@@ -311,6 +380,7 @@ async def test_find_workload_resolves_statefulset_and_daemonset_pods(cluster):
     assert result["resolution"]["kind"] == "DaemonSet" and result["resolution"]["name"] == "agent"
 
 
+@pytest.mark.asyncio
 async def test_find_workload_takes_a_statefulset_from_the_model(cluster):
     llm = ScriptedLLM('RESOLUTION_JSON: {"scope": "workload", "kind": "StatefulSet", "namespace": "shop", "name": "db", "confident": true}')
     result = await find_workload.run(_ctx("find_workload", "restart the database", llm=llm, options={"namespace": "shop"}))
@@ -318,6 +388,7 @@ async def test_find_workload_takes_a_statefulset_from_the_model(cluster):
     assert '"shop/db (StatefulSet)"' in llm.prompts[0]
 
 
+@pytest.mark.asyncio
 async def test_check_health_of_a_statefulset_looks_at_its_own_pods_only(cluster):
     _obj(cluster, "StatefulSet", "db")["status"]["readyReplicas"] = 1
     result = await check_health.run(_ctx("check_health", "check db", results=_workload("StatefulSet", "db"), options={"include_logs": False}))
@@ -327,3 +398,90 @@ async def test_check_health_of_a_statefulset_looks_at_its_own_pods_only(cluster)
     assert {f["name"] for f in report["findings"]} <= {"db", "db-0", "db-1"}
     assert any(f["kind"] == "StatefulSet" and f["reason"] == "ReplicasUnavailable" and "1/2" in f["evidence"] for f in report["findings"])
     assert list(report["container_resources"]) == ["shop/db"]
+
+
+# ---------------------------------------------------------------- a late approval
+
+
+_SCALE5 = _change(action="scale_replicas", replicas=5, replicas_quote="to 5")
+
+
+def _aged(pa, hours):
+    return {**pa, "created_at": (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()}
+
+
+async def _apply_with(pa, options):
+    ctx = _ctx("apply_approved_change", "", params=pa, confirmed=True, options=options)
+    return (await apply_approved_change.run(ctx))["action_result"]
+
+
+@pytest.mark.asyncio
+async def test_a_change_approved_after_the_deployment_was_made_again_is_not_applied(cluster):
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    _obj(cluster, "Deployment", "checkout")["metadata"]["uid"] = "uid-checkout-recreated"
+    with pytest.raises(RuntimeError, match="deleted and created again"):
+        await _apply(pa)
+    assert not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_a_proposal_from_before_the_uid_was_recorded_still_applies(cluster):
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    pa["snapshot"].pop("deployment_uid")
+    cluster.auto_rollout = True
+    assert (await _apply(pa))["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_resources_someone_changed_while_the_approval_waited_refuse_the_change(cluster):
+    pa = await _approved(cluster, "set the memory limit of checkout to 3Gi", _change(action="set_resources", container="app", resources={"limits": {"memory": {"value": "3Gi", "quote": "memory limit of checkout to 3Gi"}}}))
+    container = _obj(cluster, "Deployment", "checkout")["spec"]["template"]["spec"]["containers"][0]
+    container["resources"]["requests"]["cpu"] = "750m"
+    with pytest.raises(RuntimeError, match="container app resources changed since the proposal"):
+        await _apply(pa)
+    assert not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_an_approval_older_than_a_day_is_not_applied(cluster):
+    pa = _aged(await _approved(cluster, "scale checkout to 5", _SCALE5), 25)
+    with pytest.raises(RuntimeError, match="more than the 24 hours an approval stays valid"):
+        await _apply(pa)
+    assert not cluster.patches
+
+
+@pytest.mark.parametrize("options", [{"proposal_max_age_hours": 48}, {"proposal_max_age_hours": 0}])
+@pytest.mark.asyncio
+async def test_the_age_limit_is_an_option(cluster, options):
+    pa = _aged(await _approved(cluster, "scale checkout to 5", _SCALE5), 25)
+    cluster.auto_rollout = True
+    assert (await _apply_with(pa, options))["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_a_change_already_written_is_verified_however_old_its_proposal(cluster):
+    # The step's first attempt wrote it; a retry after the limit must not turn that into "nothing was changed".
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    cluster.auto_rollout = True
+    await _apply(pa)
+    cluster.patches.clear()
+    again = await _apply(_aged(pa, 30))
+    assert again["applied"]["already_at_target"] is True and again["status"] == "succeeded" and not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_a_scale_up_after_someone_changed_the_pods_cpu_or_memory_is_not_applied(cluster):
+    # The proposal's estimate of where the new pods fit was made from the old requests.
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    _obj(cluster, "Deployment", "checkout")["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]["memory"] = "4Gi"
+    with pytest.raises(RuntimeError, match="estimate of where the new pods fit no longer holds"):
+        await _apply(pa)
+    assert not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_a_scale_down_does_not_depend_on_the_pods_cpu_or_memory(cluster):
+    pa = await _approved(cluster, "scale checkout to 2", _change(action="scale_replicas", replicas=2, replicas_quote="to 2"))
+    _obj(cluster, "Deployment", "checkout")["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]["memory"] = "4Gi"
+    cluster.auto_rollout = True
+    assert (await _apply(pa))["status"] == "succeeded"

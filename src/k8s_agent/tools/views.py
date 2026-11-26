@@ -158,6 +158,8 @@ def deployment_view(raw: dict) -> dict:
         "uid": meta.get("uid"),
         "generation": meta.get("generation"),
         "observed_generation": status.get("observedGeneration"),
+        # Bumped by the controller each time a pod template change (or a rollback) starts a rollout.
+        "revision": (meta.get("annotations") or {}).get("deployment.kubernetes.io/revision"),
         "created_at": meta.get("creationTimestamp"),
         "replicas": spec.get("replicas", 1),
         "paused": bool(spec.get("paused")),

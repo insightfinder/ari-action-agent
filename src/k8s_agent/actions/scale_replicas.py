@@ -44,6 +44,13 @@ class ScaleReplicas(DeploymentAction):
         then = artifact_int(proposal["snapshot"].get("deployment_replicas"))
         if then != state["deployment"].get("replicas"):
             changes.append(f"replicas changed from {then} to {state['deployment'].get('replicas')}")
+        # A scale-up's capacity estimate was made from each pod's requests then; changed requests (someone's
+        # CPU/memory change while the approval waited) make it say nothing about the new pods.
+        proposed = proposal["snapshot"].get("container_resources")
+        if then is not None and artifact_int(proposal.get("replicas") or 0) > then and proposed is not None:
+            now = {c["name"]: c["resources"] for c in state["deployment"]["template"]["containers"]}
+            if now != proposed:
+                changes.append("its containers' CPU/memory changed since the proposal, so its estimate of where the new pods fit no longer holds")
         return changes
 
     def at_target(self, action, state):

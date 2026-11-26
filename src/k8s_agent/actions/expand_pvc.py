@@ -299,7 +299,9 @@ class ExpandPvc(ActionSpec):
                 resource="PersistentVolumeClaim",
                 name=action["pvc"],
                 namespace=action.get("namespace"),
-                body={"spec": {"resources": {"requests": {"storage": action["storage"]}}}},
+                # The uid ties the write to the approved PVC: one deleted and made again under the same name
+                # answers 422 ("metadata.uid: field is immutable", checked on test) instead of being grown.
+                body={"metadata": {"uid": action["pvc_uid"]}, "spec": {"resources": {"requests": {"storage": action["storage"]}}}},
                 patch_type="merge",
             )
         ]
@@ -335,6 +337,14 @@ class ExpandPvc(ActionSpec):
         why, _ = eligibility(state)
         if why:
             changes.append(why)
+        if pvc.get("phase") != "Bound":
+            changes.append(f"PVC {name} is {pvc.get('phase') or 'not bound'} now, not Bound")
+        sc = state.get("storage_class")
+        if sc is None or not sc.get("allow_volume_expansion"):
+            changes.append(
+                f"StorageClass {pvc.get('storage_class') or '(none)'} "
+                + ("no longer exists" if sc is None else "no longer allows volume expansion")
+            )
         if _bytes(pvc.get("requested")) != _bytes(snapshot.get("requested")):
             changes.append(f"its requested size changed from {snapshot.get('requested')} to {pvc.get('requested')}")
         return changes
