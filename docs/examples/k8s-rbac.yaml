@@ -75,9 +75,9 @@ rules:
   - apiGroups: ["source.toolkit.fluxcd.io"]
     resources: [gitrepositories, ocirepositories, buckets, helmrepositories]
     verbs: [get]
-  # ---- write (the scale subresource for replica changes)
+  # ---- write (Deployments only; the scale subresource for replica changes)
   - apiGroups: ["apps"]
-    resources: [deployments/scale, deployments, statefulsets, daemonsets]
+    resources: [deployments/scale, deployments]
     verbs: [patch]
   - apiGroups: ["autoscaling"]
     resources: [horizontalpodautoscalers]
@@ -94,10 +94,6 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [delete]
-  # Suspending or resuming a CronJob.
-  - apiGroups: ["batch"]
-    resources: [cronjobs]
-    verbs: [patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

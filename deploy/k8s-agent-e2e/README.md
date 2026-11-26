@@ -27,10 +27,8 @@ kubectl --context $CTX -n ari-k8s-agent create secret generic ari-k8s-agent-env 
   --from-literal=TEMPORAL_PAYLOAD_ENCRYPTION_KEY="$(openssl rand -base64 32)"
 kubectl --context $CTX apply -f <(sed "s|__IMAGE_TAG__|$TAG|g; s|__TEMPORAL_HOST__|$TEMPORAL_HOST|g" deploy/k8s-agent-e2e/agent.yaml)
 
-# 3. Fixtures (e2e-rollback then gets a second revision, so its first one is "the previous")
+# 3. Fixtures
 kubectl --context $CTX apply -f deploy/k8s-agent-e2e/fixtures.yaml
-kubectl --context $CTX -n ari-k8s-e2e rollout status deploy/e2e-rollback
-kubectl --context $CTX -n ari-k8s-e2e set image deploy/e2e-rollback app=registry.k8s.io/pause:3.9
 
 # 4. Run the scenarios (read-only + cancelled proposals; add --allow-writes to approve changes)
 kubectl --context $CTX -n ari-k8s-agent port-forward svc/ari-k8s-api 18002:80 &
@@ -69,30 +67,27 @@ read-only root filesystem, no token in the API pod). Every write scenario
 puts the fixture fields it changed back with kubectl afterwards, so the run
 can be repeated; after an interrupted run, re-apply `fixtures.yaml`.
 
-Restart, rollback and pod delete (`restart_deployment`, `restart_statefulset`,
-`restart_daemonset`, `delete_pod`, `delete_sts_pod`, `rollback`,
-`rollback_revision`) work on `e2e-plain`, `e2e-sts`, `e2e-ds` and
-`e2e-rollback`. Without `--allow-writes` they still check that the
-proposal's dry run changed nothing (the pod a delete names is still there
-with the same uid). On the test cluster the agent runs in namespace
-`insightfinder` (`ari-k8s-api` / `ari-k8s-worker`, secret `ari-k8s-secret`)
-rather than `ari-k8s-agent`; only `ari-k8s-e2e` is ever changed. Write
-scenarios belong here, not on real services: on test, image automation
-redeploys the `insightfinder` namespace many times an hour.
+Restart and pod delete (`restart_deployment`, `delete_pod`) work on
+`e2e-plain`. Without `--allow-writes` they still check that the proposal's
+dry run changed nothing (the pod a delete names is still there with the same
+uid). On the test cluster the agent runs in namespace `insightfinder`
+(`ari-k8s-api` / `ari-k8s-worker`, secret `ari-k8s-secret`) rather than
+`ari-k8s-agent`; only `ari-k8s-e2e` is ever changed. Write scenarios belong
+here, not on real services: on test, image automation redeploys the
+`insightfinder` namespace many times an hour.
 
-Image, pause/resume and CronJob scenarios (`set_image`,
-`set_image_statefulset`, `pause_resume`, `health_cronjob`,
-`suspend_resume_cronjob`) work on `e2e-plain`, `e2e-sts` and the CronJob
-`e2e-cron`, which fires only once a year. `set_image*` move container `app`
-to `pause:3.9` and kubectl puts `pause:3.10` back; `pause_resume` pauses
-`e2e-plain` through the agent, changes its image with kubectl while paused,
-and has the agent resume it (the waiting change then rolls out). The CronJob
-changes need chart 0.3.16 (`patch` on cronjobs).
+`health_cronjob` reads the
+CronJob `e2e-cron`, which fires only once a year.
 
-`scale_statefulset` scales `e2e-sts-pvc` (one pod with a 1Gi gp3 PVC from
-its volume claim template) to 2 and back to 1 through the agent: the new pod
-gets PVC `data-e2e-sts-pvc-1`, which the scale-down keeps (a later run mounts
-it again, and the proposal says so). The PVCs go with the namespace.
+What is never changed (2026-11-26): `refuse_statefulset_change` (a restart of
+`e2e-sts` is refused), `refuse_protected_namespace` (scaling coredns in
+kube-system), `refuse_self` (a restart of the agent's own worker): each must
+end without a proposal and with the object unchanged. `admission_policy`
+checks the chart's ValidatingAdmissionPolicy directly, with server dry runs
+as the worker's ServiceAccount: denied in kube-system and on the agent's own
+worker, allowed on `e2e-plain`. `refuse_self` and `admission_policy` need
+`ARI_WORKER_DEPLOYMENT` and the oncallari chart from 0.3.17 (it sets the
+protected-workload list and the policy); `agent.yaml` here sets neither.
 
 Nodes are only read: `health_node` checks the node an e2e-plain pod runs on
 (by its short name), `refuse_node_change` checks that "cordon node ..." is

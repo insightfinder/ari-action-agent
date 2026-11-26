@@ -5855,3 +5855,110 @@ merged into test and e2e-tested on its own (the two phases are not mixed). Batch
 `scale_replicas`, `set_image` only. Targets: only names the request writes out, capped; no label selector and no
 "all Deployments in a namespace". Execution: one target at a time, each verified before the next, stop at the
 first failure and report done / not done. Recorded in docs/K8S_AGENT_INTERFACE.md "Planned".
+
+**StatefulSet scaling deployed to test and e2e-tested (2026-11-26).** Feature commit `178afbb`, merged into test
+as `03f5811` (conflicts in README.md and docs/MEMORY.md only, both sides kept); images ari-k8s-agent-worker and
+ari-agent-api `2611260237-test`. Run with `--allow-writes`: `rbac`, `scale_statefulset` (e2e-sts-pvc 1 -> 2
+`succeeded` in 68 s, 2 -> 1 tier high `succeeded` in 68 s, PVC `data-e2e-sts-pvc-1` kept), and the Deployment
+scale scenarios after the `scale_replicas` rewrite: `scale` (e2e-plain 2 -> 3, 65 s), `refuse_managed` (KEDA and
+HPA refused), `refuse_zero`, `high_replicas` (critical, prefixed name), `drift`, `persist`. 8 scenarios, 0
+failed. Fixtures back afterwards: e2e-plain 2, e2e-helm-labelled 1, e2e-sts-pvc 1 with both PVCs.
+
+**No PVC deletes (2026-11-26, user).** Asked whether the agent could delete the PVCs a StatefulSet scale-down
+leaves (a narrow `delete_pvc`: only ordinals past the replica count, not mounted, named in the request). Declined:
+the agent runs no dangerous operation. Reasons given: gp3 on test has `reclaimPolicy: Delete`, so the EBS volume
+and its data are gone for good; `delete persistentvolumeclaims` cannot be narrowed by name in RBAC. Recorded in
+the Never list of docs/K8S_AGENT_INTERFACE.md. Also checked on test (server dry run, nothing written): shrinking
+a PVC is refused by the API server ("field can not be less than status.capacity"), and EBS volumes only grow.
+
+
+**Safety review of every capability (2026-11-26, user decisions).** Rule from the user: no operation that could
+break a product environment. Recreate strategies are an environment choice made at deploy time (test/stg), so
+not a concern here. To be removed (built, on test): `rollback`, `set_image`, `suspend_cronjob` /
+`resume_cronjob`, StatefulSet scaling (`scale_replicas` back to Deployments only), restart of StatefulSets and
+DaemonSets, deleting a StatefulSet's or DaemonSet's pod; `delete_pod` to refuse the only ready pod. Not to be
+built: `batch`, `flux_reconcile` (patch on HelmReleases/Kustomizations cannot be narrowed to the annotation),
+`resize_pod` for StatefulSet pods. Kept: Deployment scale, autoscaler bounds, Deployment CPU/memory, in-place
+pod resize, Deployment restart, Deployment pod delete, pause/resume rollout, reads; `expand_pvc` stays planned
+(costs money, does not break anything). New: protected namespaces (kube-system, flux-system, cert-manager,
+vault, monitoring proposed) refused in code; the agent runs in `insightfinder` beside the services, so its own
+workloads (and its approval path) are protected by name rather than by namespace. RBAC drops patch on
+statefulsets/daemonsets/cronjobs. Plan and open questions in the session reply; nothing changed yet.
+Follow-up decisions (same day): protected namespaces = kube-system, kube-public, kube-node-lease, flux-system,
+cert-manager, vault, keda, traefik (not monitoring: Prometheus/Loki there often need fixing; not knative-*,
+reloader). Protected workloads by name = the agent's own API/worker Deployments (always) plus its approval
+path: insightfinder-mcp-service, insightfinder-mcp-service-worker, temporal-*, ari-coordinator. Both lists are
+chart values (one source for the code check and a ValidatingAdmissionPolicy that denies the agent's
+ServiceAccount those writes). pause/resume_rollout: first proposed for removal (worry: a Flux HelmRelease
+upgrade might time out on a paused Deployment); the user asked for it to be verified first, so it stays until
+decided (result below). VAP needs Kubernetes >= 1.30: test, stg and prod API servers report v1.37.3.
+
+**Safety tightening built (2026-11-26, II-25740; uncommitted).** Per the decisions above.
+- Removed: `actions/rollback.py`, `set_image.py`, `cronjob.py`; StatefulSet scaling (scale_replicas,
+  base, governance, read, views, propose_change and tests reverted to their 72ac95d state); restart and
+  pod delete of StatefulSets/DaemonSets; the intent gates and image helpers, `wait_workload_rollout`,
+  `wait_cronjob_suspend`, `list_replicasets` and the rollback/image `moved_away` kind; scenarios
+  restart_statefulset/daemonset, delete_sts_pod, rollback(_revision), set_image(_statefulset),
+  scale_statefulset, suspend_resume_cronjob; fixtures e2e-rollback and e2e-sts-pvc (e2e-cron kept for
+  `health_cronjob`). Kept: pause/resume (the user wants it verified first, see below).
+- `propose_change` refuses any non-Deployment target before asking the model; `apply_approved_change` refuses
+  a proposal whose target kind its action no longer takes (a StatefulSet restart made before the deploy).
+- `delete_pod`: Deployment pods only; refused when no other pod is ready, at proposal and again at approval.
+- New `tools/protection.py`: protected namespaces (default kube-system, kube-public, kube-node-lease,
+  flux-system, cert-manager, vault, keda, traefik) and workloads (`ns/name`, trailing `*` = prefix; no default
+  in code: names are installation-specific, and a test forbids hard-coded InsightFinder names in k8s_agent),
+  from `K8S_AGENT_PROTECTED_NAMESPACES` / `_WORKLOADS`; checked in propose (refusal `protected: true`) and
+  apply. A dry run denied by a ValidatingAdmissionPolicy is a refusal too.
+- charts branch `II-25740-k8s-agent-protection` (from main, oncallari 0.3.17): RBAC drops patch on
+  statefulsets/daemonsets/cronjobs; `ariK8sAgent.protection` values (namespaces; workloads where a bare name is
+  in the release namespace; the agent's API and worker always added) feed the worker env and a new
+  ValidatingAdmissionPolicy + binding (on by default; rendering fails without the v1 API). The local branch
+  `II-25740-k8s-agent-node-actions` remains obsolete.
+- Policy checked live on test with a probe copy (`ari-k8s-protected-probe`, rendered for release ari-k8s,
+  deleted afterwards), as the worker's ServiceAccount with server dry runs: denied kube-system/coredns,
+  insightfinder/ari-k8s-worker, insightfinder-mcp-service, a scale of temporal-frontend, delete and
+  pods/resize of the worker's pod (resize through the API with impersonation: kubectl's GET of the
+  subresource is itself refused by RBAC); allowed insightfinder-metricagentworker, e2e-plain (patch, scale,
+  pod delete) and the e2e-keda ScaledObject. Confirmed afterwards that no probe annotation was written.
+- New live scenarios: refuse_statefulset_change, refuse_protected_namespace, refuse_self, admission_policy;
+  the `rbac` scenario now expects patch on statefulsets/daemonsets/cronjobs/PVCs and delete on PVCs denied.
+- Suite on 3.12: 1235 passed, 11 skipped. Docs: K8S_AGENT_INTERFACE (actions, protection, Never, RBAC,
+  cross-repo, change log), DEVELOPER_GUIDE, README, e2e README, agent card (meta.py), capabilities.yaml.
+  Not yet deployed.
+
+**Pause vs a Flux HelmRelease upgrade, checked on test (2026-11-26).** Temporary HelmRepository + HelmRelease
+`e2e-podinfo` (podinfo 6.17.0) in ari-k8s-e2e, deleted afterwards. Installed, `kubectl rollout pause`, then the
+HelmRelease values changed (ui.message v1 -> v2): the upgrade succeeded within seconds (Ready=True,
+UpgradeSucceeded, history v2 deployed) and stayed so for 13 minutes with no failure, timeout or remediation;
+Helm kept `spec.paused: true`; the Deployment's template had v2 but no pod was replaced (updatedReplicas 0,
+condition DeploymentPaused). After `rollout resume` the new ReplicaSet rolled out (1/1 on v2 within a minute)
+and the HelmRelease stayed Ready. The earlier worry (an upgrade timing out on a paused Deployment) does not
+hold with helm-controller v1.6.3; the real effect is that Flux reports a version the pods do not run yet. The
+pause proposal's risk now says so. Log: scratchpad pausecheck/run.log (not kept). Read-only check of the real
+HelmReleases: drift detection is unset on all of them (test 33, stg 35, prod 59), so Helm does not put a
+pause back; stg and prod run older helm-controllers (v1.3.0, v1.1.0) and most releases there have
+`upgrade.remediation.retries: 3`, so the "upgrade succeeds while paused" result is verified for v1.6.3 with
+default settings only, not for stg/prod.
+
+**Retired fixtures deleted on test (2026-11-26, user left it to me).** `kubectl --context test -n ari-k8s-e2e
+delete` of Deployment `e2e-rollback`, StatefulSet `e2e-sts-pvc` and PVCs `data-e2e-sts-pvc-0/1`; their PVs
+(gp3, reclaimPolicy Delete) are gone too. The rest of `fixtures.yaml` is unchanged on the cluster.
+
+**Admission policy optional for older clusters (2026-11-26).** The agent may be open-sourced and installed on
+clusters without ValidatingAdmissionPolicy (Kubernetes < 1.30). Chart: `ariK8sAgent.protection.admissionPolicy`
+is now `auto` (render when the API is served, else skip with a NOTES.txt warning), `true` (required; render
+fails without the API) or `false`. Helper `insightfinder.ariK8sAgentAdmissionPolicy`. Checked with helm
+template/install --dry-run=client: with the API auto/true render the policy and binding, false does not;
+without the API auto renders nothing and prints the warning, true fails. The worker's own check runs either
+way. Recommended: set `true` in test-fluxcd/eks-fluxcd (recorded in K8S_AGENT_INTERFACE.md). Plain `helm
+template` without `--api-versions` does not report the API, so auto skips there; Flux and Argo CD pass the
+cluster's API list.
+
+**pause/resume_rollout removed (2026-11-26, user).** After the HelmRelease check above showed a pause does not
+break a release, the user still removed it for its narrow value: once paused the agent has no next step
+(rollback is gone), a pause holds back fixes too, and `kubectl rollout pause` is one command. Removed:
+`actions/pause_rollout.py`, its intent gates (and the `_ZH_STATE_*` patterns), `wait_paused` and the `paused`
+kind of `moved_away`, the `pause_resume` live scenario and the pause tests; docs, agent card and capability
+descriptions updated; recorded in the "Never" list. Kept: the read-only `paused` field in views/queries and the
+restart refusal for a paused Deployment. Remaining writes: scale_replicas, set_autoscaler_bounds, set_resources,
+resize_pod, restart_rollout, delete_pod (Deployments only). Suite on 3.12: 1216 passed, 11 skipped.

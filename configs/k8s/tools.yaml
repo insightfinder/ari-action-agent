@@ -15,13 +15,9 @@ tools:
     module: k8s_agent.tools.read
     function: list_workloads
 
-  get_workload:         # one Deployment, StatefulSet, DaemonSet or CronJob as its view
+  get_workload:         # one Deployment, StatefulSet, DaemonSet or CronJob as its view (changes: Deployments only)
     module: k8s_agent.tools.read
     function: get_workload
-
-  list_replicasets:     # a Deployment's ReplicaSets (its revision history), for a rollback
-    module: k8s_agent.tools.read
-    function: list_replicasets
 
   list_deployment_views:
     module: k8s_agent.tools.read
@@ -106,18 +102,6 @@ tools:
   wait_pod_replaced:    # a deleted pod: old uid gone, replacement ready and stable
     module: k8s_agent.tools.rollout
     function: wait_pod_replaced
-
-  wait_workload_rollout:  # a StatefulSet or DaemonSet rollout (a restart, an image change)
-    module: k8s_agent.tools.rollout
-    function: wait_workload_rollout
-
-  wait_paused:          # a Deployment paused or resumed (controller's Progressing condition)
-    module: k8s_agent.tools.rollout
-    function: wait_paused
-
-  wait_cronjob_suspend: # a CronJob's spec.suspend holds
-    module: k8s_agent.tools.rollout
-    function: wait_cronjob_suspend
 
   # ---- writes
   dry_run_patch:        # always dryRun=All — cannot change the cluster

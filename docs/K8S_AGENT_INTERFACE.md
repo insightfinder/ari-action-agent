@@ -30,27 +30,20 @@ label and email). Other fields are informational for the approver.
 
 - `id`, `action`, `action_name`, `namespace`, `deployment` — unchanged.
 - `target`: `{"kind", "namespace", "name"}` — the object the change is about. **Added II-25740.**
-  `kind: "Deployment"`, except `resize_pod`, which sets `kind: "Pod"` and still fills `deployment` with the
-  pod's owning Deployment (and adds `pod` and `container`). Actions on other kinds set it and may leave
-  `deployment` empty (null): `restart_rollout` of a StatefulSet or DaemonSet (`kind` is that kind), and
-  `delete_pod` (`kind: "Pod"`; `deployment` is filled only for a Deployment's pod), `set_image` of a
-  StatefulSet or DaemonSet, the CronJob actions (`kind: "CronJob"`, `deployment` null), and `scale_replicas`
-  of a StatefulSet (`kind: "StatefulSet"`, `deployment` null). A proposal without `target` (made before
-  II-25740) is still applied.
+  `kind: "Deployment"`, except `resize_pod` and `delete_pod`, which set `kind: "Pod"` and still fill
+  `deployment` with the pod's owning Deployment (and add `pod`). Every change lands on a Deployment or one of
+  its pods (decided 2026-11-26; see "Never"). A proposal without `target` (made before II-25740) is still
+  applied.
 - Per-action fields (spread into the proposal beside the common ones; informational, the agent rebuilds the
-  write from them): `restart_rollout`: `workload_kind`, `workload`, `restarted_at` (the value the template's
-  `kubectl.kubernetes.io/restartedAt` gets). `rollback`: `from_revision`, `to_revision`, `replicaset`,
-  `replicaset_uid`, `images` (container -> image of the target revision; the pod template itself is never in
-  the proposal). `delete_pod`: `workload_kind`, `workload`, `pod`, `pod_uid`. **Added II-25740.**
-  Write batch 2 (**added II-25740**): `set_image`: `workload_kind`, `workload`, `container`, `image`.
-  `pause_rollout` / `resume_rollout`: `paused` (the value set), `pending_pods` (pods a resume will replace
-  because the template changed while paused; 0 for a pause). `suspend_cronjob` / `resume_cronjob`: `cronjob`,
-  `suspend`. `scale_replicas` (**added II-25740**, beside `replicas`): `workload_kind`, `workload` (also for a
-  Deployment, whose `deployment` stays filled).
+  write from them), **added II-25740**: `restart_rollout`: `workload_kind` (`Deployment`), `workload`,
+  `restarted_at` (the value the template's `kubectl.kubernetes.io/restartedAt` gets). `delete_pod`:
+  `workload_kind`, `workload`, `pod`, `pod_uid`. `resize_pod`: `pod`, `container`.
 - `persistence.needed`: `false` when nothing has to change in Git (a restart, a deleted pod, an in-place
-  resize back to the template's own values, a pause or resume); `reason` says why and
-  `changes` is empty. `true` otherwise (a `set_image` names `image`, a CronJob suspend or resume `suspend`).
-  **Added II-25740.**
+  resize back to the template's own values); `reason` says why and `changes` is empty.
+  `true` otherwise. **Added II-25740.**
+- Refusal fields (the `refusal` artifact): `asked_for` (the action the model picked when the request's own
+  words do not ask for it), `protected: true` (a protected namespace or workload, or the cluster's admission
+  policy said no). **Added II-25740.**
 - `before`, `after`, `requested`, `clamped`, `node_cap`, `risk_tier` (low/medium/high/critical), `risks`,
   `notes`, `capacity_outlook`, `dry_run`, `ownership`, `drift_notice`, `persistence`,
   `estimated_seconds_per_pod_to_ready`, `snapshot`, `created_at` — unchanged.
@@ -69,22 +62,14 @@ UIE (`ran`).
   (the kubelet cannot fit it on the node), `resize_deferred` (accepted, waiting for room on the node),
   `pod_replaced` (the pod was replaced while watched), `container_failing` (applied, then the container failed
   or restarted again). **Added II-25740.** The other actions keep their statuses.
-- `status` for `restart_rollout` and `rollback` of a Deployment (II-25740): `succeeded`, `in_progress`,
-  `new_pods_failing`, `rollout_failed`, `unschedulable`; a rollback also `reverted` (the newer image came back
-  while watched: image automation or a Helm upgrade). A StatefulSet or DaemonSet restart: `succeeded`,
-  `in_progress`, `new_pods_failing`, `unschedulable`. `delete_pod`: `succeeded` (the old uid is gone and a
-  replacement is ready and stable; `verification.replacement` names it), `in_progress`, `new_pods_failing`,
-  `unschedulable`. A pod that was already gone or replaced when the approval arrived counts as done:
-  `applied.already_at_target` is true and nothing is deleted.
-- Write batch 2 statuses (II-25740). `set_image`: as a restart of the same kind, plus `reverted` (another
-  image came back while watched). `pause_rollout`: `succeeded` (the controller reports DeploymentPaused and the
-  value held), `in_progress`, `reverted`. `resume_rollout`: the same when no pod is replaced; when a template
-  change waited (`pending_pods` > 0) as a Deployment rollout, `reverted` meaning paused again.
-  `suspend_cronjob` / `resume_cronjob`: `succeeded` (the value held for 45 s; `verification.active_jobs` lists
-  runs active then — a resume may start one at once), `reverted`.
-- `scale_replicas` of a StatefulSet (II-25740): `succeeded` (`spec.replicas`, `status.replicas` and ready pods
-  all at the target, observed generation current, then stable), `in_progress`, `new_pods_failing`,
-  `unschedulable`, `reverted` (another count put back while watched). A Deployment scale is unchanged.
+- `status` for `restart_rollout` (II-25740): `succeeded`, `in_progress`, `new_pods_failing`, `rollout_failed`,
+  `unschedulable`. `delete_pod`: `succeeded` (the old uid is gone and a replacement is ready and stable;
+  `verification.replacement` names it), `in_progress`, `new_pods_failing`, `unschedulable`. A pod that was
+  already gone or replaced when the approval arrived counts as done: `applied.already_at_target` is true and
+  nothing is deleted.
+- An approval is not applied (the step fails, nothing is written) when its target has become protected, when
+  its kind is no longer changed (a StatefulSet or DaemonSet restart proposed before 2026-11-26), or for an
+  action that no longer exists.
 
 ### `query_result`
 
@@ -123,97 +108,62 @@ kind on the test cluster conformed.
 
 ### Action names (`action`)
 
-`scale_replicas`, `set_autoscaler_bounds`, `set_resources`, `resize_pod`, `restart_rollout`, `rollback`,
-`delete_pod`, `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob`, `resume_cronjob` today (`k8s_agent/actions/__init__.py`, `ACTIONS`). `resize_pod` (**added II-25740**): CPU/memory of one container
-of one running pod, in place through `pods/resize` — no rollout, same pod. Chosen only when the request asks
-for an in-place change (decided in code; naming a pod is not enough). Proposed only when the API server serves
-`pods/resize` (live discovery) and both the API server and the pod's kubelet are >= 1.35; memory only when
-the container's memory `resizePolicy` is `RestartContainer`. The Deployment template is not changed, so the
-persistence hint names the template fields to change in Git.
+`scale_replicas`, `set_autoscaler_bounds`, `set_resources`, `resize_pod`, `restart_rollout`, `delete_pod`,
+today (`k8s_agent/actions/__init__.py`, `ACTIONS`). Every one changes a
+Deployment, its autoscaler or one of its pods: StatefulSets, DaemonSets, CronJobs and nodes are read only, and
+`propose_change` refuses a change to one before asking the model (safety review with the user, 2026-11-26:
+nothing that could break a product environment).
 
-Added II-25740 (write batch 1). Restart, rollback and delete are proposed only when the request's own words ask
-for them (decided in code: an on-call prompt quoting "restarted 5 times" does not); otherwise the refusal
-carries `asked_for` with the action the model picked.
-- `restart_rollout`: a rolling restart of a Deployment, StatefulSet or DaemonSet, as `kubectl rollout restart`
-  (sets `kubectl.kubernetes.io/restartedAt` on the pod template). Refused for a paused Deployment, an
-  `OnDelete` update strategy, or no pods. Tier `medium`; `high` under `Recreate` or for a one-pod StatefulSet.
-- `rollback`: a Deployment back to the previous revision, or to the one the request states, as `kubectl
-  rollout undo` (JSON patch replacing `spec.template` with that ReplicaSet's, after a `test` of the current
-  revision). Refused for a paused Deployment or when no such revision is kept. Tier `medium`.
-- `delete_pod`: one pod, named in the request, that a Deployment, StatefulSet or DaemonSet owns; deleted with a
-  uid precondition (a plain delete, not an eviction: a PodDisruptionBudget is reported, not waited for). Tier
-  `medium`; `high` when no other pod of the workload is ready.
-- `find_workload` now also resolves StatefulSets and DaemonSets (`{"scope": "workload", "kind", ...}` in its
-  step result; a Deployment keeps `{"scope": "deployment", ...}`).
+`resize_pod` (**added II-25740**): CPU/memory of one container of one running pod of a Deployment, in place
+through `pods/resize` — no rollout, same pod. Chosen only when the request asks for an in-place change (decided
+in code; naming a pod is not enough). Proposed only when the API server serves `pods/resize` (live discovery)
+and both the API server and the pod's kubelet are >= 1.35; memory only when the container's memory
+`resizePolicy` is `RestartContainer`. The Deployment template is not changed, so the persistence hint names the
+template fields to change in Git.
 
-Added II-25740 (write batch 2). Each is proposed only when the request's own words ask for it (code, as in
-batch 1; a refusal carries `asked_for`).
-- `set_image`: one container's image in a Deployment, StatefulSet or DaemonSet, as `kubectl set image`
-  (strategic merge patch by container name). The image is the request's own words: a full reference written
-  verbatim, or a tag written as a tag ("tag 1.4", "version 1.4", "app:1.4") put on the current repository.
-  The container must exist; with one container it need not be named. Refused for a paused Deployment, an
-  `OnDelete` strategy or the image already running. Tier `medium`; `high` when the repository changes, under
-  `Recreate`, or for a one-pod StatefulSet. Whether the image exists cannot be checked before it rolls out.
-- `pause_rollout` / `resume_rollout`: a Deployment's `spec.paused`, as `kubectl rollout pause` / `resume`.
-  A pause replaces no pod; while paused, template changes (image automation, Helm upgrades) wait. A resume
-  rolls out whatever waited (`pending_pods`, read from the Deployment's status). Tier `medium`.
-- `suspend_cronjob` / `resume_cronjob`: a CronJob's `spec.suspend`. A resume without
-  `startingDeadlineSeconds` may start one run at once for the latest schedule missed while suspended (a
-  `medium` risk). A chart or manifest usually sets `suspend`, so a Helm upgrade or reconcile puts it back
-  (drift notice, persistence hint). Tier `medium`.
-- Not added: `trigger_cronjob` (run a CronJob now, i.e. create a Job from it). Built and then removed on
-  2026-11-25 by user decision: the agent does not re-run CronJobs; whoever needs a run outside the schedule uses
-  `kubectl create job --from=cronjob/<name>`. It would have needed `create` on jobs and an exception to the
-  "Never" list below.
-- `find_workload` also resolves CronJobs (`{"scope": "workload", "kind": "CronJob", ...}`, also from a
-  scheduled run's pod name); `check_health` of a CronJob covers its runs' pods and reports a suspended one
-  (`Suspended`, info).
+Added II-25740. Restart and delete are proposed only when the request's own words ask for them
+(decided in code: an on-call prompt quoting "restarted 5 times" does not); otherwise the refusal carries
+`asked_for` with the action the model picked.
+- `restart_rollout`: a rolling restart of a Deployment, as `kubectl rollout restart` (sets
+  `kubectl.kubernetes.io/restartedAt` on the pod template). Refused for a paused Deployment or one with no
+  pods. Tier `medium`; `high` under `Recreate`.
+- `delete_pod`: one pod of a Deployment, named in the request; deleted with a uid precondition (a plain
+  delete, not an eviction: a PodDisruptionBudget is reported, not waited for). Refused, at proposal and again
+  at approval, when no other pod of the Deployment is ready. Tier `medium`.
+- `find_workload` resolves StatefulSets, DaemonSets, CronJobs (also from a scheduled run's pod name) and nodes
+  too, for health checks: `{"scope": "workload", "kind", ...}`, `{"scope": "node", "kind": "Node",
+  "namespace": null, "name"}` (a node only when no workload matches); a Deployment keeps `{"scope":
+  "deployment", ...}`. `check_health` covers a StatefulSet's, DaemonSet's or CronJob's own pods (a suspended
+  CronJob is `Suspended`, info) and a node's pods (`NotReady` warning, `Cordoned` info), so
+  `health_report.scope.type` can be `node`.
 
-StatefulSet scaling (II-25740): `scale_replicas` also takes a StatefulSet (not a DaemonSet). Same rules as for a
-Deployment (a stated count, never below 1, refused under an HPA or KEDA ScaledObject that targets the
-StatefulSet), plus:
-- Refused when another object controls the StatefulSet (a controller `ownerReference`, e.g. an operator's
-  custom resource), which would put its own count back; the refusal names it in `controller`.
-- Refused for a scale-down under `persistentVolumeClaimRetentionPolicy.whenScaled: Delete`: it would delete the
-  removed pods' PVCs, and this agent never deletes a PVC.
-- Tier `medium` up, `high` down. Risks and notes name the pods added or removed (by ordinal, from
-  `spec.ordinals.start`), the PVCs each new pod creates from the volume claim templates or mounts again with
-  old data (`medium` risk; read from a PVC list at proposal time only), the PVCs a scale-down keeps, and pods
-  not ready under `OrderedReady` (`medium`: the controller waits for them).
-- Written as a merge patch of `spec.replicas` on the StatefulSet itself (not `statefulsets/scale`), with the
-  `patch statefulsets` rule from oncallari 0.3.15: no new RBAC. A Deployment is still scaled through
-  `deployments/scale`.
-- The approval re-checks the count, the autoscaler, the controlling object, the PVC retention policy and the
-  uid.
-- RBAC (oncallari chart 0.3.16): `patch` on `cronjobs` (batch). Before it, both CronJob changes are refused
-  with the missing rule named; the other batch 2 actions need no new rule.
+Protected namespaces and workloads (II-25740, 2026-11-26): never changed, whatever a request or an approval
+says. The oncallari chart's `ariK8sAgent.protection` values hold both lists and feed two checks:
+- the worker's environment (`K8S_AGENT_PROTECTED_NAMESPACES`, `K8S_AGENT_PROTECTED_WORKLOADS`): `propose_change`
+  refuses before asking the model (refusal `protected: true`), and `apply_approved_change` refuses an approval
+  whose target has become protected (`tools/protection.py`);
+- a ValidatingAdmissionPolicy (Kubernetes >= 1.30; left out on an older cluster unless required, see RBAC) that
+  has the API server deny the agent's ServiceAccount any write in a protected namespace, and to a protected
+  Deployment, its pods (through their ReplicaSet) and its autoscalers. A dry run it denies comes back as a
+  refusal (`protected: true`).
+- The code holds no workload names (they are installation-specific; the oncallari defaults below are
+  InsightFinder's). A chart shipped for other installations should default `workloads` to empty: the agent's
+  own API and worker are added anyway.
+- Namespaces by default: kube-system, kube-public, kube-node-lease, flux-system, cert-manager, vault, keda,
+  traefik. Workloads by default (in the release namespace): insightfinder-mcp-service,
+  insightfinder-mcp-service-worker, temporal-*, ari-coordinator; the chart always adds the agent's own API
+  and worker. The agent runs beside the services it changes (`insightfinder` on test), so it and its approval
+  path are protected by name, not by namespace.
 
-Nodes (II-25740): read only. `find_workload` resolves `{"scope": "node", "kind": "Node", "namespace": null,
-"name"}` for a node the request writes out (its full name or the part before the first dot), only when no
-workload matches (on-call prompts quote node names while asking about a workload); `check_health` of a node
-covers the pods on it and reports `NotReady` (warning) and `Cordoned` (info), so `health_report.scope.type` can
-now be `node` (with `kind: "Node"`, `name`, `namespace` null). `propose_change` refuses any change to a node.
-`cordon_node`, `uncordon_node` and `drain_node` were built and declined by the user on 2026-11-25 (see "Never").
-
-Planned under II-25740 (not built yet), in this order:
-- `batch` (one approval for the same change on several targets). StatefulSet replica scaling, planned beside
-  it, was built on 2026-11-25 (above). Decided with the user on 2026-11-26: only `restart_rollout`,
-  `scale_replicas` and `set_image`; only targets the request writes out by name (no label selectors or "every
-  Deployment in X"), with a cap on their number; applied one target at a time, each verified before the
-  next, stopping at the first that fails and reporting which were done and which were not.
-- Added 2026-11-24 (user decision), in this order: `flux_reconcile` (set `reconcile.fluxcd.io/requestedAt` on a
-  HelmRelease or Kustomization so a merged fix applies now; changes no desired state, tier `low`);
-  `resize_pod` for StatefulSet pods (same rules as for Deployment pods; persistence hint points at the
-  StatefulSet template); `expand_pvc` (grow only, never shrink: needs the StorageClass's
-  `allowVolumeExpansion`, a per-request growth cap, tier `high`; irreversible and costs money; a
+Planned under II-25740 (not built yet):
+- `expand_pvc` (grow only, never shrink: needs the StorageClass's `allowVolumeExpansion`, a per-request growth
+  cap, tier `high`; the protection check and the admission policy must cover PVCs too (vault's sit in a
+  protected namespace); irreversible and costs money, which the user accepts: it does not break anything; a
   StatefulSet's `volumeClaimTemplates` cannot follow, so the proposal says what Git needs).
 
-Later, only after the list above (needs its own design first):
-- Suspend/resume Flux reconciliation (HelmRelease/Kustomization): blocks every deploy and is easy to forget,
-  so it needs an expiry or reminder; on test a suspended HelmRelease is re-applied by its parent
-  Kustomization within minutes (docs/MEMORY.md 2026-10-14), so the parent must be handled too.
-- Pause KEDA scaling (`autoscaling.keda.sh/paused`).
-- CPU/memory changes for StatefulSet and DaemonSet templates (same mechanism as `set_resources`).
+Not to be built (decided 2026-11-26): `batch`, `flux_reconcile` (`patch` on HelmReleases/Kustomizations cannot
+be narrowed by RBAC to the reconcile annotation), `resize_pod` for StatefulSet pods, and the earlier "later"
+list (suspending Flux reconciliation, pausing KEDA, StatefulSet/DaemonSet CPU/memory).
 
 ### Never (permanent boundaries)
 
@@ -222,9 +172,27 @@ Not to be added. A change to this list is a decision of its own, recorded here a
 - Reading Secrets (any verb), reading ConfigMap values (keys only), copying nested content of custom
   resources (top-level scalars only).
 - exec / attach / port-forward into pods.
-- Creating or deleting workloads, Services, Ingresses, Namespaces or PVCs (deleting a controller-owned pod,
-  which its controller replaces, is the only delete). This includes creating a Job from a CronJob ("run it
-  now"): considered as `trigger_cronjob` and declined by the user on 2026-11-25.
+- Creating or deleting workloads, Services, Ingresses, Namespaces or PVCs (deleting one pod of a Deployment,
+  which the Deployment replaces, is the only delete). This includes creating a Job from a CronJob ("run it
+  now"): considered as `trigger_cronjob` and declined by the user on 2026-11-25. It also includes deleting a
+  PVC a StatefulSet scale-down left behind: asked about and declined by the user on 2026-11-26 (with gp3's
+  `reclaimPolicy: Delete` the EBS volume and its data go with it, and `delete persistentvolumeclaims` cannot be
+  narrowed by RBAC); people delete them with kubectl.
+- Changing StatefulSets, DaemonSets or CronJobs, or their pods (decided 2026-11-26: nothing that could break a
+  product environment). Built on test and removed: StatefulSet scaling, StatefulSet/DaemonSet restart and pod
+  delete, `suspend_cronjob` / `resume_cronjob`. Stateful systems (databases, quorum services such as vault)
+  and node-level agents (CNI, CSI, kube-proxy) can break in ways the inverse change does not undo, and a
+  suspended CronJob (a backup, a cleanup) fails silently later.
+- Pausing or resuming rollouts (`pause_rollout` / `resume_rollout`, built on test and removed on 2026-11-26).
+  Checked first on test (helm-controller v1.6.3): a HelmRelease upgrade of a paused Deployment succeeds and the
+  resume rolls it out, so it does not break a release; removed for its narrow value (no next step for the
+  agent once paused, it holds back fixes too, and `kubectl rollout pause` is one command).
+- Changing what code runs: `rollback` and `set_image` were built on test and removed on 2026-11-26. Old code on
+  data a newer version migrated, or a new image's own migrations, cannot be undone by another change, and a
+  different repository would run arbitrary code with the service's credentials. Images change through Git and
+  the image automation.
+- Changing anything in a protected namespace or a protected workload (above).
+- Several targets under one approval (`batch`, not built).
 - Changing the content of Services, Ingresses, NetworkPolicies or ConfigMaps: networking and configuration
   change through Git.
 - Changing nodes at all: deleting them, their labels or taints, and also cordon, uncordon and drain. The three
@@ -233,23 +201,27 @@ Not to be added. A change to this list is a decision of its own, recorded here a
   single-replica services at once, and `patch` on nodes cannot be narrowed by RBAC to `spec.unschedulable`.
   Node groups, Cluster Autoscaler and people with kubectl own nodes.
 - Rolling back a HelmRelease (Flux upgrades it again; revert in Git, or roll back the Deployment).
-- Writing any custom resource other than a KEDA ScaledObject's min/max (and the Flux reconcile annotation
-  above).
+- Writing any custom resource other than a KEDA ScaledObject's min/max (no Flux reconcile annotation either).
 - Editing RBAC, writing to Git, or any write without a person's approval of that exact proposal.
 - Scaling anything to 0 replicas.
 
 ## RBAC
 
 `docs/examples/k8s-rbac.yaml` is the reference; the oncallari chart's
-`templates/ari-k8s-agent/ari-k8s-agent-rbac.yaml` (charts repo) mirrors it rule for rule. II-25740 phase 0
-reads and writes exactly the same resources as before, so neither changed. Later phases add reads (and the
-new writes) and will list the exact rules here. `resize_pod` adds `patch` on `pods/resize` (core group), in
-both files from oncallari 0.3.14; until a cluster has that rule, the dry run's 403 comes back as a refusal
-naming it. Write batch 1 adds `patch` on `statefulsets` and `daemonsets` (apps group; a restart) and `delete`
-on `pods` (core group; `delete_pod`), in both files from oncallari 0.3.15; a Deployment restart or rollback
-needs no new rule. The chart is this agent's own deployment: any change here
-that needs a new RBAC rule, env var or value updates the oncallari chart in the same piece of work (charts
-repo, same ticket branch, `Chart.yaml` version bumped).
+`templates/ari-k8s-agent/ari-k8s-agent-rbac.yaml` (charts repo) mirrors it rule for rule. Writes, from
+oncallari 0.3.17: `patch` on `deployments` and `deployments/scale` (apps), `horizontalpodautoscalers`
+(autoscaling) and `scaledobjects` (keda.sh), `patch` on `pods/resize` and `delete` on `pods` (core). 0.3.15
+and 0.3.16 also granted `patch` on statefulsets, daemonsets and cronjobs; 0.3.17 drops them with the actions
+that used them. RBAC can only allow, so the protected namespaces and workloads are denied by the chart's
+ValidatingAdmissionPolicy (`templates/ari-k8s-agent/ari-k8s-agent-admission-policy.yaml`,
+`ariK8sAgent.protection.admissionPolicy`: `auto` by default renders it when the cluster serves
+admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy, Kubernetes >= 1.30, and otherwise leaves it out with
+a warning in the release notes; `true` requires it and fails the render without the API; `false` never renders
+it). Without the policy the worker's own check still applies. InsightFinder's GitOps values should set `true`,
+so a cluster without the API fails loudly instead of running unenforced.
+Until a cluster has a rule an action needs, the dry run's 403 comes back as a refusal naming it. The chart is
+this agent's own deployment: any change here that needs a new RBAC rule, env var or value updates the
+oncallari chart in the same piece of work (charts repo, same ticket branch, `Chart.yaml` version bumped).
 
 ## Needed from other repositories
 
@@ -257,8 +229,10 @@ Recorded for their owners; not changed from this repository.
 
 | Repo | What | Why | Since |
 |---|---|---|---|
-| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `rollback`, `delete_pod`, `set_image`, `pause_rollout`, `resume_rollout`, `suspend_cronjob` and `resume_cronjob` ship with II-25740. | II-25740 |
-| insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship (including `scale_replicas` of a StatefulSet, and that nodes are read only). | II-25740 |
+| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout` and `delete_pod` ship with II-25740 (`rollback`, `set_image`, pause/resume and the CronJob actions were removed before shipping). | II-25740 |
+| insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship: changes are to Deployments only; StatefulSets, DaemonSets, CronJobs, nodes and protected namespaces/workloads are read only. | II-25740 |
+| test-fluxcd, eks-fluxcd | Set `ariK8sAgent.protection.admissionPolicy: true` in the ari-k8s HelmRelease values (the chart default `auto` silently leaves the policy out on a cluster without the API). | A missing policy should fail the release, not go unnoticed. | II-25740 |
+| eks-fluxcd | When the k8s agent is deployed to stg/prod: check `ariK8sAgent.protection.workloads` against that cluster's names (the defaults are bare names in the release namespace: insightfinder-mcp-service, insightfinder-mcp-service-worker, temporal-*, ari-coordinator) and add whatever runs the approval path there. | The agent and its approval path are protected by name; a name that differs there is not protected. | II-25740 |
 | insightfinder-mcp-service | Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. Do not have a model re-type the rows: 100+ rows exceed its output limit and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
 | insightfinder-mcp-service | Confirm live that a follow-up chat turn ("in table format") can reach the previous turn's agent result, or that the coordinator calls the agent again. | Screenshot of 2026-11-19 (stg): the coordinator answered from memory. | II-25740 |
 
@@ -283,3 +257,9 @@ Recorded for their owners; not changed from this repository.
   `deployment` null; new proposal fields `workload_kind` / `workload` on every `scale_replicas` (a Deployment's
   `deployment` stays); refusal field `controller`. No new RBAC (patch on statefulsets, oncallari 0.3.15).
   Additive; nothing removed or renamed.
+- **2026-11-26, II-25740** — safety review (user): removed before shipping `rollback`, `set_image`,
+  `pause_rollout`, `resume_rollout`, `suspend_cronjob`, `resume_cronjob`, StatefulSet scaling and every StatefulSet/DaemonSet change (their
+  per-action fields and statuses with them); `delete_pod` refuses the only ready pod; new refusal field
+  `protected`; protected namespaces and workloads (chart values, worker env, ValidatingAdmissionPolicy).
+  oncallari 0.3.17 drops `patch` on statefulsets, daemonsets and cronjobs. `batch` and `flux_reconcile` will not
+  be built.

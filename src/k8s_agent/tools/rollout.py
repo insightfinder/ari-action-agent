@@ -153,21 +153,9 @@ def moved_away(dep: dict, target: dict) -> str | None:
     Deployment (a GitOps reconcile, a Helm upgrade, a person) can put its own value back while the
     rollout is watched; the rollout then never completes, and that is not "still in progress"."""
     kind = target.get("kind")
-    if kind == "paused":
-        if bool(dep.get("paused")) != bool(target.get("paused")):
-            state = "paused" if dep.get("paused") else "not paused"
-            return f"the Deployment is {state} again"
-        return None
     if kind == "replicas":
         if dep.get("replicas") != target.get("replicas"):
             return f"spec.replicas is {dep.get('replicas')} again, not the approved {target.get('replicas')}"
-        return None
-    if kind == "images":
-        # A rollback: image automation or a Helm upgrade rolling forward again puts the newer image back.
-        current = {c.get("name"): c.get("image") for c in (dep.get("template") or {}).get("containers") or []}
-        for container, image in (target.get("images") or {}).items():
-            if current.get(container) != image:
-                return f"container {container} runs image {current.get(container)} again, not the rolled-back {image}"
         return None
     if kind != "resources":
         return None
@@ -476,7 +464,7 @@ async def wait_resize(
         await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
 
 
-# ---------------------------------------------------------------- a deleted pod, a StatefulSet or DaemonSet rollout
+# ---------------------------------------------------------------- a deleted pod
 
 
 def _pod_ready(pod: dict) -> bool:
@@ -485,8 +473,6 @@ def _pod_ready(pod: dict) -> bool:
 
 
 def desired_pods(view: dict) -> int:
-    if view.get("kind") == "DaemonSet":
-        return (view.get("status") or {}).get("desired") or 0
     return view.get("replicas") or 0
 
 
@@ -514,7 +500,7 @@ async def wait_pod_replaced(
     """Poll after a pod was deleted until its controller has replaced it.
 
     Succeeded needs positive evidence, because a delete bumps no generation and the workload's counts can
-    look complete before anything happened: the pod with `uid` is gone (a StatefulSet's replacement reuses
+    look complete before anything happened: the pod with `uid` is gone (a replacement could reuse
     the name, so the uid decides), a pod of the workload created after the delete is ready, and the new pods
     stay up without a restart for STABILITY_SECONDS. The workload's other pods are reported (`ready` of
     `desired`) but not waited for: one deleted pod does not mend a sibling that is itself failing.
@@ -574,214 +560,3 @@ async def wait_pod_replaced(
                 ),
             }
         await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
-
-
-def workload_rolled_out(view: dict) -> bool:
-    """A StatefulSet or DaemonSet has finished rolling out its current template."""
-    status = view.get("status") or {}
-    if (view.get("observed_generation") or 0) < (view.get("generation") or 0):
-        return False
-    desired = desired_pods(view)
-    if view.get("kind") == "StatefulSet":
-        partition = (view.get("strategy") or {}).get("partition") or 0
-        updated_ok = (status.get("updated") or 0) >= max(desired - partition, 0)
-        revision_ok = partition > 0 or status.get("current_revision") == status.get("update_revision")
-        return updated_ok and revision_ok and (status.get("ready") or 0) == desired
-    return all((status.get(k) or 0) == desired for k in ("updated", "ready", "available"))
-
-
-def _statefulset_pace(view: dict, target: dict | None) -> str:
-    if view.get("kind") != "StatefulSet":
-        return ""
-    if (target or {}).get("kind") != "replicas":
-        return "; a StatefulSet replaces its pods one at a time"
-    if view.get("pod_management_policy") == "Parallel":
-        return ""
-    return "; a StatefulSet (OrderedReady) adds or removes its pods one at a time"
-
-
-def replicas_reached(view: dict, replicas: int) -> bool:
-    """A StatefulSet runs exactly `replicas` ready pods for its current spec. A scale is judged on the counts
-    alone, not on the template revision: a StatefulSet whose own rollout is pending (OnDelete, a partition, a
-    stuck update) scales all the same. `status.replicas` still counts a removed pod while it terminates."""
-    status = view.get("status") or {}
-    return (
-        (view.get("observed_generation") or 0) >= (view.get("generation") or 0)
-        and view.get("replicas") == replicas
-        and status.get("replicas") == replicas
-        and status.get("ready") == replicas
-    )
-
-
-async def wait_workload_rollout(
-    kind: str,
-    namespace: str,
-    name: str,
-    applied_at: str | None,
-    max_wait_seconds: float,
-    poll_seconds: float = POLL_SECONDS,
-    target: dict | None = None,
-) -> dict:
-    """Poll a StatefulSet or DaemonSet after a template change (a restart, an image) until its controller
-    reports the rollout complete, then watch the new pods for STABILITY_SECONDS. A StatefulSet replaces one pod
-    at a time and waits for each to be ready, so a long one often ends `in_progress`: not a failure. With
-    `target` (`{"kind": "images", ...}`), an approved value put back while watched ends it as `reverted`. A
-    `{"kind": "replicas", "replicas": n}` target (a StatefulSet scaled) is complete at `replicas_reached`."""
-    applied = _parse(applied_at)
-    started = time.monotonic()
-    stable_since: float | None = None
-    baseline: dict = {}
-    while True:
-        view = await read.get_workload(kind, namespace, name)
-        moved = moved_away(view, target) if target else None
-        if moved:
-            return {
-                "done": True,
-                "status": "reverted",
-                "detail": (
-                    f"The change was applied, then undone: {moved}. Something that manages this {kind}, most "
-                    "likely a GitOps reconcile or a Helm upgrade, restored its own value."
-                ),
-                "waited_seconds": round(time.monotonic() - started),
-            }
-        pods = await read.list_pods(namespace, selector=view.get("label_selector") or view.get("selector") or None, active_only=True)
-        new = _new_pods([p for p in pods if governance.owned_by(p, kind, name)], applied)
-        elapsed = round(time.monotonic() - started)
-        counts = {"desired": desired_pods(view), **{k: (view.get("status") or {}).get(k) for k in ("updated", "ready")}}
-        base = {"replicas": counts, "waited_seconds": elapsed}
-        failing = _failing(new)
-        if failing:
-            return {**base, "done": True, "status": "new_pods_failing", "failing": failing[:10]}
-        scheduling = await _scheduling(namespace, _pending(new))
-        if scheduling and scheduling.get("stop_waiting"):
-            return {**base, "done": True, "status": "unschedulable", "scheduling": scheduling}
-        if stable_since is not None:
-            restarted = _restarted_since(baseline, new)
-            if restarted:
-                return {
-                    **base,
-                    "done": True,
-                    "status": "new_pods_failing",
-                    "failing": restarted[:10],
-                    "detail": f"new pods restarted within {round(time.monotonic() - stable_since)}s of becoming ready",
-                }
-        done = replicas_reached(view, target["replicas"]) if (target or {}).get("kind") == "replicas" else workload_rolled_out(view)
-        if done:
-            if stable_since is None:
-                stable_since, baseline = time.monotonic(), _restart_counts(new)
-            observed = time.monotonic() - stable_since
-            if observed >= STABILITY_SECONDS:
-                return {**base, "done": True, "status": "succeeded", "stable_for_seconds": round(observed)}
-        else:
-            stable_since = None
-        if elapsed >= max_wait_seconds:
-            if scheduling and scheduling.get("cause") == "failed_scheduling":
-                return {**base, "done": True, "status": "unschedulable", "scheduling": scheduling}
-            return {
-                **base,
-                "done": True,
-                "status": "in_progress",
-                "note": (
-                    f"The change is applied but the {kind} had not finished rolling out when the wait window "
-                    f"({int(max_wait_seconds)}s) ended"
-                    + _statefulset_pace(view, target)
-                    + ". This is not a failure; check it again later."
-                ),
-            }
-        await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
-
-
-# ---------------------------------------------------------------- a paused or resumed Deployment, a CronJob
-
-
-async def wait_paused(
-    namespace: str,
-    name: str,
-    paused: bool,
-    max_wait_seconds: float,
-    poll_seconds: float = POLL_SECONDS,
-) -> dict:
-    """Poll after `spec.paused` was set until the Deployment controller has acted on it: it has observed the
-    new generation and its Progressing condition says `DeploymentPaused` (or, resumed, no longer does). A
-    Deployment whose rollout had already timed out keeps `ProgressDeadlineExceeded` through a pause (the
-    controller never overwrites it; seen on test, 2026-11-25), so that counts too. The value must then hold for
-    STABILITY_SECONDS: something that manages the Deployment may put its own back. A resume that has a template
-    change to roll out is verified by `wait_rollout` instead."""
-    started = time.monotonic()
-    held_since: float | None = None
-    while True:
-        dep = await read.get_deployment(namespace, name)
-        elapsed = round(time.monotonic() - started)
-        progressing = next((c for c in dep.get("conditions") or [] if c.get("type") == "Progressing"), None) or {}
-        base = {"paused": bool(dep.get("paused")), "progressing_reason": progressing.get("reason"), "waited_seconds": elapsed}
-        if bool(dep.get("paused")) != paused:
-            return {
-                **base,
-                "done": True,
-                "status": "reverted",
-                "detail": (
-                    f"spec.paused was set to {str(paused).lower()}, then changed back. Something that manages this "
-                    "Deployment, a person or a GitOps reconcile, restored its own value."
-                ),
-            }
-        observed = (dep.get("observed_generation") or 0) >= (dep.get("generation") or 0)
-        reason = progressing.get("reason")
-        if paused:
-            acted = observed and reason in ("DeploymentPaused", "ProgressDeadlineExceeded", None)
-        else:
-            acted = observed and reason != "DeploymentPaused"
-        if acted:
-            held_since = held_since if held_since is not None else time.monotonic()
-            held = time.monotonic() - held_since
-            if held >= STABILITY_SECONDS:
-                return {**base, "done": True, "status": "succeeded", "stable_for_seconds": round(held)}
-        else:
-            held_since = None
-        if elapsed >= max_wait_seconds:
-            return {
-                **base,
-                "done": True,
-                "status": "in_progress",
-                "note": (
-                    f"spec.paused is {str(paused).lower()}, but when the wait window ({int(max_wait_seconds)}s) ended "
-                    "the Deployment controller had not reported it yet. This is not a failure; check again later."
-                ),
-            }
-        await asyncio.sleep(min(poll_seconds, max(1.0, max_wait_seconds - elapsed)))
-
-
-async def wait_cronjob_suspend(
-    namespace: str,
-    name: str,
-    suspend: bool,
-    max_wait_seconds: float,
-    poll_seconds: float = POLL_SECONDS,
-) -> dict:
-    """Poll after a CronJob's `spec.suspend` was set until it has held for STABILITY_SECONDS. No controller
-    acknowledges a suspend, so holding is the evidence: a GitOps reconcile or a person may put the old value
-    back. Jobs already running are reported (`active_jobs`); a suspend does not stop them. A resume may start
-    a run at once for a schedule missed while suspended; it shows here as an active Job."""
-    started = time.monotonic()
-    while True:
-        cj = await read.get_workload("CronJob", namespace, name)
-        elapsed = round(time.monotonic() - started)
-        status = cj.get("status") or {}
-        base = {
-            "suspend": bool(cj.get("suspend")),
-            "active_jobs": status.get("active_jobs") or [],
-            "last_schedule_time": status.get("last_schedule_time"),
-            "waited_seconds": elapsed,
-        }
-        if bool(cj.get("suspend")) != suspend:
-            return {
-                **base,
-                "done": True,
-                "status": "reverted",
-                "detail": (
-                    f"spec.suspend was set to {str(suspend).lower()}, then changed back. Something that manages this "
-                    "CronJob, most likely a GitOps reconcile or a Helm upgrade, restored its own value."
-                ),
-            }
-        if elapsed >= min(STABILITY_SECONDS, max_wait_seconds):
-            return {**base, "done": True, "status": "succeeded", "stable_for_seconds": elapsed}
-        await asyncio.sleep(min(poll_seconds, max(1.0, STABILITY_SECONDS - elapsed)))

@@ -1,11 +1,12 @@
 """Works out exactly what would change, checks it, dry-runs it, and stops.
 
 The model's only job here is to read the request and say which change it
-asks for, quoting the words it took each number from. Which changes are
-offered depends on the workload `find_workload` resolved (a Deployment, a
-StatefulSet or a DaemonSet; each action lists its `workload_kinds`), and a
-change that takes no value (a restart, a rollback, a pod delete) is
-proposed only when the request's own words ask for it (`spec.accepts`).
+asks for, quoting the words it took each number from. Only a Deployment (or
+one of its pods) is changed: a StatefulSet, DaemonSet, CronJob or node that
+`find_workload` resolves is refused here without asking the model (decided
+2026-11-26: nothing that could break a product environment). A change that
+takes no value (a restart, a pod delete) is proposed only when the
+request's own words ask for it (`spec.accepts`).
 Everything else is code: whether the Deployment is managed by KEDA/HPA (and so may only be
 changed through its autoscaler, and only on explicit request), the
 replica floor, the node-capacity cap for CPU/memory, the capacity and
@@ -28,12 +29,11 @@ from common.llm_json import extract
 
 from .. import actions
 from ..stepkit import finish, options, refusal, resolved_target
-from ..tools import capacity, persistence, policy, quantities
+from ..tools import capacity, persistence, policy, protection, quantities
 
 _SENTINEL = "CHANGE_JSON:"
 _SYSTEM = (
-    "You read a request to change a Kubernetes workload (a Deployment, StatefulSet, DaemonSet or CronJob) or one "
-    "of its pods and report exactly what it asks for. You never invent or round a number. For every number you report "
+    "You read a request to change a Kubernetes Deployment or one of its pods and report exactly what it asks for. You never invent or round a number. For every number you report "
     "you also give the exact words of the request it came from (a verbatim quote). If the request does not ask "
     "for a concrete change, say so."
 )
@@ -56,7 +56,6 @@ async def _extract(ctx: StepContext, workload: dict, autoscaler: dict | None) ->
         "current_replicas": workload.get("replicas"),
         "containers": [{**c, "image": i} for c, i in zip(_container_summary(workload), _images(workload))],
         **({"paused": bool(workload.get("paused"))} if "paused" in workload else {}),
-        **({"suspended": bool(workload.get("suspend")), "schedule": workload.get("schedule")} if "suspend" in workload else {}),
         "autoscaler": (
             {"kind": autoscaler.get("kind"), "name": autoscaler.get("name"), "min": autoscaler.get("min"), "max": autoscaler.get("max")}
             if autoscaler
@@ -73,9 +72,6 @@ async def _extract(ctx: StepContext, workload: dict, autoscaler: dict | None) ->
         '"replicas": <int or null>, "replicas_quote": "<verbatim words or null>", '
         '"min": <int or null>, "min_quote": "<verbatim or null>", "max": <int or null>, "max_quote": "<verbatim or null>", '
         '"container": "<container name or null>", "pod": "<pod name exactly as written in the request, or null>", '
-        '"revision": <revision number to roll back to, or null for the previous one>, "revision_quote": "<verbatim or null>", '
-        '"image": "<full image reference exactly as written in the request, or null>", '
-        '"tag": "<image tag or version exactly as written, when the request gives only that, or null>", '
         '"resources": {"requests": {"cpu": {"value": "<quantity>", "quote": "<verbatim>"}, "memory": {...}}, '
         '"limits": {"cpu": {...}, "memory": {...}}}, '
         '"reasoning": "<one line>"}\n'
@@ -115,7 +111,7 @@ def _startup_estimate(dep: dict) -> int | None:
 
 
 _SCALE_DOWN_PDB = (
-    "It does not block this scale-down, which removes pods through the workload's controller rather than by eviction; with "
+    "It does not block this scale-down, which removes pods through the ReplicaSet rather than by eviction; with "
     "fewer replicas it leaves less room for voluntary disruptions such as node drains."
 )
 
@@ -142,12 +138,6 @@ def _template_pod_labels(workload: dict) -> dict:
     return {**(workload["template"].get("labels") or {}), **(workload.get("selector") or {})}
 
 
-def _example(kind: str, name: str, namespace: str) -> str:
-    if kind == "CronJob":
-        return f"'suspend cronjob {name} in namespace {namespace}'"
-    return f"'restart {kind.lower()} {name} in namespace {namespace}'"
-
-
 # ------------------------------------------------------------------ run
 
 
@@ -167,17 +157,21 @@ async def run(ctx: StepContext) -> dict:
             candidates=candidates,
         )
 
+    if kind != "Deployment":
+        return refusal(
+            f"This agent changes only Deployments and their pods; {kind} {target['namespace']}/{target['name']} is "
+            "read only here (a health check or a listing works). Nothing was proposed."
+        )
+
+    protected = protection.why_protected(target["namespace"], target["name"])
+    if protected:
+        return refusal(protected, protected=True)
+
     opts = options(ctx)
     threshold = policy.high_replica_threshold(opts)
     namespace, name = target["namespace"], target["name"]
-    autoscaler = None
-    if kind == "Deployment":
-        workload = await ctx.tool("get_deployment")(namespace, name)
-        autoscaler = await ctx.tool("find_autoscaler")(namespace, name)
-    else:
-        workload = await ctx.tool("get_workload")(kind, namespace, name)
-        if kind == "StatefulSet":
-            autoscaler = await ctx.tool("find_autoscaler")(namespace, name, "StatefulSet")
+    workload = await ctx.tool("get_deployment")(namespace, name)
+    autoscaler = await ctx.tool("find_autoscaler")(namespace, name)
     change = await _extract(ctx, workload, autoscaler)
     spec = actions.REGISTRY.get(change.get("action"))
     if spec is not None and kind not in spec.workload_kinds:
@@ -194,16 +188,10 @@ async def run(ctx: StepContext) -> dict:
             "The request does not ask for a concrete change this agent can make to "
             f"{kind} {namespace}/{name}: "
             + str(change.get("reasoning") or "no change identified")
-            + ". Nothing was proposed. Ask again with the exact change, for example "
-            + (
-                "'set the memory limit "
-                f"of container {_container_summary(workload)[0]['name'] if workload['template']['containers'] else '<container>'} "
-                f"in deployment {name} (namespace {namespace}) to <value>' or "
-                if kind == "Deployment"
-                else ""
-            )
-            + _example(kind, name, namespace)
-            + ".",
+            + ". Nothing was proposed. Ask again with the exact change, for example 'set the memory limit "
+            f"of container {_container_summary(workload)[0]['name'] if workload['template']['containers'] else '<container>'} "
+            f"in deployment {name} (namespace {namespace}) to <value>' or 'restart deployment {name} in namespace "
+            f"{namespace}'.",
             current={"kind": kind, "replicas": workload.get("replicas"), "containers": _container_summary(workload)},
         )
 
@@ -216,7 +204,6 @@ async def run(ctx: StepContext) -> dict:
         nodes = await ctx.tool("list_nodes")()
         pods = await ctx.tool("list_pods")(None, None, True)
     env = {"threshold": threshold, "headroom": policy.headroom_ratio(opts), "nodes": nodes, "pods": pods}
-    env.update(await spec.plan_inputs(ctx, state))
     planned, refused = spec.plan(ctx, state, change, env)
     if refused:
         return refused
@@ -296,12 +283,17 @@ async def run(ctx: StepContext) -> dict:
     try:
         dry_run = await ctx.tool("dry_run_patch")(action)
     except RuntimeError as exc:
+        # The cluster's own guard (the chart's ValidatingAdmissionPolicy) said no: a protected namespace or workload.
+        if "ValidatingAdmissionPolicy" in str(exc):
+            return refusal(
+                f"The cluster's protection policy denies this change, so nothing was proposed. Dry-run answer: {exc}",
+                protected=True,
+            )
         # A new image can reach a cluster before the chart that grants its RBAC does.
-        missing = spec.missing_rule(action)
-        if missing and "HTTP 403" in str(exc):
+        if spec.rbac_rule and "HTTP 403" in str(exc):
             return refusal(
                 f"The agent is not allowed to make this change in this cluster yet: its ServiceAccount lacks "
-                f"{missing}. Nothing was proposed. "
+                f"{spec.rbac_rule}. Nothing was proposed. "
                 f"Dry-run answer: {exc}"
             )
         raise

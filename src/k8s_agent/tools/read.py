@@ -92,13 +92,6 @@ async def get_workload(kind: str, namespace: str, name: str) -> dict:
         raise RuntimeError(f"could not read {kind} {namespace}/{name}: {safe_error(exc)}") from None
 
 
-async def list_replicasets(namespace: str, deployment: str, selector: dict | str | None = None) -> list[dict]:
-    """The ReplicaSets a Deployment owns (its revision history), as views."""
-    raws = await _list_dicts("ReplicaSet", namespace=namespace, labels=selector or None)
-    sets = [views.replicaset_view(r) for r in raws]
-    return [rs for rs in sets if (rs.get("owner") or {}).get("kind") == "Deployment" and (rs.get("owner") or {}).get("name") == deployment]
-
-
 async def list_deployment_views(namespace: str | None = None) -> list[dict]:
     return [views.deployment_view(r) for r in await _list_dicts("Deployment", namespace=namespace)]
 
@@ -290,10 +283,9 @@ async def list_hpas(namespace: str) -> list[dict]:
         raise RuntimeError(f"could not list HPAs in {namespace}: {safe_error(exc)}") from None
 
 
-async def find_autoscaler(namespace: str, name: str, kind: str = "Deployment") -> dict | None:
-    """The HPA or KEDA ScaledObject that scales the `kind` (Deployment or StatefulSet) named `name`, or None."""
+async def find_autoscaler(namespace: str, deployment: str) -> dict | None:
     scaledobjects, hpas = await asyncio.gather(list_scaledobjects(namespace), list_hpas(namespace))
-    return governance.find_autoscaler(name, scaledobjects, hpas, kind)
+    return governance.find_autoscaler(deployment, scaledobjects, hpas)
 
 
 # ---------------------------------------------------------------- capacity context

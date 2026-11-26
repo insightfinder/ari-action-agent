@@ -1,15 +1,16 @@
-"""Registry of every change this agent can propose. See `base.py`."""
+"""Registry of every change this agent can propose. See `base.py`.
+
+Removed by decision (2026-11-26, nothing that could break a product environment): rollback, set_image,
+pause/resume_rollout, suspend/resume_cronjob, and every change to a StatefulSet or DaemonSet. See the "Never"
+list in docs/K8S_AGENT_INTERFACE.md.
+"""
 
 from .base import ActionSpec, Operation, target_of
-from .cronjob import ResumeCronJob, SuspendCronJob
 from .delete_pod import DeletePod
-from .pause_rollout import PauseRollout, ResumeRollout
 from .resize_pod import ResizePod
 from .restart_rollout import RestartRollout
-from .rollback import Rollback
 from .scale_replicas import ScaleReplicas
 from .set_autoscaler_bounds import SetAutoscalerBounds
-from .set_image import SetImage
 from .set_resources import SetResources
 
 # Order is the order the extraction prompt lists them in; new actions go last so existing names keep their place.
@@ -21,13 +22,7 @@ REGISTRY: dict[str, ActionSpec] = {
         SetResources(),
         ResizePod(),
         RestartRollout(),
-        Rollback(),
         DeletePod(),
-        SetImage(),
-        PauseRollout(),
-        ResumeRollout(),
-        SuspendCronJob(),
-        ResumeCronJob(),
     )
 }
 ACTIONS = tuple(REGISTRY)

@@ -802,7 +802,7 @@ def scenario_double_approve(args):
         return ok, f"sends={states} final={done['status']['state']} status={result.get('status')} writes={writes} in {elapsed:.0f}s"
 
 
-# ---------------------------------------------------------------- restart, rollback, pod delete (II-25740)
+# ---------------------------------------------------------------- restart, pod delete (II-25740)
 
 RESTARTED_AT = "kubectl.kubernetes.io/restartedAt"
 
@@ -846,16 +846,6 @@ def scenario_restart_deployment(args):
     return _restart(args, "deployment", "e2e-plain")
 
 
-def scenario_restart_statefulset(args):
-    """Rolling restart of the StatefulSet e2e-sts (one pod at a time), verified by its controller's status."""
-    return _restart(args, "statefulset", "e2e-sts")
-
-
-def scenario_restart_daemonset(args):
-    """Rolling restart of the DaemonSet e2e-ds (node by node), verified by its controller's status."""
-    return _restart(args, "daemonset", "e2e-ds")
-
-
 def _delete(args, pod: str, same_name: bool):
     """A pod delete is proposed with its uid; without --allow-writes the pod must still be there with the same
     uid (the dry run deleted nothing); approved, the old uid is gone and the agent names the replacement."""
@@ -890,66 +880,6 @@ def scenario_delete_pod(args):
     return _delete(args, running[0], same_name=False)
 
 
-def scenario_delete_sts_pod(args):
-    """Delete e2e-sts-1: the StatefulSet brings it back under the same name with a new uid."""
-    return _delete(args, "e2e-sts-1", same_name=True)
-
-
-def _rollback_image() -> str:
-    return _kubectl("-n", NAMESPACE, "get", "deploy", "e2e-rollback", "-o", "jsonpath={.spec.template.spec.containers[0].image}")
-
-
-def _set_rollback_image(image: str) -> None:
-    if _rollback_image() != image:
-        _kubectl("-n", NAMESPACE, "set", "image", "deploy/e2e-rollback", f"app={image}")
-        _kubectl("-n", NAMESPACE, "rollout", "status", "deploy/e2e-rollback", "--timeout=180s")
-
-
-def _rollback(args, prompt_for):
-    """e2e-rollback is put on pause:3.9 (so pause:3.10 is the previous revision), rolled back through the
-    agent, and put back on pause:3.9 with kubectl."""
-    older, newer = "registry.k8s.io/pause:3.10", "registry.k8s.io/pause:3.9"
-    _set_rollback_image(older)
-    _set_rollback_image(newer)
-    try:
-        task, pending = _propose(prompt_for())
-        if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending:
-            return False, f"expected a proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
-        shape = pending.get("action") == "rollback" and (pending.get("images") or {}).get("app") == older and not _leaks(task)
-        if not args.allow_writes:
-            state = _cancel(task["id"])
-            untouched = _rollback_image() == newer
-            return (shape and untouched) or False, f"proposal only ({pending.get('action_name')}, {state}); untouched={untouched}"
-        done, elapsed = _approve(task, pending)
-        result = _artifact(done, "action_result") or {}
-        live = _rollback_image()
-        ok = shape and result.get("status") == "succeeded" and live == older and not _leaks(done)
-        return ok, f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} image={live} :: {pending.get('action_name')}"
-    finally:
-        if args.allow_writes:
-            _set_rollback_image(newer)
-
-
-def scenario_rollback(args):
-    """Roll e2e-rollback back to the previous revision (pause:3.10); the proposal carries images, never the template."""
-    return _rollback(args, lambda: f"roll back the deployment e2e-rollback in namespace {NAMESPACE} to the previous revision")
-
-
-def scenario_rollback_revision(args):
-    """Roll e2e-rollback back to a revision the request states by number."""
-
-    def prompt():
-        sets = json.loads(_kubectl("-n", NAMESPACE, "get", "rs", "-l", "app=e2e-rollback", "-o", "json"))["items"]
-        revision = max(
-            int(rs["metadata"]["annotations"]["deployment.kubernetes.io/revision"])
-            for rs in sets
-            if rs["spec"]["template"]["spec"]["containers"][0]["image"].endswith("pause:3.10")
-        )
-        return f"roll back the deployment e2e-rollback in namespace {NAMESPACE} to revision {revision}"
-
-    return _rollback(args, prompt)
-
-
 def scenario_health_statefulset(_args):
     """A health check of the StatefulSet e2e-sts covers its own pods only."""
     task, elapsed = _run(f"check the health of the statefulset e2e-sts in namespace {NAMESPACE}")
@@ -959,146 +889,7 @@ def scenario_health_statefulset(_args):
     return ok, f"{task['status']['state']} in {elapsed:.0f}s scope={scope} pods={(report.get('summary') or {}).get('pods')}"
 
 
-# ---------------------------------------------------------------- image, pause/resume, CronJob (II-25740)
-
-PAUSE_OLD, PAUSE_NEW = "registry.k8s.io/pause:3.10", "registry.k8s.io/pause:3.9"
-
-
-def _image(kind: str, name: str) -> str:
-    return _kubectl("-n", NAMESPACE, "get", kind, name, "-o", "jsonpath={.spec.template.spec.containers[0].image}")
-
-
-def _put_image(kind: str, name: str, image: str) -> None:
-    """Puts a fixture's image back with kubectl (not through the agent) and waits for the rollout."""
-    if _image(kind, name) != image:
-        _kubectl("-n", NAMESPACE, "set", "image", f"{kind}/{name}", f"app={image}")
-        _kubectl("-n", NAMESPACE, "rollout", "status", f"{kind}/{name}", "--timeout=300s")
-
-
-def _set_image(args, kind: str, name: str):
-    """The image of container app is set to pause:3.9 through the agent (verified, and the persistence hint
-    names the image field); the dry run leaves it alone. kubectl puts pause:3.10 back afterwards."""
-    _put_image(kind, name, PAUSE_OLD)
-    try:
-        task, pending = _propose(f"set the image of container app in {kind} {name} in namespace {NAMESPACE} to {PAUSE_NEW}")
-        if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending:
-            return False, f"expected a proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
-        changes = (pending.get("persistence") or {}).get("changes") or []
-        shape = (
-            pending.get("action") == "set_image" and pending.get("image") == PAUSE_NEW
-            and any(c.get("field") == "image" and c.get("to") == PAUSE_NEW for c in changes) and not _leaks(task)
-        )
-        if not args.allow_writes:
-            state = _cancel(task["id"])
-            untouched = _image(kind, name) == PAUSE_OLD
-            return (shape and untouched) or False, f"proposal only ({pending.get('action_name')}, {state}); untouched={untouched}"
-        done, elapsed = _approve(task, pending)
-        result = _artifact(done, "action_result") or {}
-        live = _image(kind, name)
-        ok = shape and result.get("status") == "succeeded" and live == PAUSE_NEW and not _leaks(done)
-        return ok, f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} image={live} :: {pending.get('action_name')}"
-    finally:
-        if args.allow_writes:
-            _put_image(kind, name, PAUSE_OLD)
-
-
-def scenario_set_image(args):
-    """Set the image of e2e-plain to pause:3.9: proposed, approved, rolled out and verified."""
-    return _set_image(args, "deployment", "e2e-plain")
-
-
-def scenario_set_image_statefulset(args):
-    """Set the image of the StatefulSet e2e-sts to pause:3.9, verified by its controller's status."""
-    return _set_image(args, "statefulset", "e2e-sts")
-
-
-def _sts_replicas(name: str) -> int:
-    return int(_kubectl("-n", NAMESPACE, "get", "statefulset", name, "-o", "jsonpath={.spec.replicas}") or 0)
-
-
-def _pvc_exists(name: str) -> bool:
-    return bool(_kubectl("-n", NAMESPACE, "get", "pvc", "--ignore-not-found", name, "-o", "name"))
-
-
-def scenario_scale_statefulset(args):
-    """Scale the StatefulSet e2e-sts-pvc from 1 to 2 (a new pod and its PVC), then back to 1 (high risk; the
-    PVC of the removed pod is kept), each verified by the StatefulSet's own counts."""
-    sts, claim = "e2e-sts-pvc", "data-e2e-sts-pvc-1"
-    try:
-        ok, pending, result, note = _round_trip(args, f"scale the statefulset {sts} in namespace {NAMESPACE} to 2 replicas", "scale_replicas")
-        pending = pending or {}
-        said = any(claim in n for n in pending.get("notes") or []) or any(claim in r.get("message", "") for r in pending.get("risks") or [])
-        shape = (pending.get("target") or {}).get("kind") == "StatefulSet" and pending.get("risk_tier") in ("medium", "high") and said
-        if not ok:
-            return (False if ok is False else (shape and _sts_replicas(sts) == 1)), f"{note}; proposal_shape={shape}"
-        up = shape and result.get("status") == "succeeded" and _sts_replicas(sts) == 2 and _pvc_exists(claim)
-        ok2, pending2, result2, note2 = _round_trip(args, f"scale the statefulset {sts} in namespace {NAMESPACE} to 1 replica", "scale_replicas")
-        pending2 = pending2 or {}
-        high = pending2.get("risk_tier") == "high" and any("kept with their data" in n for n in pending2.get("notes") or [])
-        down = bool(ok2) and high and result2.get("status") == "succeeded" and _sts_replicas(sts) == 1 and _pvc_exists(claim)
-        return up and down, f"{note}; up={up}; {note2}; down={down} (tier {pending2.get('risk_tier')}, {claim} kept={_pvc_exists(claim)})"
-    finally:
-        if args.allow_writes and _sts_replicas(sts) != 1:
-            _kubectl("-n", NAMESPACE, "scale", "statefulset", sts, "--replicas=1")
-
-
-def _paused(name: str) -> bool:
-    return _kubectl("-n", NAMESPACE, "get", "deploy", name, "-o", "jsonpath={.spec.paused}") == "true"
-
-
-def _round_trip(args, prompt: str, action: str):
-    """Propose -> (approve) -> `(ok_so_far, pending, result, note)`; without --allow-writes, cancels."""
-    task, pending = _propose(prompt)
-    if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending or pending.get("action") != action:
-        return False, pending, None, f"expected a {action} proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
-    if not args.allow_writes:
-        return None, pending, None, f"proposal only ({pending.get('action_name')}, {_cancel(task['id'])})"
-    done, elapsed = _approve(task, pending)
-    result = _artifact(done, "action_result") or {}
-    ok = done["status"]["state"] == "TASK_STATE_COMPLETED" and not _leaks(task) and not _leaks(done)
-    return ok, pending, result, f"{action} {elapsed:.0f}s status={result.get('status')}"
-
-
-def scenario_pause_resume(args):
-    """Pause e2e-plain through the agent; change its image with kubectl while paused (no rollout); resume
-    through the agent, which says the waiting change replaces the pods and verifies that rollout."""
-    try:
-        ok, pending, result, note = _round_trip(args, f"pause the rollout of deployment e2e-plain in namespace {NAMESPACE}", "pause_rollout")
-        if not ok:
-            untouched = None if ok is False else not _paused("e2e-plain")
-            return (ok if ok is False else (untouched or False)), f"{note}; untouched={untouched}"
-        paused_ok = result.get("status") == "succeeded" and _paused("e2e-plain")
-        _kubectl("-n", NAMESPACE, "set", "image", "deploy/e2e-plain", f"app={PAUSE_NEW}")
-        time.sleep(10)
-        ok2, pending2, result2, note2 = _round_trip(args, f"resume the rollout of deployment e2e-plain in namespace {NAMESPACE}", "resume_rollout")
-        waiting = (pending2 or {}).get("pending_pods")
-        resumed = bool(ok2) and result2.get("status") == "succeeded" and not _paused("e2e-plain") and _image("deployment", "e2e-plain") == PAUSE_NEW
-        return paused_ok and resumed and bool(waiting), f"{note}; paused={paused_ok}; {note2}; pending_pods={waiting}"
-    finally:
-        if _paused("e2e-plain"):
-            _kubectl("-n", NAMESPACE, "rollout", "resume", "deploy/e2e-plain")
-        if args.allow_writes:
-            _put_image("deployment", "e2e-plain", PAUSE_OLD)
-
-
-def _suspended(name: str) -> bool:
-    return _kubectl("-n", NAMESPACE, "get", "cronjob", name, "-o", "jsonpath={.spec.suspend}") == "true"
-
-
-def scenario_suspend_resume_cronjob(args):
-    """Suspend the CronJob e2e-cron through the agent (the dry run leaves it alone), then resume it."""
-    try:
-        ok, pending, result, note = _round_trip(args, f"suspend the cronjob e2e-cron in namespace {NAMESPACE}", "suspend_cronjob")
-        if not ok:
-            untouched = None if ok is False else not _suspended("e2e-cron")
-            return (ok if ok is False else (untouched or False)), f"{note}; untouched={untouched}"
-        suspended = result.get("status") == "succeeded" and _suspended("e2e-cron")
-        ok2, _, result2, note2 = _round_trip(args, f"resume the cronjob e2e-cron in namespace {NAMESPACE}", "resume_cronjob")
-        resumed = bool(ok2) and result2.get("status") == "succeeded" and not _suspended("e2e-cron")
-        return suspended and resumed, f"{note}; suspended={suspended}; {note2}; resumed={resumed}"
-    finally:
-        if _suspended("e2e-cron"):
-            _kubectl("-n", NAMESPACE, "patch", "cronjob", "e2e-cron", "--type", "merge", "-p", '{"spec":{"suspend":false}}')
+# ---------------------------------------------------------------- CronJob, read only (II-25740)
 
 
 def scenario_health_cronjob(_args):
@@ -1108,6 +899,72 @@ def scenario_health_cronjob(_args):
     scope = report.get("scope") or {}
     ok = task["status"]["state"] == "TASK_STATE_COMPLETED" and scope.get("type") == "workload" and scope.get("kind") == "CronJob"
     return ok, f"{task['status']['state']} in {elapsed:.0f}s scope={scope} pods={(report.get('summary') or {}).get('pods')}"
+
+
+# ---------------------------------------------------------------- what is never changed (2026-11-26)
+
+
+def _no_proposal(prompt: str, check) -> tuple[bool, str]:
+    """`prompt` gets no proposal (refused, or answered without planning a change) and `check()` still holds."""
+    before = check()
+    task, elapsed = _run(prompt)
+    refusal = _artifact(task, "refusal") or {}
+    after = check()
+    ok = task["status"]["state"] == "TASK_STATE_COMPLETED" and _artifact(task, "pending_action") is None and before == after
+    return ok, f"{task['status']['state']} in {elapsed:.0f}s refusal={json.dumps(refusal)[:160]} state {before!r}->{after!r}"
+
+
+def scenario_refuse_statefulset_change(_args):
+    """A restart of the StatefulSet e2e-sts is refused (StatefulSets are read only): no proposal, no new restartedAt."""
+    return _no_proposal(f"restart the statefulset e2e-sts in namespace {NAMESPACE}", lambda: _restarted_at("statefulset", "e2e-sts"))
+
+
+def scenario_refuse_protected_namespace(_args):
+    """Scaling coredns in kube-system is refused (protected namespace): no proposal, replicas unchanged."""
+    return _no_proposal(
+        "scale the deployment coredns in namespace kube-system to 5 replicas",
+        lambda: _kubectl("-n", "kube-system", "get", "deploy", "coredns", "-o", "jsonpath={.spec.replicas}"),
+    )
+
+
+def scenario_refuse_self(_args):
+    """A restart of the agent's own worker is refused (protected workload): no proposal, no new restartedAt."""
+    worker = _split("ARI_WORKER_DEPLOYMENT")
+    if not worker:
+        return None, "needs ARI_WORKER_DEPLOYMENT (<namespace>/<name>)"
+    namespace, name = worker
+    path = "jsonpath={.spec.template.metadata.annotations.kubectl\\.kubernetes\\.io/restartedAt}"
+    return _no_proposal(
+        f"restart the deployment {name} in namespace {namespace}",
+        lambda: _kubectl("-n", namespace, "get", "deploy", name, "-o", path),
+    )
+
+
+def scenario_admission_policy(_args):
+    """The chart's ValidatingAdmissionPolicy, not only the agent's code: the worker's ServiceAccount's server dry
+    runs are denied in kube-system and on the agent's own worker, and still allowed on e2e-plain."""
+    worker = _split("ARI_WORKER_DEPLOYMENT")
+    if not worker:
+        return None, "needs ARI_WORKER_DEPLOYMENT (<namespace>/<name>)"
+    namespace, deployment = worker
+    sa = _kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.template.spec.serviceAccountName}")
+    body = json.dumps({"metadata": {"annotations": {"ari-e2e/probe": "1"}}})
+
+    def dry_run(ns, name):
+        context = os.environ.get("KUBE_CONTEXT")
+        cmd = [
+            "kubectl", *(["--context", context] if context else []), f"--as=system:serviceaccount:{namespace}:{sa}",
+            "-n", ns, "patch", "deploy", name, "--type", "merge", "-p", body, "--dry-run=server",
+        ]
+        out = subprocess.run(cmd, capture_output=True, text=True)
+        return out.returncode == 0, (out.stderr or out.stdout).strip()
+
+    system_ok, system_msg = dry_run("kube-system", "coredns")
+    self_ok, self_msg = dry_run(namespace, deployment)
+    e2e_ok, e2e_msg = dry_run(NAMESPACE, "e2e-plain")
+    by_policy = "ValidatingAdmissionPolicy" in system_msg and "ValidatingAdmissionPolicy" in self_msg
+    ok = not system_ok and not self_ok and e2e_ok and by_policy
+    return ok, f"kube-system denied={not system_ok} self denied={not self_ok} e2e-plain allowed={e2e_ok} :: {system_msg[:140]}"
 
 
 # ---------------------------------------------------------------- nodes: read only (II-25740)
@@ -1189,10 +1046,8 @@ RBAC_ALLOWED = [
     ("patch", "deployments.apps", f"-n={NAMESPACE}"), ("patch", "deployments.apps", f"-n={NAMESPACE}", "scale"),
     ("patch", "horizontalpodautoscalers.autoscaling", f"-n={NAMESPACE}"), ("patch", "scaledobjects.keda.sh", f"-n={NAMESPACE}"),
     ("patch", "pods", f"-n={NAMESPACE}", "resize"), ("delete", "pods", f"-n={NAMESPACE}"),
-    ("patch", "statefulsets.apps", f"-n={NAMESPACE}"), ("patch", "daemonsets.apps", f"-n={NAMESPACE}"),
     ("list", "replicasets.apps", "-A"), ("list", "statefulsets.apps", "-A"), ("list", "daemonsets.apps", "-A"),
     ("list", "cronjobs.batch", "-A"), ("get", "jobs.batch", f"-n={NAMESPACE}"),
-    ("patch", "cronjobs.batch", f"-n={NAMESPACE}"),
 ]
 RBAC_DENIED = [
     ("get", "secrets", f"-n={NAMESPACE}"), ("list", "secrets", "-A"), ("create", "pods", f"-n={NAMESPACE}", "exec"),
@@ -1203,7 +1058,9 @@ RBAC_DENIED = [
     ("delete", "statefulsets.apps", f"-n={NAMESPACE}"), ("create", "pods", f"-n={NAMESPACE}", "eviction"),
     ("watch", "pods", "-A"), ("list", "configmaps", "-A"),
     ("create", "jobs.batch", f"-n={NAMESPACE}"), ("delete", "jobs.batch", f"-n={NAMESPACE}"), ("patch", "jobs.batch", f"-n={NAMESPACE}"),
-    ("create", "cronjobs.batch", f"-n={NAMESPACE}"),
+    ("create", "cronjobs.batch", f"-n={NAMESPACE}"), ("patch", "cronjobs.batch", f"-n={NAMESPACE}"),
+    ("patch", "statefulsets.apps", f"-n={NAMESPACE}"), ("patch", "daemonsets.apps", f"-n={NAMESPACE}"),
+    ("patch", "persistentvolumeclaims", f"-n={NAMESPACE}"), ("delete", "persistentvolumeclaims", f"-n={NAMESPACE}"),
 ]
 
 
@@ -1288,20 +1145,14 @@ SCENARIOS = {
     "double_approve": scenario_double_approve,
     "health_statefulset": scenario_health_statefulset,
     "restart_deployment": scenario_restart_deployment,
-    "restart_statefulset": scenario_restart_statefulset,
-    "restart_daemonset": scenario_restart_daemonset,
     "delete_pod": scenario_delete_pod,
-    "delete_sts_pod": scenario_delete_sts_pod,
-    "rollback": scenario_rollback,
-    "rollback_revision": scenario_rollback_revision,
-    "set_image": scenario_set_image,
-    "set_image_statefulset": scenario_set_image_statefulset,
-    "scale_statefulset": scenario_scale_statefulset,
-    "pause_resume": scenario_pause_resume,
     "health_cronjob": scenario_health_cronjob,
-    "suspend_resume_cronjob": scenario_suspend_resume_cronjob,
     "health_node": scenario_health_node,
     "refuse_node_change": scenario_refuse_node_change,
+    "refuse_statefulset_change": scenario_refuse_statefulset_change,
+    "refuse_protected_namespace": scenario_refuse_protected_namespace,
+    "refuse_self": scenario_refuse_self,
+    "admission_policy": scenario_admission_policy,
     "node_beside_workload": scenario_node_beside_workload,
     "worker_restart": scenario_worker_restart,
     "resume_after_restart": scenario_resume_after_restart,
