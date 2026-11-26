@@ -7033,3 +7033,15 @@ scripted model; generation unchanged): `insightfinder-dailyreportworker` (usage 
 both namespaces reach the worker env and the admission policy. New live scenarios `refuse_memory_decrease`,
 `memory_decrease_high` (fixture applied on test). Not run: the live script against a deployed build (needs
 commit, merge into test, deploy, and chart 0.3.21 released + test-fluxcd bumped).
+
+**Memory decrease guard and protected ingress namespaces live on test (2026-11-26).** Merge into test `6e028e1`;
+images ari-k8s-agent-worker and ari-agent-api `2611261023-test`; oncallari 0.3.21 via test-fluxcd (the
+HelmRepository's cached index did not list 0.3.21 yet: `flux reconcile source helm ari-k8s -n insightfinder` on
+test, then the release applied). Worker env and the `ari-k8s-protected` admission policy both list ingress-nginx
+and istio-system. Live script, `--allow-writes`, 15 scenarios: `refuse_memory_decrease` (110Mi refused, usage
+104Mi), `memory_decrease_high` (256Mi -> 200Mi proposed high with the usage, cancelled), `rbac`, `refuse_limit`,
+`clamp`, `clamp_sidecar`, `refuse_protected_namespace`, `refuse_self`, `admission_policy`, `drift`, `scale`,
+`fix_stuck`, `slow_start` (384 s), `resize_pod`, `gate_stale`: all passed (`refuse_memory_decrease` first failed
+with "connection refused", the port-forward not up yet; passed on a rerun). Fixtures restored afterwards
+(e2e-slow 64Mi, e2e-memhungry 32Mi, e2e-plain 2 replicas). Not run this round: the other 38 scenarios (reads,
+restart, delete_pod, expand_pvc, autoscaler bounds, the remaining gates, worker/API restarts), unchanged paths.
