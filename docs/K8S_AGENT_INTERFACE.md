@@ -68,8 +68,8 @@ UIE (`ran`).
   already gone or replaced when the approval arrived counts as done: `applied.already_at_target` is true and
   nothing is deleted.
 - An approval is not applied (the step fails, nothing is written) when its target has become protected, when
-  its kind is no longer changed (a StatefulSet or DaemonSet restart proposed before 2026-11-26), or for an
-  action that no longer exists.
+  its kind is no longer changed (a StatefulSet or DaemonSet restart, or a delete of such a pod, proposed before
+  2026-11-26), or for an action that no longer exists.
 
 ### `query_result`
 
@@ -144,8 +144,9 @@ says. The oncallari chart's `ariK8sAgent.protection` values hold both lists and 
   whose target has become protected (`tools/protection.py`);
 - a ValidatingAdmissionPolicy (Kubernetes >= 1.30; left out on an older cluster unless required, see RBAC) that
   has the API server deny the agent's ServiceAccount any write in a protected namespace, and to a protected
-  Deployment, its pods (through their ReplicaSet) and its autoscalers. A dry run it denies comes back as a
-  refusal (`protected: true`).
+  Deployment, its pods (through their ReplicaSet) and its autoscalers (their target before and after the
+  request), and any change to what an autoscaler scales (`spec.scaleTargetRef`; the agent only changes bounds).
+  A dry run it denies comes back as a refusal (`protected: true`).
 - The code holds no workload names (they are installation-specific; the oncallari defaults below are
   InsightFinder's). A chart shipped for other installations should default `workloads` to empty: the agent's
   own API and worker are added anyway.

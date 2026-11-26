@@ -264,6 +264,17 @@ async def test_delete_already_done_is_verified_not_repeated(cluster):
     assert again["applied"]["already_at_target"] is True and not cluster.deletes and again["status"] == "succeeded"
 
 
+async def test_a_statefulset_pod_delete_proposed_before_the_removal_is_not_applied(cluster):
+    pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
+    uid = _obj(cluster, "Pod", "db-1")["metadata"]["uid"]
+    pa.update({"workload_kind": "StatefulSet", "workload": "db", "deployment": None, "pod": "db-1", "pod_uid": uid,
+               "target": {"kind": "Pod", "namespace": "shop", "name": "db-1"}})
+    pa["snapshot"]["pod_uid"] = uid
+    with pytest.raises(RuntimeError, match="deletes only a Deployment's pods"):
+        await _apply(pa)
+    assert not cluster.deletes
+
+
 async def test_a_pod_name_only_inside_a_longer_one_is_not_taken(cluster):
     import copy
 

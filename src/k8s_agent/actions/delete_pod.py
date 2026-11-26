@@ -155,6 +155,10 @@ class DeletePod(ActionSpec):
             return [f"pod {name} was already replaced (new uid)"]
         if pod.get("deleting"):
             return [f"pod {name} is already being deleted"]
+        # A proposal made before only Deployment pods were deleted (2026-11-26) may name another kind's pod.
+        owner = (state.get("workload") or {}).get("kind")
+        if owner != "Deployment" or (proposal.get("workload_kind") or "Deployment") != "Deployment":
+            return [f"pod {name} is a {owner or 'bare'} pod; this agent deletes only a Deployment's pods"]
         if not _ready_others(name, state.get("siblings") or []):
             return [f"no other pod of {proposal.get('workload')} is ready now"]
         return []

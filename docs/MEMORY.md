@@ -5962,3 +5962,13 @@ kind of `moved_away`, the `pause_resume` live scenario and the pause tests; docs
 descriptions updated; recorded in the "Never" list. Kept: the read-only `paused` field in views/queries and the
 restart refusal for a paused Deployment. Remaining writes: scale_replicas, set_autoscaler_bounds, set_resources,
 resize_pod, restart_rollout, delete_pod (Deployments only). Suite on 3.12: 1216 passed, 11 skipped.
+
+**Two fixes from the automated security review of the commits (2026-11-26).**
+- Chart policy: an autoscaler was judged by its target before the request only, so the agent's ServiceAccount
+  could have pointed an HPA/ScaledObject at a protected Deployment. The policy now also checks the target after
+  the request and denies any change to `spec.scaleTargetRef` (the agent only changes bounds). Probe copy on test
+  again (deleted after): retargeting e2e-hpa and e2e-keda denied; max changes (3 -> 5, server dry run) still
+  allowed; the earlier denials/allowances unchanged; nothing written.
+- `delete_pod` approval: a pod delete proposed before 2026-11-26 for a StatefulSet's or DaemonSet's pod has
+  target kind `Pod`, which the target-kind guard lets through; its drift check now refuses unless the pod's
+  owner (and the proposal's `workload_kind`) is a Deployment. Test added. Suite on 3.12: 1217 passed, 11 skipped.
