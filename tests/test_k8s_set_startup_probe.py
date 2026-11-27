@@ -228,3 +228,12 @@ async def test_without_the_key_no_check_is_copied(cluster, monkeypatch):
     monkeypatch.setattr(views, "_digest_key", lambda: None)
     result = await ca._propose("give checkout 20 minutes to start", _time("20 minutes"))
     assert "TEMPORAL_PAYLOAD_ENCRYPTION_KEY" in result["refusal"]["reason"] and not cluster.patches
+
+
+@pytest.mark.parametrize(
+    "quote,seconds",
+    [("2 minutes (120 seconds)", 120), ("10 minutes", 600), ("600s", 600), ("10分钟", 600), ("2 minutes or 3 minutes", None),
+     ("5", None)],
+)
+def test_stated_duration(quote, seconds):
+    assert policy.stated_duration(quote, f"give it {quote} to start") == seconds

@@ -6815,3 +6815,64 @@ Before this, the reply showed the limits and a request with `<value>` left for a
   64Mi suggestion and its request) and `startup_probe` PASS (both proposed from "give deployment X ... 2 minutes to
   start", approved, `succeeded` in about 125 s, 24 x 5s; fixtures recreated afterwards). Pods of the earlier
   manual runs stay Terminating on NotReady nodes (node issue on test, not touched).
+
+## 2026-11-27 - ARI chat e2e on TST with mcp-service, and fixes found there (II-25740)
+
+Driven in the ARI Agent chat on test.insightfinder.com (account bo, system TST, Kubernetes card ->
+`https://test-ari-k8s-agent.insightfinder.com`) with Playwright, agent images 2611270743-test. Prompts from the test
+document (user's Downloads); every approval agreed with the user first, fixtures only.
+
+With the deployed mcp-service (2611242139-test):
+- Health checks (namespace, Deployment, StatefulSet, DaemonSet, CronJob, a missing one), the OOM 64Mi suggestion, the
+  probe-kill diagnosis, the log-injection case and the refusals reached through Deployments (scale to 0, a
+  KEDA-managed replica count, limit below request, memory below 1.2 x usage) all passed.
+- Not routed to the agent: PVC grow/shrink, a Helm PVC, StatefulSet/DaemonSet restart, Deployment restart, Secrets.
+  The coordinator called them "outside the scope" (arik8s.yaml described three changes) and handed out kubectl
+  commands for exactly what the agent refuses (patch a Helm PVC, restart a StatefulSet, decode a Secret).
+- Listings came back as prose only (no `query_result` table); one listing was answered as a health summary.
+- "Give it 2 minutes to start" reached the agent as "allow 2 minutes (120 seconds)": refused (two durations); the
+  coordinator then retried with values it made up and a 25 s proposal resulted (cancelled by hand).
+- A bare "reject" was once answered by the model ("cancelled") without calling the agent, leaving the proposal
+  paused (cancelled by hand); another time the agent got it but the UI showed "No answer returned from MCP service".
+- One DaemonSet check failed transiently: InfrastructureCore gRPC "Socket closed" during an appserver rollout
+  (mcp-service does not retry that lookup; not fixed).
+
+Fixed in this repo (uncommitted at the time of writing):
+- Probe-kill diagnosis: the run time before the kill is a lower bound; how long the start needs is unknown (the chat
+  had proposed 20 s from an 18 s run). Respond note says the same about `last_run_seconds`.
+- `policy.stated_duration` accepts one duration restated in another unit ("2 minutes (120 seconds)").
+- An in-place request the model extracted as `set_resources` is planned as `resize_pod` (the chat's "resize pod X in
+  place: cpu limit 100m" rolled every pod of e2e-plain instead), and `resize_pod` takes the pod named verbatim in
+  the request when the model leaves it out. Suite 1543 passed on 3.12.
+
+mcp-service (branch `II-25740-k8s-agent-capabilities` from origin/main, uncommitted): arik8s.yaml description lists
+every read, change and refusal, and tells the coordinator to call it for anything about the cluster, never give
+kubectl commands for it, pass values verbatim and not retry refused requests with other values; on-call rule K2 the
+same; `is_kubernetes_change` reads `kubernetes_change: true` (and the new action names); `query_result` rows are
+rendered as a Markdown table under the final answer by code (`a2a.query_tables`, coordinator `with_tables`), the
+coordinator sees only a summary; a message that is only approve/reject (or 批准/拒绝, yes, cancel, ...) is passed to
+the agent in code (`chat_decision`), the reply is the agent's own message without artifact JSON
+(`decision_reply`), and a proposal the next message did not answer is cancelled with a note
+(`_drop_unanswered`; `K8sChatApproval.peek_answerable`). Its suite: no new failures against main's baseline (13
+failing tests and one stale import on main, unrelated); 20 new tests.
+
+Swapped on test to try it: HelmRelease insightfinder annotated `kustomize.toolkit.fluxcd.io/reconcile: disabled` and
+suspended at 08:50 UTC, mcp-service + worker set to `insightfinder/mcp-service:ii25740-<time>` (tags without
+`-test`, so image automation ignores them). `ii25740-2611271656` carried merge-conflict markers in coordinator.py
+(a worktree re-apply) for about 2 minutes before `ii25740-2611271657` replaced it. With the new mcp-service: PVC
+requests routed (100Gi refused with the 51Gi limit), listings shown as a 17-row table, reject answered in code.
+Approved through chat (all `succeeded`, agent tasks checked): scale e2e-plain 2->3, restart e2e-plain, delete one
+e2e-plain pod, startup probe for e2e-slowstart-liveness (2 min, 24 x 5s, coordinator passed the time verbatim),
+expand data-e2e-vol-0 1Gi->2Gi. The in-place resize went through as set_resources (cpu limit 50m->100m on the
+template; fixed above). A first e2e-slow memory 64Mi->96Mi approval was reported `reverted` because I re-applied the
+fixtures during its rollout (the agent's revert detection was right); rerun follows.
+- e2e-slow rerun with mcp-service `ii25740-2611271728`: the first rerun (96Mi) was reported "did not finish within
+  300s ... cancelled" although the change was in place: the chat waits `timeout_s` 300 after an approval and a
+  rolling update of the slow fixture takes about 6 minutes. mcp-service now waits 960 s for arik8s (the agent's
+  apply step allows 900 s) and, when it still cancels, says the approved change may already be made. 64Mi->...->128Mi
+  then `succeeded` after about 6.5 minutes in the chat. The existing "deadline cancels the task" behaviour of
+  `a2a_resume.confirm` was kept (its test pins it).
+- Restored at 09:38 UTC: fixtures re-applied (e2e-plain 2 x 50m/32Mi, e2e-slow 64Mi, startup probe removed,
+  data-e2e-vol-0 recreated at 1Gi), HelmRelease insightfinder resumed and its reconcile annotation removed;
+  `flux reconcile` applied revision 0.9.477 and mcp-service and its worker are back on 2611242139-test. Temporary
+  Docker Hub tags `mcp-service:ii25740-*` (4) remain to be deleted by someone with delete rights.

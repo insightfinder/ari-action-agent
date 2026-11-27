@@ -50,6 +50,8 @@ def test_startup_probe_kill_is_named_with_its_allowance():
     assert "raise startupProbe.failureThreshold" in finding["diagnosis"]
     # A Deployment's pod: the agent can propose the fix itself.
     assert "give deployment <name> 10 minutes to start" in finding["diagnosis"]
+    # The run time is a lower bound, never the time to allow (a chat answer once proposed 20s from an 18s run).
+    assert "only that it is longer than 17s" in finding["diagnosis"]
     assert "exit code 137" in finding["evidence"]
 
 

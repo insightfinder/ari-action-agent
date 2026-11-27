@@ -127,6 +127,11 @@ class ResizePod(ActionSpec):
         pods = await ctx.tool("list_pods")(dep["namespace"], dep.get("label_selector") or dep.get("selector") or None, True)
         own = sorted(p["name"] for p in pods if not p.get("deleting") and governance.deployment_of(p) == dep["name"])
         named = str(change.get("pod") or "").strip()
+        if not named:
+            # The model left the pod out (it picked set_resources and was redirected, see propose_change): one
+            # of the Deployment's pods written verbatim in the request is the one meant.
+            quoted = [name for name in own if name in (ctx.prompt or "")]
+            named = quoted[0] if len(quoted) == 1 else ""
         if named:
             if named not in own or named not in (ctx.prompt or ""):
                 return None, refusal(

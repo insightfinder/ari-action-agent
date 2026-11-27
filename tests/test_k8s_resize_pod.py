@@ -354,3 +354,14 @@ async def test_asks_in_place(prompt, expected):
     from k8s_agent.tools import policy
 
     assert policy.asks_in_place(prompt) is expected
+
+
+async def test_an_in_place_request_extracted_as_set_resources_is_still_in_place(cluster):
+    # Found in ARI chat (2026-11-27): the model picked set_resources, without the pod, for an in-place request,
+    # and every pod was rolled. It is planned as resize_pod, of the pod the request names.
+    _set_limits(cluster, cpu="1")
+    change = _change(action="set_resources", container="app", resources={"limits": {"cpu": {"value": "2", "quote": "cpu limit 2"}}})
+    pa = (await _propose(cluster, "resize pod checkout-1 in place: cpu limit 2", change))["pending_action"]
+    assert pa["action"] == "resize_pod" and pa["pod"] == "checkout-1"
+    [dry] = cluster.patches
+    assert dry["kind"] == "Pod" and dry["name"] == "checkout-1"

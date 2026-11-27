@@ -117,6 +117,14 @@ def kill_cause(pod: dict, container: dict, kills: list[dict] | None) -> dict | N
                   **{k: v for k, v in probe.items() if k != "check_digest"}},
     }
     ran_text = f"after running {ran}s" if ran is not None else "(run time not recorded)"
+    # Found in the ARI chat (2026-11-27): a reader took the run time before the kill for the time the start needs
+    # ("it takes 18s to start, allow 20s"). The kill cut the start short, so only a lower bound is known.
+    unknown_need = (
+        f" How long it needs to start is not known from this, only that it is longer than {ran}s (the kill cut it "
+        "short): choose a time that covers its longest expected start, e.g. what its logs or past starts show."
+        if ran is not None
+        else " How long it needs to start is not known from this."
+    )
     # A Deployment's pod (owned by a ReplicaSet): this agent can propose the fix itself (set_startup_probe).
     ask = (
         "; for a Deployment this agent can propose it when asked with a time, e.g. \"give deployment <name> "
@@ -130,7 +138,7 @@ def kill_cause(pod: dict, container: dict, kills: list[dict] | None) -> dict | N
             f"{_timing('startup', probe) if probe else 'startupProbe timing unknown'}. If the container needs "
             "longer to start (slow initialisation, recovery, an index rebuild: see its previous log), give it "
             "more: raise startupProbe.failureThreshold (or periodSeconds) where the workload is defined (its chart "
-            "values when Helm or Flux manages it)" + ask
+            "values when Helm or Flux manages it)" + ask + "." + unknown_need
         )
         return cause
     grace = int(pod.get("termination_grace_seconds") or 30)
@@ -143,7 +151,7 @@ def kill_cause(pod: dict, container: dict, kills: list[dict] | None) -> dict | N
             f"({_timing('liveness', probe)}), and it has no startup probe: it is likely killed while still "
             "starting. If it needs longer to start, add a startupProbe with the same check as the liveness probe "
             "and enough time to start (it holds the liveness probe off until it passes) where the workload is "
-            "defined, rather than loosening the liveness probe" + ask
+            "defined, rather than loosening the liveness probe" + ask + "." + unknown_need
         )
     else:
         cause["diagnosis"] = (

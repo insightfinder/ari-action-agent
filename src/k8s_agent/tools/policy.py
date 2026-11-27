@@ -282,14 +282,15 @@ def asks_startup_change(prompt: str) -> bool:
 
 def stated_duration(quote: str | None, prompt: str) -> int | None:
     """Seconds stated by `quote` ("10 minutes", "600s", "1.5 hours", "10分钟"), when the quote is verbatim in the
-    request and states exactly one duration with a unit; else None. A bare number is not a duration."""
+    request and states one duration with a unit, perhaps restated in another unit ("2 minutes (120 seconds)", as the
+    ARI chat's coordinator writes it, found 2026-11-27); else None. Two different durations, or a bare number, are
+    not one."""
     if not quote or _normalize(quote) not in _normalize(prompt):
         return None
-    found = _DURATION.findall(quote)
-    if len(found) != 1:
+    stated = {float(number) * _SECONDS[unit[0].lower()] for number, unit in _DURATION.findall(quote)}
+    if len(stated) != 1:
         return None
-    number, unit = found[0]
-    seconds = float(number) * _SECONDS[unit[0].lower()]
+    seconds = stated.pop()
     return int(seconds) if seconds >= 1 and seconds == int(seconds) else None
 
 
