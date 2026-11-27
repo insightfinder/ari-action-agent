@@ -31,9 +31,10 @@ kubectl --context $CTX apply -f <(sed "s|__IMAGE_TAG__|$TAG|g; s|__TEMPORAL_HOST
 kubectl --context $CTX apply -f deploy/k8s-agent-e2e/fixtures.yaml
 
 # 4. Run the scenarios (read-only + cancelled proposals; add --allow-writes to approve changes)
-kubectl --context $CTX -n ari-k8s-agent port-forward svc/ari-k8s-api 18002:80 &
+kubectl --context $CTX proxy --port=18001 &
 # LLM_PROVIDER / LLM_API_KEY / LLM_MODEL from the environment or scripts/.env (git-ignored)
-ARI_BASE_URL=http://127.0.0.1:18002 python scripts/k8s_agent_live_test.py
+ARI_BASE_URL=http://127.0.0.1:18001/api/v1/namespaces/ari-k8s-agent/services/ari-k8s-api:80/proxy \
+  python scripts/k8s_agent_live_test.py
 ```
 
 ### Agent from the chart
@@ -49,11 +50,20 @@ helm --kube-context $CTX install ari-k8s charts/oncallari -n ari-k8s-agent \
   --set ariK8sAgent.agentPublicUrl=http://ari-k8s-api.ari-k8s-agent \
   --set ariK8sAgent.agentApiKeys="$(openssl rand -hex 24)" \
   --set ariK8sAgent.temporalPayloadEncryptionKey="$(openssl rand -base64 32)"
-kubectl --context $CTX -n ari-k8s-agent port-forward svc/ari-k8s-api 18002:80 &
+kubectl --context $CTX proxy --port=18001 &
+ARI_BASE_URL=http://127.0.0.1:18001/api/v1/namespaces/ari-k8s-agent/services/ari-k8s-api:80/proxy \
 ARI_API_KEY="$(kubectl --context $CTX -n ari-k8s-agent get secret ari-k8s-secret -o jsonpath='{.data.AGENT_API_KEYS}' | base64 -d)" \
 ARI_API_DEPLOYMENT=ari-k8s-agent/ari-k8s-api ARI_API_SERVICE=ari-k8s-agent/ari-k8s-api ARI_WORKER_DEPLOYMENT=ari-k8s-agent/ari-k8s-worker \
 KUBE_CONTEXT=$CTX python scripts/k8s_agent_live_test.py --allow-writes
 ```
+
+The scenarios reach the API through `kubectl proxy` (the API server's
+service proxy) rather than `kubectl port-forward`. A port-forward is one
+long-lived stream to one pod: over a full run (about two hours) it dropped
+several times with "connection reset" / "connection refused" and failed the
+scenario in flight, and it dies with the pod when the API restarts. Through
+the proxy each request is its own call to the API server and goes to
+whichever pod backs the Service. A port-forward URL still works.
 
 The chart refuses to render without `agentApiKeys` (or with `change-me`) and
 without a payload encryption key, unless `existingSecret` is set.

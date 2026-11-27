@@ -7141,3 +7141,31 @@ replacement). Suite on 3.12: 1471 passed, 11 skipped, 2 failed (`test_a2a_agent_
 same 2 fail on HEAD without these changes and pass alone; test order).
 Docs: K8S_AGENT_INTERFACE.md (delete_pod status, change log), the e2e README.
 Not verified live yet: needs commit, merge into test, push and deploy, then the live script.
+
+**Live on test: approvals done by someone else refused; full run, 89 scenarios (2026-11-27).** Merge into test
+`b858a4b`; images ari-k8s-agent-worker and ari-agent-api `2611261446-test` (`StepRefused` and `_duration` present
+in the worker). Live script, `--allow-writes`, all 89 scenarios: 84 passed first time. The 5 others:
+`late_too_old` (the agent refused correctly, "made 25 seconds ago, more than the 7 seconds an approval stays
+valid"; the scenario still looked for "hours an approval stays valid", now "an approval stays valid"), and
+`late_memory_usage`, `late_already_scaled`, `worker_restart`, `resume_after_restart` (the local `kubectl
+port-forward` dropped: connection reset / refused; the API pod did not restart). Rerun of the 5: all passed. New
+behaviour seen live: `late_delete_pod_gone` both refused ("... no longer exists; it already holds what was
+approved, done by someone else, not this agent" / "is already being deleted"); `late_delete_pod_retry` worker
+killed after the agent's own delete -> COMPLETED, `already_at_target`, succeeded (81 s); `late_already_*`
+(scaled, resources, bounds, resized, grown) all refused with that wording. A refusal runs only once,
+checked afterwards in Temporal's own history (namespace k8s-ari-agent, read-only, temporal-admintools): all 42
+failed `execute_step` activities of this run (worker 7bf95c99f9 / 64df78969d, from 15:14Z) are `StepRefused`,
+`nonRetryable: true`, started once (`attempt: 1`); the 34 of the earlier run on the old image (12:45-13:22Z) were
+`RuntimeError`, retryable, started twice (`attempt: 2`). Fixtures afterwards as in fixtures.yaml (data-e2e-disk-0 recreated at 1Gi, StorageClass
+expandable, worker env as before).
+
+**Live script reaches the API through `kubectl proxy`, not a port-forward (2026-11-27).** The 4 port-forward
+drops in the 89-scenario run (connection reset / refused, no pod restart) failed scenarios that were otherwise
+fine. `ARI_BASE_URL` can now be the API server's service proxy
+(`http://127.0.0.1:18001/api/v1/namespaces/<ns>/services/ari-k8s-api:80/proxy` behind `kubectl proxy
+--port=18001`): each request is its own call to the API server and goes to whichever pod backs the Service; the
+`x-api-key` header passes through (no key -> 401, key -> 404 on an unknown task). With such a URL
+`resume_after_restart` keeps using it instead of opening its own port-forward (`_through_service_proxy`). A
+port-forward URL still works. Docs: script docstring, e2e README. Verified: tests/test_k8s_live_script.py 72
+passed (3.12); live on test through the proxy: `card`, `auth`, `resume_after_restart` (API restarted, approval
+COMPLETED in 63 s) all passed. Not yet a full run through the proxy.

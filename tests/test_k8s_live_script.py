@@ -147,3 +147,19 @@ def test_a_refusal_is_read_from_the_worker_log_in_either_shape():
     assert live._refusals_in(logs, "t-1") == ["the cluster changed (a). Nothing was changed."]
     assert live._refusals_in(logs, "t-2") == ["the cluster changed (b). Nothing was changed."]
     assert live._refusals_in(logs, "t-9") == []
+
+
+@pytest.mark.parametrize(
+    ("url", "proxied"),
+    [
+        ("http://127.0.0.1:18001/api/v1/namespaces/insightfinder/services/ari-k8s-api:80/proxy", True),
+        ("http://127.0.0.1:18001/api/v1/namespaces/insightfinder/services/ari-k8s-api:80/proxy/", True),
+        ("http://127.0.0.1:18002", False),
+    ],
+)
+def test_a_restart_needs_no_port_forward_through_the_service_proxy(monkeypatch, url, proxied):
+    monkeypatch.setenv("ARI_BASE_URL", url)
+    assert live._through_service_proxy() is proxied
+    if proxied:
+        with live._port_forward("insightfinder", "ari-k8s-api") as reached:
+            assert reached == url.rstrip("/")
