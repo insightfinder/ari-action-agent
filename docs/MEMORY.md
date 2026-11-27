@@ -7233,3 +7233,95 @@ COMPLETED in 63 s) all passed. Not yet a full run through the proxy.
   `resume_after_restart`. Fixtures after the run: data-e2e-disk-0 and data-e2e-vol-0 Bound at 1Gi, no
   Released PVs, no ResourceQuota left, worker env unchanged (AGENT_KIND and the two protection lists), api and
   worker 1/1. Two other nodes (ip-10-1-18-19, ip-10-1-21-212) were NotReady afterwards; not touched.
+
+## 2026-11-27 - Health check names what restarted a container: OOM, startup probe, liveness probe (II-25740)
+
+Asked by the user after a RabbitMQ incident (eu): an index rebuild at start outlasted the startup probe, so the
+kubelet restarted it forever; a longer startup probe fixed it. The agent could not tell that from an OOM kill.
+
+- Checked on test first (two throwaway Deployments, kubelet v1.36): a probe restart is SIGTERM then SIGKILL, so it
+  ends 137 / `Error` (process ignores SIGTERM) or 0 / `Completed` (exits on it); only the runtime's `OOMKilled`
+  reason and the kubelet's Normal `Killing` event ("Container app failed startup|liveness probe, will be
+  restarted", `involvedObject.fieldPath` `spec.containers{app}`) tell the causes apart. `list_events` reads
+  Warning only, so it never saw these. Field selector `reason=Killing` works on core/v1 events.
+- New read tool `list_probe_kills` (tools.yaml, check_health's tools); `pod_view` gains `probes` (timing and
+  handler kind, never the check: an exec command can hold a password) and `termination_grace_seconds`;
+  terminated states gain `started_at`; `event_view.involved.field_path`.
+- `health_rules.kill_cause` / `pod_findings(pod, kills)`: `killed_by` `oom` | `startup_probe` | `liveness_probe` |
+  `not_recorded` (signal exit with nothing on record: events expire), `diagnosis`, and for probe kills `probe`
+  (`allows_seconds` = initialDelaySeconds + failureThreshold x periodSeconds), `probe_kills`, `last_run_seconds`,
+  `during_startup` (liveness kill within its allowance plus period, timeout and grace, and no startup probe:
+  suggest adding a startup probe with the liveness check, not loosening liveness). Reasons name the probe;
+  1-2 probe restarts are a new `Restarted (...)` warning; probe-killed containers get their previous log.
+  The respond note says an exit code 137 alone is not an OOM kill.
+- Not built: changing or adding probes. Discussed with the user: a startup probe cloned from the liveness check
+  is the only probe the agent could safely add (on a Deployment); RabbitMQ is a Helm StatefulSet (read only, and
+  its chart `rabbitmq-16.0.15` already has `startupProbe.enabled`, default off with 100s), so its fix is a values
+  change in Git.
+- Fixtures `e2e-slowstart` (startup probe 15s, exit 137) and `e2e-slowstart-liveness` (liveness kill while
+  starting, exit 0), applied on test; live scenario `health_probe_kills`.
+- Verified: suite on 3.12 1508 passed, 11 skipped (12 new tests in `tests/test_k8s_probe_kills.py`; mutation
+  with the kill list ignored: 5 fail). Read-only against test through my kubeconfig (local code, not the deployed
+  image): `check_health` reported `FrequentRestarts (killed by startup probe)` (ran 19s, allows 15s, previous log
+  "Rebuilding message store indices"), `FrequentRestarts (killed by liveness probe)` (ran 14s, during start), and
+  e2e-oom `CrashLoopBackOff (OOMKilled)`. No new lint findings. Not verified: the deployed agent and
+  `health_probe_kills` (need a new image), and the LLM summary of the new fields.
+
+## 2026-11-27 - New action `set_startup_probe`: more time for a Deployment's container to start (II-25740)
+
+User decision after the probe-kill diagnosis: Deployments may get a startup probe; liveness and readiness are never
+changed (added to the Never list: loosening them affects the running service).
+
+- `actions/set_startup_probe.py`. Asked only when the request is about the startup probe or how long the container
+  may take to start (`policy.asks_startup_change`), with a time in its words (`policy.stated_duration`: one duration
+  with a unit, read by code from the quote) or failureThreshold/periodSeconds (quoted). No startup probe: one is
+  added copying the liveness check (readiness when no liveness; neither: refused). Existing one: failureThreshold
+  (and a stated periodSeconds) grows, check kept. Only ever more time than now (startup allowance, or liveness's
+  without one), at most 3600 s (one hour; the user considered 30 min and kept the hour: a start that hangs is
+  restarted only after what was approved, never more than that). Tier medium (high under Recreate); a start time past progressDeadlineSeconds is a
+  medium risk.
+- The copied check never travels in the proposal (an exec command can hold a password, e.g. the RabbitMQ chart's
+  `curl --user`): new `ActionSpec.build_operations(kube, action)` (default: `operations`) builds the patch from the
+  live Deployment for the dry run and the write; the proposal carries `copy_check_from` and `check_digest`
+  (`views.probe_digest`, sha256 of the check, 16 hex) and the copy is refused when it changed. `write._run` calls
+  `build_operations`. Probe views gained `check_digest`; extraction gets each container's probe timing (never the
+  check) and new keys `startup_time_quote`, `failure_threshold(_quote)`, `period_seconds(_quote)`.
+- Approval: any probe change of the container since the proposal is drift; at target = approved threshold, period
+  and copied check; retry ownership on `f:startupProbe.f:failureThreshold` / `f:periodSeconds`; `wait_rollout`
+  target kind `startup_probe` (`moved_away` reports it `reverted` when put back). RBAC unchanged (patch
+  deployments); no chart change.
+- Health diagnosis of a Deployment pod killed by a probe now says the agent can propose the fix when asked with a
+  time.
+- Live scenario `startup_probe` (write; fixtures recreated afterwards: their Deployments got `app` labels for a
+  selective re-apply). Docs: interface (action, Never, change log, mcp-service follow-up now lists it), meta/agent
+  card, capabilities.yaml, e2e README.
+- Verified: suite on 3.12 1526 passed, 11 skipped (18 new tests in `tests/test_k8s_set_startup_probe.py`); mutations:
+  drift check removed -> 1 fails, "never less" removed -> 1 fails, write-time digest check removed -> covered by its
+  own test. On test with local code and my kubeconfig (the worker's flow, extraction scripted): proposed, dry-run,
+  approved and applied on both fixtures, both `succeeded` with 46 s stable: e2e-slowstart-liveness got a startup
+  probe copying its tcpSocket liveness check (24 x 5s; new pod ready after its 60 s start, waited 122 s),
+  e2e-slowstart's 15 s probe became 24 x 5s (waited 444 s: a first new pod sat on a NotReady node and was replaced).
+  The first try found a fixture bug: busybox `nc -l` exits after one connection, so the probe's own connect ended
+  the container; the fixtures now serve with `httpd -f -p 8080`. Fixtures recreated afterwards. Not verified: the
+  deployed worker (needs a new image), field ownership live (unit-tested), the real model's extraction.
+
+## 2026-11-27 - OOM kills get a suggested memory limit (II-25740)
+
+User decision: an OOMKilled finding now says what to ask for. `check_health._oom_suggestions` adds `suggestion`
+`{field: limits.memory, container, from, to, basis, note, request}`: `to` = 2 x the current limit
+(`OOM_LIMIT_FACTOR`, the user chose 2 over 1.5: small limits need several rounds at 1.5), rounded up to Mi, capped
+by `capacity.resource_cap` (largest eligible node, headroom option); `request` only for a Deployment's pod (the
+agent can propose it). No limit set: no value, the note says the node ran out of memory and a request should
+reserve it. At the node cap: no value, note. It is a first step, not a measured need (the peak before the kill is
+not on record). check_health's tools gain `list_nodes` (already granted); nodes and all active pods are read only
+when an OOM finding exists. Respond note: give the value with its basis and note and use `request` verbatim.
+Before this, the reply showed the limits and a request with `<value>` left for a person or the coordinator.
+- Verified: suite on 3.12 1532 passed, 11 skipped (5 new tests: 2x with request, node cap, at cap, no limit, no
+  Deployment). Read-only on test with local code: e2e-oom and e2e-memhungry (32Mi) -> suggestion 64Mi with the
+  request (e2e-memhungry needs ~55Mi, so 64Mi is its fix). `health_probe_kills` now also checks e2e-oom's 64Mi.
+  Not verified: the deployed worker, the model's wording of it.
+- Same day, user decision after weighing it (a value people may approve without thinking, which a leak only
+  postpones): keep the value, and tell the two cases apart by `last_run_seconds` (now also on OOM findings):
+  `suggestion.pattern` `early` (< 1 h, `LONG_RUN_SECONDS`) keeps the "first step" note; `long_run` says it looks
+  like a leak or growth that a larger limit only delays. 2 new tests (1534 passed on 3.12). Live read-only:
+  e2e-oom and e2e-memhungry are `early`.

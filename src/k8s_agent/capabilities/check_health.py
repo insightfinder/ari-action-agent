@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from common.capabilities_base import StepContext
 
 from ..stepkit import finish, options, resolved_target, untrusted_block
-from ..tools import governance, health_rules
+from ..tools import capacity, governance, health_rules, policy, quantities
 
 _FINDINGS_LIMIT = {"deployment": 40, "workload": 40, "node": 40, "namespace": 40, "cluster": 30}
 _EVENTS_LIMIT = 15
@@ -77,6 +77,86 @@ def _flagged_keys(findings: list[dict], pods: list[dict]) -> set[tuple[str, str]
         elif f["kind"] == "Pod" and owners.get((f["namespace"], f["name"])):
             keys.add((f["namespace"], owners[(f["namespace"], f["name"])]))
     return keys
+
+
+# An OOM-killed container's suggested memory limit: this many times its current limit (user decision, 2026-11-27).
+# The peak it needed is not on record (metrics-server samples before the kill, and a crash loop leaves few), so
+# this is a first step, capped by what the largest eligible node can give; still killed, raise it again.
+OOM_LIMIT_FACTOR = 2
+# Killed after running at least this long: more like a leak or growth with load than a limit set too low.
+LONG_RUN_SECONDS = 3600
+
+
+async def _oom_suggestions(ctx: StepContext, findings: list[dict], pods: list[dict], templates: dict) -> None:
+    """Adds `suggestion` to each OOMKilled finding: a memory limit of `OOM_LIMIT_FACTOR` x the current one, capped by
+    node capacity, and for a Deployment the request that would get it proposed. `templates` maps (namespace,
+    Deployment) to its view."""
+    oom = [f for f in findings if f.get("kind") == "Pod" and f.get("killed_by") == "oom"]
+    if not oom:
+        return
+    by_pod = {(p.get("namespace"), p.get("name")): p for p in pods}
+    nodes = all_pods = None
+    made: dict = {}
+    for finding in oom:
+        pod = by_pod.get((finding["namespace"], finding["name"])) or {}
+        container = finding.get("container")
+        owner = governance.deployment_of(pod)
+        key = (finding["namespace"], owner or finding["name"], container)
+        if key in made:
+            finding["suggestion"] = made[key]
+            continue
+        limit = ((pod.get("limits") or {}).get(container) or {}).get("memory")
+        if not limit:
+            made[key] = finding["suggestion"] = {
+                "field": "limits.memory",
+                "container": container,
+                "note": "the container has no memory limit, so it was killed when its node ran out of memory, not at "
+                "a limit of its own: set a memory request that reserves what it uses rather than a larger limit",
+            }
+            continue
+        current = quantities.to_units("memory", limit)
+        want = -(-current * OOM_LIMIT_FACTOR // quantities.MI) * quantities.MI
+        suggestion = {"field": "limits.memory", "container": container, "from": limit,
+                      "basis": f"{OOM_LIMIT_FACTOR} x the current limit {limit}"}
+        dep = templates.get((finding["namespace"], owner)) if owner else None
+        if dep is not None:
+            if nodes is None:
+                nodes = await ctx.tool("list_nodes")()
+                all_pods = await ctx.tool("list_pods")(None, None, True)
+            cap = capacity.resource_cap(nodes, all_pods, dep["template"], policy.headroom_ratio(options(ctx)), container, {"memory": want})
+            room = (cap or {}).get("memory", {}).get("cap")
+            if room is not None and room < want:
+                if room <= current:
+                    suggestion["note"] = (
+                        f"no eligible node can give container {container} more than its current limit "
+                        f"({quantities.format_memory(room)} at most on {cap['memory']['node']}); larger nodes, or less "
+                        "memory used, are needed"
+                    )
+                    made[key] = finding["suggestion"] = suggestion
+                    continue
+                want = room
+                suggestion["basis"] += f", capped by the largest eligible node ({cap['memory']['node']})"
+        suggestion["to"] = quantities.format_memory(want)
+        ran = finding.get("last_run_seconds")
+        if ran is not None and ran >= LONG_RUN_SECONDS:
+            suggestion["pattern"] = "long_run"
+            suggestion["note"] = (
+                f"it ran {ran // 60} min before being killed, which looks more like a memory leak or growth with load "
+                "than a limit set too low: a larger limit only delays the next OOM kill; use it to stop the restarts "
+                "and find what uses the memory"
+            )
+        else:
+            suggestion["pattern"] = "early" if ran is not None else "unknown"
+            suggestion["note"] = (
+                "a first step, not a measured need (the peak it used before being killed is not on record): if it is "
+                "still OOM-killed, raise it again or find what uses the memory"
+            )
+        if dep is not None:
+            suggestion["request"] = (
+                f"set the memory limit of container {container} in deployment {owner} in namespace "
+                f"{finding['namespace']} to {suggestion['to']}"
+            )
+        made[key] = finding["suggestion"] = suggestion
 
 
 async def run(ctx: StepContext) -> dict:
@@ -152,6 +232,13 @@ async def run(ctx: StepContext) -> dict:
             "means nothing recent was recorded — not that nothing happened."
         )
 
+    try:
+        # What restarted a container: a probe kill is a Normal event, so list_events (Warning only) misses it.
+        kills = await ctx.tool("list_probe_kills")(namespace)
+    except Exception as exc:  # noqa: BLE001 — supporting evidence, like the events
+        kills = []
+        gaps.append(f"probe kills (Killing events) could not be read: {exc}")
+
     metrics = await ctx.tool("get_pod_metrics")(namespace)
     usage = metrics.get("usage") or {}
     if metrics.get("gap"):
@@ -167,8 +254,11 @@ async def run(ctx: StepContext) -> dict:
     if node is not None:
         findings.extend(health_rules.node_findings(node))
     for pod in pods:
-        findings.extend(health_rules.pod_findings(pod))
+        findings.extend(health_rules.pod_findings(pod, kills))
     findings.extend(health_rules.usage_findings(pods, usage))
+
+    templates = {(d["namespace"], d["name"]): d for d in deployments}
+    await _oom_suggestions(ctx, findings, pods, templates)
 
     if options(ctx).get("include_logs", True):
         get_log = ctx.tool("get_pod_log")
@@ -176,7 +266,11 @@ async def run(ctx: StepContext) -> dict:
         for finding in findings:
             if tails >= _LOG_TAILS:
                 break
-            if finding["kind"] == "Pod" and str(finding["reason"]).startswith("CrashLoopBackOff"):
+            # A crash loop's previous log, and a probe-killed container's (a slow start mostly shows as running,
+            # restarted now and then, not as CrashLoopBackOff): what it was doing when it was stopped.
+            if finding["kind"] == "Pod" and (
+                str(finding["reason"]).startswith("CrashLoopBackOff") or finding.get("killed_by") in ("startup_probe", "liveness_probe")
+            ):
                 tail = await get_log(finding["namespace"], finding["name"], finding.get("container"), True)
                 if tail:
                     finding["previous_log_tail"] = untrusted_block(tail)

@@ -103,6 +103,7 @@ def pod(
     created=None,
     resize_policy=None,
     qos_class="Burstable",
+    probes=None,
 ):
     requests = requests if requests is not None else {"cpu": "500m", "memory": "1Gi"}
     container = {
@@ -110,6 +111,8 @@ def pod(
         "env": [{"name": "API_KEY", "value": CANARY}],
         "resources": {"requests": requests, "limits": limits or {}},
     }
+    if probes:
+        container.update(probes)  # {"startupProbe": {...}, "livenessProbe": {...}, ...}
     if resize_policy:
         container["resizePolicy"] = [{"resourceName": k, "restartPolicy": v} for k, v in resize_policy.items()]
     statuses = containers or [{"name": "app", "ready": True, "restartCount": 0, "state": {"running": {"startedAt": iso(30)}}}]
@@ -152,14 +155,17 @@ def node(name, cpu="8", memory="32Gi", labels=None, taints=None, ready=True, ins
     }
 
 
-def event(reason, name, message, namespace="shop", kind="Pod", type_="Warning", minutes_ago=1, count=1):
+def event(reason, name, message, namespace="shop", kind="Pod", type_="Warning", minutes_ago=1, count=1, field_path=None):
+    involved = {"kind": kind, "name": name, "namespace": namespace}
+    if field_path:
+        involved["fieldPath"] = field_path
     return {
         "type": type_,
         "reason": reason,
         "message": message,
         "count": count,
         "lastTimestamp": iso(minutes_ago),
-        "involvedObject": {"kind": kind, "name": name, "namespace": namespace},
+        "involvedObject": involved,
         "metadata": {"name": f"{name}.evt", "namespace": namespace},
     }
 
@@ -388,6 +394,8 @@ def _matches_fields(obj: dict, selector: str | None) -> bool:
         if key == "type" and obj.get("type") != value:
             return False
         if key == "involvedObject.name" and (obj.get("involvedObject") or {}).get("name") != value:
+            return False
+        if key == "reason" and obj.get("reason") != value:
             return False
         if key == "spec.nodeName" and (obj.get("spec") or {}).get("nodeName") != value:
             return False

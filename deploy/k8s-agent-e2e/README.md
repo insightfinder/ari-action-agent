@@ -101,6 +101,21 @@ here, not on real services: on test, image automation redeploys the
 `health_cronjob` reads the
 CronJob `e2e-cron`, which fires only once a year.
 
+Probe kills (2026-11-27): `e2e-slowstart` and `e2e-slowstart-liveness` take
+60s to open their port (as an index rebuild would) and are restarted forever,
+the first by a startup probe that allows 15s (`sh` ignores SIGTERM: exit 137,
+`Error`), the second by a liveness probe while it starts, with no startup
+probe (it exits on SIGTERM: exit 0, `Completed`). `health_probe_kills` waits
+for the kubelet's first kill of each, then checks that the health report names
+the probe (`killed_by`), the startup probe's 15s allowance and the previous
+log, that the liveness one is diagnosed as killed while starting, and that
+`e2e-oom` stays `oom`. `startup_probe` (a write scenario) asks for 2 minutes to
+start for each: `e2e-slowstart-liveness` gets a startup probe copying its
+liveness check, `e2e-slowstart` a longer one (24 x 5s); approved, the new pod
+must start and stay up. Both Deployments are then deleted and re-applied from
+this file (by their `app` label), since `kubectl apply` would keep the probe the
+agent added.
+
 Lowering memory (2026-11-26): `e2e-memuse` holds about 100Mi under a 256Mi
 limit. `refuse_memory_decrease` (limit to 110Mi, below 1.2 x its usage) must
 end without a proposal; `memory_decrease_high` (limit to 200Mi) must be

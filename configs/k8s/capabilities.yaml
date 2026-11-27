@@ -28,10 +28,12 @@ capabilities:
       Pod-level health for the resolved Deployment (or StatefulSet,
       DaemonSet or CronJob), node, namespace or cluster:
       pending/unschedulable pods, crash loops with the previous container's
-      termination reason (OOMKilled vs probe failure), image pull failures,
+      termination reason and what killed it (OOMKilled, a startup or liveness
+      probe, with how long the probe lets it run; for an OOM kill a suggested
+      memory limit, 2 x the current one capped by node capacity), image pull failures,
       restarts, warning events, usage near limits, replicas unavailable.
       Deterministic rules; missing data is reported as a gap. Read-only.
-    tools: [get_deployment, get_workload, get_node, list_deployment_views, list_pods, list_pods_on_node, list_events, get_pod_metrics, get_pod_log]
+    tools: [get_deployment, get_workload, get_node, list_deployment_views, list_pods, list_pods_on_node, list_events, list_probe_kills, get_pod_metrics, get_pod_log, list_nodes]
     retry:
       max_attempts: 2
       backoff_seconds: 5
@@ -61,7 +63,10 @@ capabilities:
       only to at least 1.2 times its current usage), CPU/memory of
       one of its running pods in place (no rollout; needs Kubernetes
       in-place pod resize, read live from the cluster), a rolling restart,
-      deleting one of its pods (never the only ready one); and growing a
+      deleting one of its pods (never the only ready one), more time for a
+      container to start (a startup probe copying its liveness check, or a
+      longer existing one; never less time, never liveness or readiness);
+      and growing a
       disk (a PVC a StatefulSet's claim template created, to a size the
       request names; never smaller). StatefulSets, DaemonSets, CronJobs and nodes
       are otherwise read only: a change to one is refused.

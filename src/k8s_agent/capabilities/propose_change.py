@@ -46,6 +46,18 @@ def _container_summary(workload: dict) -> list[dict]:
     return [{"name": c["name"], "resources": c["resources"]} for c in workload["template"]["containers"]]
 
 
+def _probe_summary(workload: dict) -> dict:
+    """Which probes each container has, with their timing (never their checks)."""
+    return {
+        c["name"]: {
+            kind: {k: v for k, v in probe.items() if k != "check_digest"}
+            for kind in ("startup", "liveness", "readiness")
+            if (probe := c.get(f"{kind}_probe"))
+        }
+        for c in workload["template"]["containers"]
+    }
+
+
 def _images(workload: dict) -> list[str | None]:
     return [c.get("image") for c in workload["template"]["containers"]]
 
@@ -60,6 +72,7 @@ async def _extract(ctx: StepContext, workload: dict, autoscaler: dict | None) ->
         "workload": f"{workload.get('kind') or 'Deployment'} {workload['namespace']}/{workload['name']}",
         "current_replicas": workload.get("replicas"),
         "containers": [{**c, "image": i} for c, i in zip(_container_summary(workload), _images(workload))],
+        "probes": _probe_summary(workload),
         **({"paused": bool(workload.get("paused"))} if "paused" in workload else {}),
         "autoscaler": (
             {"kind": autoscaler.get("kind"), "name": autoscaler.get("name"), "min": autoscaler.get("min"), "max": autoscaler.get("max")}
@@ -79,6 +92,9 @@ async def _extract(ctx: StepContext, workload: dict, autoscaler: dict | None) ->
         '"container": "<container name or null>", "pod": "<pod name exactly as written in the request, or null>", '
         '"resources": {"requests": {"cpu": {"value": "<quantity>", "quote": "<verbatim>"}, "memory": {...}}, '
         '"limits": {"cpu": {...}, "memory": {...}}}, '
+        '"startup_time_quote": "<verbatim words stating how long the container may take to start, or null>", '
+        '"failure_threshold": <int or null>, "failure_threshold_quote": "<verbatim or null>", '
+        '"period_seconds": <int or null>, "period_seconds_quote": "<verbatim or null>", '
         '"reasoning": "<one line>"}\n'
         "Omit resource fields the request does not name. Quantities use Kubernetes units (e.g. 500m, 2, 4Gi, 512Mi)."
     )
