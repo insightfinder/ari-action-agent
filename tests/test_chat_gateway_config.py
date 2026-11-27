@@ -20,6 +20,7 @@ def test_llm_config_needs_a_key_and_knows_default_models():
         GatewaySettings().llm_config()
     assert GatewaySettings(llm_api_key="k").llm_config() == {"provider": "openai", "api_key": "k", "model": "gpt-4o-mini"}
     assert GatewaySettings(llm_api_key="k", llm_provider="anthropic").llm_config()["model"] == "claude-haiku-4-5"
+    assert GatewaySettings(llm_api_key="k", llm_provider="moonshotai").llm_config()["model"] == "kimi-k3.1-pro"
 
 
 def test_llm_config_for_an_unknown_provider_requires_an_explicit_model():
