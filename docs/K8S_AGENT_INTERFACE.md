@@ -4,6 +4,49 @@ What the `k8s` agent kind exposes to its callers (MCP Service, UIE/Infrastructur
 other repositories must do when it changes. **Every change to anything listed here is recorded in the change
 log at the bottom, with the date and ticket.** The agent's own design lives in docs/MEMORY.md (II-25173 onward).
 
+## Capabilities (what a caller can route to it)
+
+Reads, no approval: Pod health of a Deployment, StatefulSet, DaemonSet, CronJob, node, namespace or the whole
+cluster (crash loops with their cause; what killed a container: an OOM kill, with a suggested memory limit and the
+request that would get it proposed, or a startup or liveness probe, with how long the probe allows; image pull
+failures; unschedulable pods; warning events; usage near limits); listings of any readable kind (`query_result`).
+
+Changes, each proposed first and applied only after a person approves that proposal (`action` names below):
+a Deployment's replicas (`scale_replicas`); a KEDA ScaledObject's or HPA's min/max (`set_autoscaler_bounds`);
+CPU/memory of a Deployment's container (`set_resources`, rolls its pods) or of one running pod in place
+(`resize_pod`); a rolling restart (`restart_rollout`); deleting one pod of a Deployment (`delete_pod`); more time
+for a container to start (`set_startup_probe`); growing a StatefulSet claim-template PVC (`expand_pvc`).
+
+Refused, with the reason in the reply and a `refusal` (see "Never" below): changes to StatefulSets, DaemonSets,
+CronJobs, nodes, protected namespaces and workloads; scaling to 0; shrinking a disk or growing a Helm/Flux PVC;
+liveness/readiness probe changes; Secrets; anything without an exact value. A caller's routing text (an agent card
+description, a coordinator prompt) should name these, and send every request about the cluster to the agent,
+including ones it may refuse, rather than answer them itself: it is the agent that knows the cluster's state and
+rules. (Found 2026-11-27: a description naming three changes made a chat answer that restarts and disks were "out
+of scope" and hand out kubectl commands for exactly what the agent refuses.)
+
+## Calling it (any caller)
+
+- **Request text.** The agent acts only on values the request states, read from its words: pass the person's
+  request with the namespace, the workload and every value exactly as given (sizes and CPU/memory with units, a
+  start time as a duration such as "10 minutes"). Never invent, convert or change a value, and do not retry a
+  refusal with other values; report its reason. A health report ends with the exact request that would get a fix
+  proposed; use it as written. `last_run_seconds` (how long a container ran before it was killed) is not how long
+  it needs to start.
+- **Approval.** A proposal pauses the task (`pending_action`). It is applied only when the caller resumes the task
+  with `confirm_pending_action.id` = that `pending_action.id`; declining is cancelling the task. Forward a person's
+  explicit decision, not a model's reading of it (found 2026-11-27: a chat model answered "reject" itself and the
+  proposal stayed paused), and cancel a proposal that will not be answered any more. A proposal older than
+  `proposal_max_age_hours` is refused when confirmed.
+- **Timing.** A confirmed change is applied and then verified before the task ends (rollout progress, new pods
+  stable for 45 s, a resize as reported by the kubelet, a disk's capacity): the apply step allows 900 s, so wait at
+  least 960 s after a confirmation. Cancelling after a confirmation stops only the verification, never the change;
+  do not tell anyone that nothing changed (found 2026-11-27: a 300 s wait reported "cancelled" for a change in
+  place).
+- **Results.** Every applied change's `action_result` has `kubernetes_change: true`; recognise changes by it rather
+  than by a list of action names. `query_result` rows are data for the caller to render; never have a model retype
+  them. The agent's status message (the task's reply) is written for people; the artifacts are for programs.
+
 ## Request
 
 A2A message: the prompt as a TextPart and one DataPart `{"llm": {...}, "options": {"namespace"?,
@@ -359,11 +402,11 @@ Recorded for their owners; not changed from this repository.
 
 | Repo | What | Why | Since |
 |---|---|---|---|
-| insightfinder-mcp-service | (Done on branch `II-25740-k8s-agent-capabilities`, 2026-11-27, not merged yet; tried on test.) `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `delete_pod`, `expand_pvc` and `set_startup_probe` ship with II-25740 (`rollback`, `set_image`, pause/resume and the CronJob actions were removed before shipping). | II-25740 |
-| insightfinder-mcp-service | (Done on the same branch, 2026-11-27.) `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship: changes are to Deployments, plus growing a StatefulSet's claim-template PVC; StatefulSets, DaemonSets, CronJobs, nodes and protected namespaces/workloads are otherwise read only. | II-25740 |
+| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `delete_pod`, `expand_pvc` and `set_startup_probe` ship with II-25740 (`rollback`, `set_image`, pause/resume and the CronJob actions were removed before shipping). | II-25740 |
+| insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only; they should follow "Capabilities" and "Calling it" above (route every request about the cluster to the agent; values verbatim; no retry of a refusal). In chat: forward approve/reject as the person's decision and cancel unanswered proposals; `a2a.timeout_s` at least 960. | ARI chat on test, 2026-11-27: PVC, restart, StatefulSet and Secret requests never reached the agent (kubectl commands instead); a start time was rewritten and retried down to 25 s; a "reject" was answered without the agent; an approved change was reported "cancelled" after 300 s. A change set that fixed all of these was run on test (docs/MEMORY.md, 2026-11-27). | II-25740 |
 | test-fluxcd, eks-fluxcd | Set `ariK8sAgent.protection.admissionPolicy: true` in the ari-k8s HelmRelease values (the chart default `auto` silently leaves the policy out on a cluster without the API). | A missing policy should fail the release, not go unnoticed. | II-25740 |
 | eks-fluxcd | When the k8s agent is deployed to stg/prod: check `ariK8sAgent.protection.workloads` against that cluster's names (the defaults are bare names in the release namespace: insightfinder-mcp-service, insightfinder-mcp-service-worker, temporal-*, ari-coordinator) and add whatever runs the approval path there. | The agent and its approval path are protected by name; a name that differs there is not protected. | II-25740 |
-| insightfinder-mcp-service | (Done on the same branch, 2026-11-27: a Markdown table under the answer.) Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. Do not have a model re-type the rows: 100+ rows exceed its output limit and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
+| insightfinder-mcp-service | Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. Do not have a model re-type the rows: 100+ rows exceed its output limit and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
 | insightfinder-mcp-service | Confirm live that a follow-up chat turn ("in table format") can reach the previous turn's agent result, or that the coordinator calls the agent again. | Screenshot of 2026-11-19 (stg): the coordinator answered from memory. | II-25740 |
 
 ## Change log
@@ -415,6 +458,8 @@ Recorded for their owners; not changed from this repository.
   (done by someone else, or undecidable with no owner on record). New `applied.field_manager` on such a result.
   `apply_approved_change` reads `managedFields` (get on the objects it already reads; no new RBAC). A
   `delete_pod` step that fails before the DELETE is sent is no longer retried (refused). Additive.
+- **2026-11-27, II-25740** — new sections "Capabilities" and "Calling it" (what callers route to the agent, how to
+  pass values, approve, wait and read results), from the ARI chat e2e. Documentation only.
 - **2026-11-27, II-25740** — new action `set_startup_probe` (fields above; `target.kind: "Deployment"`). Callers
   that list change actions by name (mcp-service `KUBERNETES_CHANGE_ACTIONS`) need it; `kubernetes_change: true`
   is set on its `action_result` as on every change.
