@@ -105,7 +105,7 @@ class SetStartupProbe(DeploymentAction):
             return None, refusal(
                 f"That would let container {name} take {_fmt(new_allowance)} to start, more than this agent sets "
                 f"({_fmt(MAX_STARTUP_SECONDS)}): a container that hangs while starting would be restarted only after "
-                "that long. Change it where the Deployment is defined if it really needs longer. Nothing was proposed."
+                "that long. Nothing was proposed."
             )
         if startup and (threshold < startup["failure_threshold"] or (now is not None and new_allowance <= now)):
             return None, refusal(

@@ -8,7 +8,7 @@ Which PVCs (decided 2026-11-26, checked on test the same day; docs/MEMORY.md):
   or its pod, and the StatefulSet itself has no owner (an operator may reconcile its PVCs).
   Nothing re-applies such a PVC's size, so growing it in the cluster lasts (a Helm upgrade of its StatefulSet
   succeeded afterwards, on test).
-- Everything else is refused with "change the size in Git": a PVC a chart or Kustomization renders gets its
+- Everything else is refused, saying its size is set in Git: a PVC a chart or Kustomization renders gets its
   smaller size re-applied on the next upgrade, which the API server rejects, and the release stalls
   (`field can not be less than status.capacity`, seen on test) until Git catches up.
 - Its StatefulSet must not be protected (`tools/protection.py`); its namespace neither.
@@ -117,7 +117,7 @@ def eligibility(state: dict) -> tuple[str | None, bool]:
         return (
             f"{ref} is rendered and re-applied by {tool}. Grown here, its next upgrade or reconcile would try to set "
             "the smaller size from Git, which the API server rejects, and that release would stop deploying until "
-            "Git is changed. Change the size in Git (the chart values or the manifest) instead; nothing was proposed."
+            "Git is changed. Its size is set in Git (the chart values or the manifest). Nothing was proposed."
         ), False
     owner = state.get("owner")
     if state.get("ambiguous_owners"):
@@ -227,7 +227,7 @@ class ExpandPvc(ActionSpec):
             return None, refusal(
                 f"{size} is more than this agent grows a disk in one step: at most {_gib(cap)} for {ref} "
                 f"(now {pvc.get('capacity')}; twice its size or 50Gi more, whichever is larger). Ask for a size up to "
-                "that, or change it in Git. Nothing was proposed."
+                "that. Nothing was proposed."
             )
         owner = state["owner"]
         action = {

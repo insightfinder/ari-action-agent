@@ -7402,15 +7402,39 @@ fixtures during its rollout (the agent's revert detection was right); rerun foll
   Docker Hub tags `mcp-service:ii25740-*` (4) remain to be deleted by someone with delete rights.
 - User decision (2026-11-27): mcp-service is only used here for integration testing, swapped on test for a run;
   its developers (and any other caller) adapt from this repository's docs, which describe the agent's capabilities
-  and interface for every caller, not one consumer: K8S_AGENT_INTERFACE.md "Capabilities" and "Calling it" (added
-  from the findings above) and its "Needed from other repositories" rows. No per-consumer docs here.
+  and interface for every caller, not one consumer: K8S_AGENT_INTERFACE.md "Capabilities" and "Behaviour a caller relies on"
+  (added from the findings above) and its "Needed from other repositories" rows. No per-consumer docs here, and no
+  rules for callers: the agent is called by them and cannot set what a coordinator does (user, 2026-11-27); the
+  docs state what the agent does, returns and takes.
 - Swapping mcp-service on test for a run: build from mcp-service `origin/test` plus the change, linux/amd64, a tag
   NOT ending in `-test` (the ImagePolicy `^(.*)-test$` would make it the official image; e.g. `ii25740-<time>`);
   check for conflict markers and run its tests first; push; annotate HelmRelease insightfinder
   `kustomize.toolkit.fluxcd.io/reconcile=disabled` and suspend it (this pauses every insightfinder deploy on test:
   keep it to about an hour); `kubectl set image` on insightfinder-mcp-service and -worker; test; then remove the
-  annotation, unsuspend, `flux reconcile helmrelease insightfinder`, and check both run the test-fluxcd `-test`
-  image again. Re-apply the e2e fixtures only after approved rollouts finish.
+  annotation, unsuspend, `flux reconcile helmrelease insightfinder`, and set both Deployments back to the tag in
+  test-fluxcd `apps/insightfinder/insightfinder/values/mcp-service.yaml` (a reconcile with no new chart revision
+  does not upgrade, so it does not put the image back: seen on the second swap); check both run it. Re-apply the
+  e2e fixtures only after approved rollouts finish.
+- Retest on agent 2611270957-test with mcp-service swapped again (10:01-10:12 UTC, `ii25740-2611271728`, then
+  `ii25740-2611271805`): the in-place resize is now `resize_pod` (same pod, low tier; proposal left unanswered,
+  and the next message cancelled it on the agent with the note); the e2e-slowstart health reply no longer proposes
+  a time from the run time but still says "takes ~18 seconds to start" (coordinator wording); shrink and Helm PVC
+  reached the agent and were refused with its reasons. StatefulSet/DaemonSet restart, rollback, set image, delete
+  Deployment, exec, Secrets and kube-system coredns: with the description listing refusals the coordinator
+  answered StatefulSet/DaemonSet itself (claiming the agent could delete StatefulSet pods); with a description
+  that lists only what it does, 4 of 5 reached the agent, but the coordinator still added kubectl commands to the
+  refusals, and set image / delete Deployment / exec were answered without the agent. What the coordinator does with a refusal is the caller's
+  matter; the interface doc only states what the agent does. No approvals in this round; fixtures untouched. Restored 10:12 UTC: Flux
+  resumed, and both Deployments set back to 2611242139-test by hand (the reconcile alone kept the swapped image).
+- User decision (2026-11-27): the agent says nothing beyond its own scope ("不要提示超出范围的东西", "做好自己的事就行了").
+  Removed from refusal reasons: "use kubectl if a change is really needed" (protected namespaces/workloads), "Use
+  kubectl" (nodes), "or change it in Git" (disk beyond one step), "Change it where the Deployment is defined if it
+  really needs longer" (start time over an hour); a Helm/Flux PVC's refusal now says its size is set in Git instead of
+  telling the reader to change it there. The persistence hint and the health diagnosis's suggested fix stay (they
+  describe this agent's own change or finding). Suite 1543 passed on 3.12. Not deployed yet.
+  The persistence hint is needed (user, same day): another sub-agent changes the fluxcd repositories, and the
+  coordinator uses the hint (repository, file chain, fields, from -> to) to call it. The Helm/Flux PVC refusal keeps
+  naming the HelmRelease or Kustomization that renders the PVC and that its size is set in Git, for the same reason.
 ---
 
 ## 2026-11-27 - Kimi (Moonshot AI) as an LLM provider (II-25490)
