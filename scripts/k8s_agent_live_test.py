@@ -11,13 +11,20 @@ and delete pods of them too). Run by hand
 against the test cluster only, never in CI, and only after the agent and
 fixtures from deploy/k8s-agent-e2e/ are in place.
 
-    kubectl -n ari-k8s-agent port-forward svc/ari-k8s-api 18002:80 &
-    export ARI_BASE_URL=http://127.0.0.1:18002
+    kubectl proxy --port=18001 &
+    export ARI_BASE_URL=http://127.0.0.1:18001/api/v1/namespaces/ari-k8s-agent/services/ari-k8s-api:80/proxy
     export ARI_API_KEY=...            # one of the agent's AGENT_API_KEYS
     export LLM_PROVIDER=anthropic LLM_API_KEY=... LLM_MODEL=...
 
 Any of these can instead go in `scripts/.env` (git-ignored, `KEY=value`
 lines); a variable already set in the environment wins over the file.
+
+Reach the API through `kubectl proxy` (the API server's service proxy), not
+`kubectl port-forward`: every request is a request of its own to the API
+server, so nothing breaks over a run that lasts hours and it follows the
+Service to a restarted pod. A port-forward is one long-lived stream to one
+pod; it drops now and then (connection reset / refused) and dies with that
+pod. `ARI_BASE_URL=http://127.0.0.1:18002` with a port-forward still works.
 
     python scripts/k8s_agent_live_test.py --list
     python scripts/k8s_agent_live_test.py                 # read-only + proposals (cancelled)
@@ -32,9 +39,10 @@ the script can be run again. Scenarios that send an approval at all —
 including the gate_* ones that expect it to be refused — need --allow-writes.
 
 `resume_after_restart` also restarts the agent's API Deployment with kubectl
-and port-forwards to it itself; it runs only when ARI_API_DEPLOYMENT and
-ARI_API_SERVICE ("<namespace>/<name>") are set, and should run last, since
-the restart ends any port-forward opened by hand. `worker_restart` deletes
+and, unless ARI_BASE_URL goes through `kubectl proxy`, port-forwards to it
+itself; it runs only when ARI_API_DEPLOYMENT and ARI_API_SERVICE
+("<namespace>/<name>") are set, and should run last, since the restart ends
+any port-forward opened by hand. `worker_restart` deletes
 the worker pod mid-verification, and `rbac` / `pods` check the installed
 chart's ServiceAccount permissions and pod hardening; these need
 ARI_WORKER_DEPLOYMENT (and `pods` also ARI_API_DEPLOYMENT). `keda_reverted`
@@ -533,8 +541,16 @@ def _worker_restart(worker: str):
     return ok, f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} applied={result.get('applied')}"
 
 
+def _through_service_proxy() -> bool:
+    """ARI_BASE_URL goes through the API server's service proxy (`kubectl proxy`), which follows the Service."""
+    return re.search(r"/api/v1/namespaces/[^/]+/services/[^/]+/proxy$", _base_url()) is not None
+
+
 @contextlib.contextmanager
 def _port_forward(namespace: str, service: str, port: int = 18003):
+    if _through_service_proxy():
+        yield _base_url()
+        return
     context = os.environ.get("KUBE_CONTEXT")
     proc = subprocess.Popen(
         ["kubectl", *(["--context", context] if context else []), "-n", namespace, "port-forward", f"svc/{service}", f"{port}:80"],
@@ -1275,7 +1291,7 @@ def scenario_late_too_old(args):
     """An approval sent with options.proposal_max_age_hours=0.002 (7 s) 15 s after the proposal is refused as too
     old; e2e-plain keeps its replicas."""
     with _restored(args, "replicas", "e2e-plain"):
-        return _late(args, "scale e2e-plain to 3 replicas", lambda: time.sleep(15), "hours an approval stays valid",
+        return _late(args, "scale e2e-plain to 3 replicas", lambda: time.sleep(15), "an approval stays valid",
                      lambda: _generation("e2e-plain"), proposal_max_age_hours=0.002)
 
 
