@@ -256,6 +256,10 @@ async def run(ctx: StepContext) -> dict:
     spec = actions.REGISTRY.get(change.get("action"))
     if spec is not None and kind not in spec.workload_kinds:
         spec = None
+    if spec is not None and spec.name == "set_resources" and policy.asks_in_place(ctx.prompt):
+        # Found in ARI chat (2026-11-27): "resize pod X ... in place: cpu limit 100m" extracted as set_resources
+        # rolled every pod. A request that asks for an in-place change is never a template change.
+        spec = actions.REGISTRY["resize_pod"]
     if spec is not None and not spec.accepts(ctx.prompt):
         if not spec.fallback:
             # The model's choice alone never proposes a change the request's own words do not ask for.
