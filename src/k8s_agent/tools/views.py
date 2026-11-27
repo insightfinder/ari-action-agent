@@ -13,6 +13,7 @@ which is also what the unit tests use as fixtures.
 """
 
 import hashlib
+import hmac
 import json
 from typing import Any
 
@@ -72,13 +73,26 @@ def probe_check(probe: dict | None) -> dict:
     return {h: probe[h] for h in PROBE_HANDLERS if (probe or {}).get(h) is not None}
 
 
-def probe_digest(probe: dict | None) -> str | None:
-    """A fingerprint of the check a raw probe runs: tells whether it changed without carrying it (an exec
-    command can hold a password)."""
-    check = probe_check(probe)
-    if not check:
+def _digest_key() -> bytes | None:
+    """The key probe fingerprints are made with, derived from the worker's payload encryption key (a secret only
+    the agent holds), so a fingerprint shown in a proposal cannot be used to test guesses of the check offline.
+    None when the key is not set (local runs)."""
+    from common.settings import get_settings
+
+    secret = get_settings().temporal_payload_encryption_key
+    if not secret:
         return None
-    return hashlib.sha256(json.dumps(check, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    return hmac.new(secret.encode(), b"ari-k8s-agent probe check fingerprint v1", hashlib.sha256).digest()
+
+
+def probe_digest(probe: dict | None) -> str | None:
+    """A keyed fingerprint (HMAC-SHA256) of the check a raw probe runs: tells whether it changed without carrying
+    it (an exec command can hold a password). None without a check, or without the key."""
+    check = probe_check(probe)
+    key = _digest_key() if check else None
+    if not key:
+        return None
+    return hmac.new(key, json.dumps(check, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()[:16]
 
 
 def _probe(probe: dict | None) -> dict | None:

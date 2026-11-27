@@ -113,7 +113,8 @@ def kill_cause(pod: dict, container: dict, kills: list[dict] | None) -> dict | N
         "killed_by": f"{kind}_probe",
         "probe_kills": kill.get("count") or 1,
         "last_run_seconds": ran,
-        "probe": {"kind": kind, "allows_seconds": probe_allowance(probe) if probe else None, **probe},
+        "probe": {"kind": kind, "allows_seconds": probe_allowance(probe) if probe else None,
+                  **{k: v for k, v in probe.items() if k != "check_digest"}},
     }
     ran_text = f"after running {ran}s" if ran is not None else "(run time not recorded)"
     # A Deployment's pod (owned by a ReplicaSet): this agent can propose the fix itself (set_startup_probe).

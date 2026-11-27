@@ -46,6 +46,7 @@ def test_startup_probe_kill_is_named_with_its_allowance():
     assert finding["killed_by"] == "startup_probe" and finding["probe_kills"] == 3
     assert finding["last_run_seconds"] == 17
     assert finding["probe"]["allows_seconds"] == 15 and finding["probe"]["handler"] == "tcpSocket"
+    assert "check_digest" not in finding["probe"]
     assert "raise startupProbe.failureThreshold" in finding["diagnosis"]
     # A Deployment's pod: the agent can propose the fix itself.
     assert "give deployment <name> 10 minutes to start" in finding["diagnosis"]

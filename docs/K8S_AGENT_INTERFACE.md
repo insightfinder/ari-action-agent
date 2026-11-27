@@ -217,7 +217,9 @@ to start, for a start that outlasts its probes (an index rebuild, a Java service
   timeoutSeconds, periodSeconds from the source unless stated. The check is copied from the live Deployment when
   the operation is built (`ActionSpec.build_operations`, dry run and write alike), never carried in the proposal (an
   exec command can hold a password): the proposal has `copy_check_from` (`livenessProbe` / `readinessProbe`) and
-  `check_digest` (a fingerprint of the check), and a check that changed since is not copied.
+  `check_digest` (a keyed fingerprint of the check: HMAC-SHA256 with a key derived from the worker's
+  `TEMPORAL_PAYLOAD_ENCRYPTION_KEY`, so it cannot be used to test guesses of a secret in the check; without that
+  key no startup probe is added), and a check that changed since is not copied.
 - A startup probe: its failureThreshold (and periodSeconds when stated) grows; its check stays.
 - Only ever more time than the container gets now (its startup probe's allowance, or its liveness probe's), at
   most 3600 s, one hour (`MAX_STARTUP_SECONDS`, user decision). Fields: `container`, `failure_threshold`, `period_seconds`,
