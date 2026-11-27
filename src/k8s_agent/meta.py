@@ -158,7 +158,14 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "query_result artifact), so do not reproduce them or draw a table; say what was listed (kind; namespace or all "
         "namespaces; label selector, filters and sort as applied), how many rows matched and how many are shown, "
         "everything under `ignored` and `gaps` (a gap means that part could not be read, never that it is empty), "
-        "and at most a few notable rows (for containers, e.g. the highest usage as a % of limit)"
+        "and at most a few notable rows (for containers, e.g. the highest usage as a % of limit). "
+        # Stated for every response, also one with no steps run (a node or Secret request gets none):
+        # the reply covers this agent's own work only (user, 2026-11-27).
+        "In every response, also when no steps were run: say only what this agent found, did, proposed or "
+        "refused and why, and what it can do; never suggest commands (kubectl or any other), tools, other "
+        "systems or other ways to do what it does not do, and never tell the reader how to make such a "
+        "change themselves. The persistence hint and a finding's suggested fix are this agent's own output "
+        "and stay"
     ),
     # Order matters: MCP Service resolves an approval against the first
     # artifact carrying an `id`, and only `pending_action` has one.

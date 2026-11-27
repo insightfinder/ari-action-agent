@@ -7435,6 +7435,18 @@ fixtures during its rollout (the agent's revert detection was right); rerun foll
   The persistence hint is needed (user, same day): another sub-agent changes the fluxcd repositories, and the
   coordinator uses the hint (repository, file chain, fields, from -> to) to call it. The Helm/Flux PVC refusal keeps
   naming the HelmRelease or Kustomization that renders the PVC and that its size is set in Git, for the same reason.
+- Live check after the refusal change reached test (agent 2611271028-test, 10:31 UTC): the refusal reasons are
+  clean (kube-system scale, Helm PVC ari-coordinator, disk 500Gi, start time 2 hours: none mentions kubectl or
+  changing Git), but the reply text still did: the reply model added `kubectl rollout restart statefulset ...`,
+  "use kubectl or the GitOps repository", "your CI pipeline", and kubectl commands for a node cordon and a Secret
+  request (those two run no steps, so no refusal artifact; the reply is all there is). Fix: the respond domain note
+  in `k8s_agent/meta.py` now says, for every response also with no steps run, to say only what the agent found,
+  did, proposed or refused and what it can do, and never to suggest commands, tools or other ways to do the rest;
+  the persistence hint and a finding's suggested fix stay. `common/respond.py` is unchanged. Verified locally with
+  the respond step and the live script's LLM on node cordon, Secrets, StatefulSet restart and Deployment delete,
+  twice each: old note 7 of 8 replies suggested kubectl/GitOps/CI, new note 0 of 8. A live scale proposal (cancelled,
+  e2e-plain still 2) written with the new note keeps the drift notice and persistence line. Suite 1543 passed on
+  3.12. Not deployed yet; the interface doc's "Scope of the reply" states it.
 ---
 
 ## 2026-11-27 - Kimi (Moonshot AI) as an LLM provider (II-25490)
