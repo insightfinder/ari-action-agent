@@ -8,6 +8,7 @@ errors); writes never do (see `write.py`).
 
 import asyncio
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 from urllib3.exceptions import HTTPError as Urllib3Error
@@ -188,6 +189,44 @@ async def list_events(namespace: str | None = None, involved_name: str | None = 
 
     recent = [e for e in events if _when(e) >= cutoff]
     return sorted(recent, key=_when, reverse=True)
+
+
+# The kubelet's message when a probe restarts a container (checked on test, kubelet v1.36, 2026-11-27):
+# "Container app failed startup probe, will be restarted". The same `Killing` reason (a Normal event) also
+# marks an ordinary stop ("Stopping container app"), so only this wording counts.
+_PROBE_KILL = re.compile(r"^Container (?P<container>\S+) failed (?P<probe>startup|liveness) probe, will be restarted")
+
+
+async def list_probe_kills(namespace: str | None = None, since_minutes: int = 60) -> list[dict]:
+    """Containers the kubelet restarted because a startup or liveness probe failed, from `Killing` events:
+    `[{namespace, pod, container, probe, count, last_seen}]`, newest first. Events expire (an hour by default),
+    so an empty list means none was recorded recently, not that none happened."""
+    raws = await _list_dicts("Event", namespace=namespace, fields={"reason": "Killing"})
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+    out = []
+    for raw in raws:
+        event = views.event_view(raw)
+        match = _PROBE_KILL.match(str(event.get("message") or ""))
+        involved = event.get("involved") or {}
+        if not match or involved.get("kind") != "Pod":
+            continue
+        try:
+            seen = datetime.fromisoformat(str(event.get("last_seen")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if seen < cutoff:
+            continue
+        out.append(
+            {
+                "namespace": involved.get("namespace"),
+                "pod": involved.get("name"),
+                "container": match.group("container"),
+                "probe": match.group("probe"),
+                "count": event.get("count") or 1,
+                "last_seen": event.get("last_seen"),
+            }
+        )
+    return sorted(out, key=lambda k: str(k["last_seen"]), reverse=True)
 
 
 async def list_scheduling_events(namespace: str | None = None, since_minutes: int = 30) -> list[dict]:

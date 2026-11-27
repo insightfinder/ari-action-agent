@@ -5,6 +5,8 @@ pause/resume_rollout, suspend/resume_cronjob, and every change to a StatefulSet 
 list in docs/K8S_AGENT_INTERFACE.md.
 
 `expand_pvc` (2026-11-26) is the one change not on a Deployment: it grows a StatefulSet's claim-template PVC.
+`set_startup_probe` (2026-11-27) gives a Deployment's container more time to start; liveness and readiness probes
+are never changed.
 """
 
 from .base import ActionSpec, Operation, target_of
@@ -15,6 +17,7 @@ from .restart_rollout import RestartRollout
 from .scale_replicas import ScaleReplicas
 from .set_autoscaler_bounds import SetAutoscalerBounds
 from .set_resources import SetResources
+from .set_startup_probe import SetStartupProbe
 
 # Order is the order the extraction prompt lists them in; new actions go last so existing names keep their place.
 REGISTRY: dict[str, ActionSpec] = {
@@ -27,6 +30,7 @@ REGISTRY: dict[str, ActionSpec] = {
         RestartRollout(),
         DeletePod(),
         ExpandPvc(),
+        SetStartupProbe(),
     )
 }
 ACTIONS = tuple(REGISTRY)

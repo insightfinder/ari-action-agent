@@ -104,6 +104,39 @@ UIE (`ran`).
   changed. When the cluster already holds the approved values, nothing is written and the result is verified;
   `applied.changed_since_proposal` lists what differed from the proposal's snapshot. **Added II-25740.**
 
+### `health_report`: what restarted a container (**added II-25740, 2026-11-27**)
+
+A Pod finding about a container's last run (`CrashLoopBackOff (...)`, `FrequentRestarts (...)`, the new
+`Restarted (...)` for 1-2 restarts that a probe caused, or a terminated container) carries, when the cluster
+recorded it:
+- `killed_by`: `oom` (the runtime's `OOMKilled`), `startup_probe` / `liveness_probe` (the kubelet's Normal
+  `Killing` event "Container <c> failed <kind> probe, will be restarted", read by the new tool
+  `list_probe_kills`, last 60 minutes), or `not_recorded` (ended by a signal, exit 137 or 143, with neither on
+  record: a probe kill whose events expired, a stop that outlasted its grace period, or a kill from outside).
+  An ordinary crash (non-zero exit code of its own) has no `killed_by`. The exit code alone never decides it:
+  a probe restart is SIGTERM then SIGKILL, so it ends 143, 137, or 0 `Completed` (all three seen on test).
+- `diagnosis`: one sentence on what happened and what to change: for a startup probe, raise its
+  `failureThreshold` (or `periodSeconds`); for a liveness kill within the liveness probe's allowance and no
+  startup probe (`during_startup: true`), add a startup probe with the liveness probe's check rather than
+  loosening liveness; for a later liveness kill, a hang or a check slower than its `timeoutSeconds`.
+- For a probe kill also `probe_kills` (event count), `last_run_seconds` (the last run, start to finish) and
+  `probe`: `{kind, allows_seconds, initial_delay_seconds, period_seconds, failure_threshold, timeout_seconds,
+  handler}`, where `allows_seconds` is initialDelaySeconds + failureThreshold x periodSeconds and `handler` is
+  the kind of check (`exec`, `httpGet`, `tcpSocket`, `grpc`), never the check itself.
+- The reason names the probe: `CrashLoopBackOff (killed by startup probe)`; OOM kills keep
+  `CrashLoopBackOff (OOMKilled)`. A probe-killed container's previous log is attached like a crash loop's.
+- An unreadable `Killing` list is a gap ("probe kills (Killing events) could not be read").
+- An OOM kill also carries `suggestion` (user decision): `{field: "limits.memory", container, from, to, basis,
+  note, request}`, `to` = 2 x the current limit (`check_health.OOM_LIMIT_FACTOR`), rounded up to Mi and capped by
+  the largest eligible node (as `set_resources` caps; `check_health` now reads nodes and every active pod for
+  it, only when there is an OOM finding). `request` (the request that would get it proposed) only for a
+  Deployment's pod. No `to` when the container has no memory limit (killed by node memory pressure: the note
+  says to reserve memory with a request) or no node can give more than the limit (the note says so). A first
+  step, not a measured need: the peak before the kill is not on record. `pattern`: `early` (killed within
+  `LONG_RUN_SECONDS`, an hour, of starting: a limit set too low), `long_run` (after an hour or more: more like a
+  leak or growth with load; the note says a larger limit only delays the next kill), `unknown` (run time not
+  recorded). The value is the same either way. OOM findings now carry `last_run_seconds` too.
+
 ### `query_result`
 
 A table, read-only, data only: the agent does no formatting; how to show it is the caller's choice. No `id`.
@@ -142,7 +175,7 @@ kind on the test cluster conformed.
 ### Action names (`action`)
 
 `scale_replicas`, `set_autoscaler_bounds`, `set_resources`, `resize_pod`, `restart_rollout`, `delete_pod`,
-`expand_pvc`, today (`k8s_agent/actions/__init__.py`, `ACTIONS`). Every one but `expand_pvc` changes a
+`expand_pvc`, `set_startup_probe`, today (`k8s_agent/actions/__init__.py`, `ACTIONS`). Every one but `expand_pvc` changes a
 Deployment, its autoscaler or one of its pods: StatefulSets, DaemonSets, CronJobs and nodes are read only, and
 `propose_change` refuses a change to one before asking the model (safety review with the user, 2026-11-26:
 nothing that could break a product environment).
@@ -173,6 +206,29 @@ in code; naming a pod is not enough). Proposed only when the API server serves `
 and both the API server and the pod's kubelet are >= 1.35; memory only when the container's memory
 `resizePolicy` is `RestartContainer`. The Deployment template is not changed, so the persistence hint names the
 template fields to change in Git.
+
+`set_startup_probe` (**added II-25740, 2026-11-27, user decision**): more time for one container of a Deployment
+to start, for a start that outlasts its probes (an index rebuild, a Java service's warm-up) and is restarted forever.
+- Proposed only when the request asks about the startup probe or how long the container may take to start
+  (`policy.asks_startup_change`), with the time in its own words: a duration with a unit ("10 minutes", "600s",
+  "10分钟", read by code from the quote, `policy.stated_duration`), or failureThreshold and/or periodSeconds.
+- No startup probe: one is added whose check is a copy of the container's liveness probe's (readiness's when it
+  has no liveness probe; neither: refused, the agent never makes up a check), initialDelaySeconds 0, the source's
+  timeoutSeconds, periodSeconds from the source unless stated. The check is copied from the live Deployment when
+  the operation is built (`ActionSpec.build_operations`, dry run and write alike), never carried in the proposal (an
+  exec command can hold a password): the proposal has `copy_check_from` (`livenessProbe` / `readinessProbe`) and
+  `check_digest` (a fingerprint of the check), and a check that changed since is not copied.
+- A startup probe: its failureThreshold (and periodSeconds when stated) grows; its check stays.
+- Only ever more time than the container gets now (its startup probe's allowance, or its liveness probe's), at
+  most 3600 s, one hour (`MAX_STARTUP_SECONDS`, user decision). Fields: `container`, `failure_threshold`, `period_seconds`,
+  `copy_check_from`, `check_digest`, `timeout_seconds`; `before`/`after` `{"startupProbe": "<text>"}`. Tier
+  `medium` (rolls the pods; `high` under Recreate); a start time beyond the Deployment's progressDeadlineSeconds
+  is a `medium` risk (the rollout can be marked failed while pods still start).
+- Approval-time: any change to the container's probes since the proposal is drift; "already at target" means the
+  startup probe holds the approved failureThreshold, periodSeconds and copied check; a retry counts it as its own
+  by `f:startupProbe.f:failureThreshold` / `f:periodSeconds` ownership. Verified as a rollout (`wait_rollout`,
+  target kind `startup_probe`; a probe put back while watched is `reverted`).
+- Liveness and readiness probes are never changed (Never list).
 
 Lowering CPU/memory (`set_resources` and `resize_pod`, **2026-11-26, user decision**). A decrease is a value
 below the current one, a limit where there was none, or a request below the limit it defaulted to.
@@ -273,6 +329,8 @@ Not to be added. A change to this list is a decision of its own, recorded here a
 - Writing any custom resource other than a KEDA ScaledObject's min/max (no Flux reconcile annotation either).
 - Editing RBAC, writing to Git, or any write without a person's approval of that exact proposal.
 - Scaling anything to 0 replicas.
+- Changing liveness or readiness probes, or a probe's check (decided 2026-11-27): loosening them affects the running
+  service (a hung pod restarted later, a broken pod serving longer); only a startup probe gets more time.
 
 ## RBAC
 
@@ -299,7 +357,7 @@ Recorded for their owners; not changed from this repository.
 
 | Repo | What | Why | Since |
 |---|---|---|---|
-| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `delete_pod` and `expand_pvc` ship with II-25740 (`rollback`, `set_image`, pause/resume and the CronJob actions were removed before shipping). | II-25740 |
+| insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `delete_pod`, `expand_pvc` and `set_startup_probe` ship with II-25740 (`rollback`, `set_image`, pause/resume and the CronJob actions were removed before shipping). | II-25740 |
 | insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only. | The coordinator routes by them; update when the new reads/actions ship: changes are to Deployments, plus growing a StatefulSet's claim-template PVC; StatefulSets, DaemonSets, CronJobs, nodes and protected namespaces/workloads are otherwise read only. | II-25740 |
 | test-fluxcd, eks-fluxcd | Set `ariK8sAgent.protection.admissionPolicy: true` in the ari-k8s HelmRelease values (the chart default `auto` silently leaves the policy out on a cluster without the API). | A missing policy should fail the release, not go unnoticed. | II-25740 |
 | eks-fluxcd | When the k8s agent is deployed to stg/prod: check `ariK8sAgent.protection.workloads` against that cluster's names (the defaults are bare names in the release namespace: insightfinder-mcp-service, insightfinder-mcp-service-worker, temporal-*, ari-coordinator) and add whatever runs the approval path there. | The agent and its approval path are protected by name; a name that differs there is not protected. | II-25740 |
@@ -355,6 +413,14 @@ Recorded for their owners; not changed from this repository.
   (done by someone else, or undecidable with no owner on record). New `applied.field_manager` on such a result.
   `apply_approved_change` reads `managedFields` (get on the objects it already reads; no new RBAC). A
   `delete_pod` step that fails before the DELETE is sent is no longer retried (refused). Additive.
+- **2026-11-27, II-25740** — new action `set_startup_probe` (fields above; `target.kind: "Deployment"`). Callers
+  that list change actions by name (mcp-service `KUBERNETES_CHANGE_ACTIONS`) need it; `kubernetes_change: true`
+  is set on its `action_result` as on every change.
+- **2026-11-27, II-25740** — `health_report` Pod findings name what restarted a container: `killed_by`
+  (`oom`, `startup_probe`, `liveness_probe`, `not_recorded`), `diagnosis`, and for a probe kill `probe`,
+  `probe_kills`, `last_run_seconds`, `during_startup`; reasons `... (killed by startup|liveness probe)` and a new
+  `Restarted (...)` finding. New read tool `list_probe_kills` (events, already granted). An OOM finding carries
+  `suggestion` (2 x the memory limit, node-capped, with the request). Fields added only.
 - **2026-11-26, II-25740** — lowering CPU/memory (`set_resources`, `resize_pod`): a memory decrease below 1.2 x the
   container's current usage, or with no usage to read, is refused, at proposal and at approval; any decrease is
   `high`; `set_resources` under Recreate is `high`. `propose_change` and `apply_approved_change` read

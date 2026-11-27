@@ -264,6 +264,35 @@ def headroom_ratio(options: dict) -> float:
     return value if 0 <= value < 0.9 else 0.2
 
 
+# A request about a container's startup probe, or about how long it may take to start (II-25740, 2026-11-27).
+_STARTUP_WORDS = re.compile(
+    r"(?i)(startup\s*-?\s*probe|startupprobe|启动探针|启动探测"
+    r"|\b(?:time|long(?:er)?|seconds?|minutes?|mins?|hours?)\b[^.\n]{0,40}\bto\s+(?:start|boot|come\s+up)"
+    r"|\bstart(?:ing)?\s*-?\s*up\s+(?:time|timeout|takes|needs|for)\b"
+    r"|启动(?:时间|超时|需要|要|慢|太慢)|(?:分钟|秒|小时)[^。\n]{0,10}启动)"
+)
+_DURATION = re.compile(r"(?i)(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|小时|minutes?|mins?|m|分钟|分|seconds?|secs?|s|秒)(?![a-z])")
+_SECONDS = {"h": 3600, "m": 60, "s": 1, "小": 3600, "分": 60, "秒": 1}
+
+
+def asks_startup_change(prompt: str) -> bool:
+    """Does the request itself ask about a startup probe, or about how long a container may take to start?"""
+    return bool(_STARTUP_WORDS.search(prompt or ""))
+
+
+def stated_duration(quote: str | None, prompt: str) -> int | None:
+    """Seconds stated by `quote` ("10 minutes", "600s", "1.5 hours", "10分钟"), when the quote is verbatim in the
+    request and states exactly one duration with a unit; else None. A bare number is not a duration."""
+    if not quote or _normalize(quote) not in _normalize(prompt):
+        return None
+    found = _DURATION.findall(quote)
+    if len(found) != 1:
+        return None
+    number, unit = found[0]
+    seconds = float(number) * _SECONDS[unit[0].lower()]
+    return int(seconds) if seconds >= 1 and seconds == int(seconds) else None
+
+
 _TIER_ORDER = ["low", "medium", "high", "critical"]
 
 

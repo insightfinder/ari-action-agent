@@ -36,7 +36,7 @@ async def _execute(kube, op: Operation, dry_run: bool) -> dict:
 async def _run(action: dict, dry_run: bool) -> dict:
     spec = actions.get(action.get("action"))
     kube = get_client()
-    operations = spec.operations(action)
+    operations = await spec.build_operations(kube, action)
     summaries = []
     for op in operations:
         try:

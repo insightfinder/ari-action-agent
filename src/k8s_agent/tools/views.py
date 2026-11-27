@@ -12,6 +12,8 @@ Inputs are the camelCase dicts the API returns (the official client's `sanitize_
 which is also what the unit tests use as fixtures.
 """
 
+import hashlib
+import json
 from typing import Any
 
 from .redact import bounded, redact_text
@@ -62,13 +64,43 @@ def _resources(container: dict) -> dict:
     }
 
 
+PROBE_HANDLERS = ("exec", "httpGet", "tcpSocket", "grpc")
+
+
+def probe_check(probe: dict | None) -> dict:
+    """The check a raw probe runs (its handler: `exec`, `httpGet`, `tcpSocket` or `grpc`), without its timing."""
+    return {h: probe[h] for h in PROBE_HANDLERS if (probe or {}).get(h) is not None}
+
+
+def probe_digest(probe: dict | None) -> str | None:
+    """A fingerprint of the check a raw probe runs: tells whether it changed without carrying it (an exec
+    command can hold a password)."""
+    check = probe_check(probe)
+    if not check:
+        return None
+    return hashlib.sha256(json.dumps(check, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+
+
 def _probe(probe: dict | None) -> dict | None:
+    """A probe's timing (Kubernetes' defaults when unset) and the kind of check it runs; never the check
+    itself (an exec command can carry a password)."""
     if not probe:
         return None
     return {
         "initial_delay_seconds": probe.get("initialDelaySeconds", 0),
         "period_seconds": probe.get("periodSeconds", 10),
         "failure_threshold": probe.get("failureThreshold", 3),
+        "timeout_seconds": probe.get("timeoutSeconds", 1),
+        "handler": next((h for h in PROBE_HANDLERS if probe.get(h) is not None), None),
+        "check_digest": probe_digest(probe),
+    }
+
+
+def _probes(container: dict) -> dict:
+    return {
+        "startup": _probe(container.get("startupProbe")),
+        "liveness": _probe(container.get("livenessProbe")),
+        "readiness": _probe(container.get("readinessProbe")),
     }
 
 
@@ -79,6 +111,7 @@ def _container(container: dict) -> dict:
         "resources": _resources(container),
         "startup_probe": _probe(container.get("startupProbe")),
         "readiness_probe": _probe(container.get("readinessProbe")),
+        "liveness_probe": _probe(container.get("livenessProbe")),
     }
 
 
@@ -197,6 +230,7 @@ def _container_state(state: dict | None) -> dict | None:
             "state": "terminated",
             "reason": t.get("reason"),
             "exit_code": t.get("exitCode"),
+            "started_at": t.get("startedAt"),
             "finished_at": t.get("finishedAt"),
             "message": _message(t.get("message")),
         }
@@ -245,6 +279,10 @@ def pod_view(raw: dict) -> dict:
         # Kubernetes' default when the field is unset), and the resources the kubelet actually applied.
         "resize_policy": {c.get("name"): _resize_policy(c) for c in spec.get("containers") or []},
         "status_resources": {cs.get("name"): _resources(cs) for cs in statuses if cs.get("resources") is not None},
+        # What a restart's cause is judged against: how long each probe lets a container run before the kubelet
+        # restarts it, and how long a stop may take (SIGTERM, then SIGKILL).
+        "probes": {c.get("name"): _probes(c) for c in spec.get("containers") or []},
+        "termination_grace_seconds": spec.get("terminationGracePeriodSeconds", 30),
     }
 
 
@@ -291,6 +329,8 @@ def event_view(raw: dict) -> dict:
             "kind": involved.get("kind"),
             "name": involved.get("name"),
             "namespace": involved.get("namespace"),
+            # `spec.containers{app}` for an event about one container of a pod.
+            "field_path": involved.get("fieldPath"),
         },
     }
 

@@ -6,6 +6,8 @@ reader (or the summary) can tell an OOM kill from a failing probe from a
 missing image without re-deriving anything.
 """
 
+from datetime import datetime
+
 from . import quantities
 
 _WAITING_ERRORS = {
@@ -41,7 +43,124 @@ def _termination(state: dict | None) -> str | None:
     return f"{state.get('reason') or 'terminated'} (exit code {state.get('exit_code')})"
 
 
-def pod_findings(pod: dict) -> list[dict]:
+# Exit codes of a process ended by a signal: 128 + SIGKILL (9) or SIGTERM (15). A probe restart is SIGTERM, then
+# SIGKILL after the grace period, so it ends as 143, 137, or 0 ("Completed") when the process stops cleanly on
+# SIGTERM (all three seen on test). Only the runtime's OOMKilled reason and the kubelet's probe-kill event tell
+# the causes apart; the exit code alone does not.
+_SIGNALLED = {137, 143}
+_LABEL = {"startup_probe": "killed by startup probe", "liveness_probe": "killed by liveness probe"}
+
+
+def _seconds_between(start, end) -> int | None:
+    try:
+        a = datetime.fromisoformat(str(start))
+        b = datetime.fromisoformat(str(end))
+    except ValueError:
+        return None
+    return max(0, round((b - a).total_seconds()))
+
+
+def probe_allowance(probe: dict) -> int:
+    """About how long a probe lets a container run, from its start, before the kubelet restarts it when the
+    probe never passes: its first check after initialDelaySeconds, then failureThreshold failures periodSeconds
+    apart."""
+    return int(probe.get("initial_delay_seconds") or 0) + int(probe.get("failure_threshold") or 3) * int(probe.get("period_seconds") or 10)
+
+
+def _timing(kind: str, probe: dict) -> str:
+    return (
+        f"{kind}Probe allows about {probe_allowance(probe)}s (initialDelaySeconds {probe.get('initial_delay_seconds')} + "
+        f"failureThreshold {probe.get('failure_threshold')} x periodSeconds {probe.get('period_seconds')}; "
+        f"timeoutSeconds {probe.get('timeout_seconds')})"
+    )
+
+
+def kill_cause(pod: dict, container: dict, kills: list[dict] | None) -> dict | None:
+    """What ended the container's last run, when the cluster recorded it: `killed_by` `oom` (the runtime's
+    OOMKilled), `startup_probe` / `liveness_probe` (a kubelet probe-kill event for this container), or
+    `not_recorded` (ended by a signal with neither on record: the events may have expired). None when the last
+    run ended on its own with an error code (an ordinary crash) or there is no last run."""
+    last = container.get("last_state") or {}
+    if last.get("state") != "terminated":
+        last = container.get("state") or {}
+    if last.get("state") != "terminated":
+        return None
+    name = container.get("name")
+    ran = _seconds_between(last.get("started_at"), last.get("finished_at"))
+    if last.get("reason") == "OOMKilled":
+        return {"killed_by": "oom", "last_run_seconds": ran, "diagnosis": "killed for exceeding its memory limit (OOMKilled), not by a probe"}
+    kill = next(
+        (k for k in kills or [] if (k.get("namespace"), k.get("pod"), k.get("container")) == (pod.get("namespace"), pod.get("name"), name)),
+        None,
+    )
+    if kill is None:
+        if last.get("exit_code") not in _SIGNALLED:
+            return None
+        return {
+            "killed_by": "not_recorded",
+            "last_run_seconds": ran,
+            "diagnosis": (
+                f"ended by a signal (exit code {last.get('exit_code')}) and not recorded as OOMKilled; no probe kill "
+                "of this container is in the last 60 minutes of events (they expire), so what sent it is not on "
+                "record: a probe restart whose events expired, a stop that outlasted its grace period, or a kill from "
+                "outside the container"
+            ),
+        }
+    kind = kill["probe"]
+    probe = ((pod.get("probes") or {}).get(name) or {}).get(kind) or {}
+    startup = ((pod.get("probes") or {}).get(name) or {}).get("startup")
+    cause = {
+        "killed_by": f"{kind}_probe",
+        "probe_kills": kill.get("count") or 1,
+        "last_run_seconds": ran,
+        "probe": {"kind": kind, "allows_seconds": probe_allowance(probe) if probe else None, **probe},
+    }
+    ran_text = f"after running {ran}s" if ran is not None else "(run time not recorded)"
+    # A Deployment's pod (owned by a ReplicaSet): this agent can propose the fix itself (set_startup_probe).
+    ask = (
+        "; for a Deployment this agent can propose it when asked with a time, e.g. \"give deployment <name> "
+        "10 minutes to start\" (it lasts until the Deployment is next rendered from Git or Helm)"
+        if pod.get("owner_kind") == "ReplicaSet"
+        else ""
+    )
+    if kind == "startup":
+        cause["diagnosis"] = (
+            f"restarted by its startup probe {ran_text}: it had not passed the startup check in time; "
+            f"{_timing('startup', probe) if probe else 'startupProbe timing unknown'}. If the container needs "
+            "longer to start (slow initialisation, recovery, an index rebuild: see its previous log), give it "
+            "more: raise startupProbe.failureThreshold (or periodSeconds) where the workload is defined (its chart "
+            "values when Helm or Flux manages it)" + ask
+        )
+        return cause
+    grace = int(pod.get("termination_grace_seconds") or 30)
+    slack = int(probe.get("period_seconds") or 10) + int(probe.get("timeout_seconds") or 1) + grace
+    during_start = bool(probe) and startup is None and ran is not None and ran <= probe_allowance(probe) + slack
+    cause["during_startup"] = during_start
+    if during_start:
+        cause["diagnosis"] = (
+            f"restarted by its liveness probe {ran_text}, within the time the liveness probe allows from start "
+            f"({_timing('liveness', probe)}), and it has no startup probe: it is likely killed while still "
+            "starting. If it needs longer to start, add a startupProbe with the same check as the liveness probe "
+            "and enough time to start (it holds the liveness probe off until it passes) where the workload is "
+            "defined, rather than loosening the liveness probe" + ask
+        )
+    else:
+        cause["diagnosis"] = (
+            f"restarted by its liveness probe {ran_text}: it stopped passing its liveness check while running "
+            f"(hung, overloaded, or a check slower than timeoutSeconds); "
+            f"{_timing('liveness', probe) if probe else 'livenessProbe timing unknown'}"
+        )
+    return cause
+
+
+def _label(cause: dict | None, last: dict | None) -> str:
+    if cause and cause["killed_by"] in _LABEL:
+        return _LABEL[cause["killed_by"]]
+    return (last or {}).get("reason") or "terminated"
+
+
+def pod_findings(pod: dict, kills: list[dict] | None = None) -> list[dict]:
+    """`kills`: the probe kills on record (`read.list_probe_kills`), to name what restarted a container."""
     findings: list[dict] = []
     if pod.get("deleting"):
         return findings
@@ -67,57 +186,65 @@ def pod_findings(pod: dict) -> list[dict]:
         last = container.get("last_state")
         restarts = container.get("restart_count") or 0
 
+        cause = kill_cause(pod, container, kills) if restarts or state.get("state") == "terminated" else None
+
         if state.get("state") == "waiting" and state.get("reason") in _WAITING_ERRORS:
             reason = state["reason"]
             evidence = state.get("message") or reason
             last_termination = _termination(last)
             if reason == "CrashLoopBackOff" and last_termination:
-                # The previous container's termination is the actual cause;
-                # OOMKilled and a failing probe look identical from outside.
-                reason = f"CrashLoopBackOff ({(last or {}).get('reason') or 'terminated'})"
+                # The previous container's termination is the actual cause: OOMKilled, or a probe kill the
+                # kubelet recorded; the exit code alone does not tell them apart.
+                reason = f"CrashLoopBackOff ({_label(cause, last)})"
                 evidence = f"previous container {last_termination}; restarts {restarts}"
-            findings.append(_finding("critical", "Pod", pod, reason, evidence, name))
+            findings.append(_with_cause(_finding("critical", "Pod", pod, reason, evidence, name), cause))
             continue
 
-        if state.get("state") == "terminated" and (state.get("exit_code") or 0) != 0:
+        if state.get("state") == "terminated" and ((state.get("exit_code") or 0) != 0 or (cause and cause["killed_by"] in _LABEL)):
             if restarts >= 1:
                 # Between two restarts of a crash loop the kubelet shows the
                 # container that just exited as `terminated` for a few
                 # seconds before it reports CrashLoopBackOff (found live,
                 # 2026-10-14). Same condition, so the same finding.
                 findings.append(
-                    _finding(
-                        "critical",
-                        "Pod",
-                        pod,
-                        f"CrashLoopBackOff ({state.get('reason') or 'terminated'})",
-                        f"container {_termination(state)}, being restarted; restarts {restarts}",
-                        name,
+                    _with_cause(
+                        _finding(
+                            "critical",
+                            "Pod",
+                            pod,
+                            f"CrashLoopBackOff ({_label(cause, state)})",
+                            f"container {_termination(state)}, being restarted; restarts {restarts}",
+                            name,
+                        ),
+                        cause,
                     )
                 )
             else:
-                findings.append(_finding("warning", "Pod", pod, state.get("reason") or "Error", _termination(state), name))
+                findings.append(_with_cause(_finding("warning", "Pod", pod, state.get("reason") or "Error", _termination(state), name), cause))
             continue
 
-        if restarts >= RESTART_WARNING_THRESHOLD:
+        if restarts >= RESTART_WARNING_THRESHOLD or (restarts and cause and cause["killed_by"] in _LABEL):
             detail = _termination(last) or "unknown cause"
             # Named after the last termination, as a crash loop is: an OOM-killed container spends
-            # most of its time running when its limit takes a while to fill.
-            cause = (last or {}).get("reason") if (last or {}).get("state") == "terminated" else None
-            findings.append(
-                _finding(
-                    "warning",
-                    "Pod",
-                    pod,
-                    f"FrequentRestarts ({cause})" if cause else "FrequentRestarts",
-                    f"{restarts} restarts; last: {detail}",
-                    name,
-                )
-            )
+            # most of its time running when its limit takes a while to fill (and a slow start killed by
+            # its probe mostly runs too, until the probe gives up on it).
+            terminated = (last or {}).get("state") == "terminated"
+            label = _label(cause, last) if terminated or cause else None
+            if restarts >= RESTART_WARNING_THRESHOLD:
+                reason = f"FrequentRestarts ({label})" if label else "FrequentRestarts"
+            else:
+                reason = f"Restarted ({label})"
+            findings.append(_with_cause(_finding("warning", "Pod", pod, reason, f"{restarts} restarts; last: {detail}", name), cause))
 
         if state.get("state") == "running" and not container.get("ready"):
             findings.append(_finding("info", "Pod", pod, "NotReady", "container running but not ready", name))
     return findings
+
+
+def _with_cause(finding: dict, cause: dict | None) -> dict:
+    if cause:
+        finding.update(cause)
+    return finding
 
 
 def deployment_findings(dep: dict) -> list[dict]:

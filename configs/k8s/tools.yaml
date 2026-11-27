@@ -43,6 +43,10 @@ tools:
     module: k8s_agent.tools.read
     function: list_events
 
+  list_probe_kills:     # containers the kubelet restarted for a failed startup/liveness probe (Killing events)
+    module: k8s_agent.tools.read
+    function: list_probe_kills
+
   get_pod_log:
     module: k8s_agent.tools.read
     function: get_pod_log

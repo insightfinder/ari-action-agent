@@ -1044,6 +1044,89 @@ def scenario_health_statefulset(_args):
     return ok, f"{task['status']['state']} in {elapsed:.0f}s scope={scope} pods={(report.get('summary') or {}).get('pods')}"
 
 
+
+def _probe_killed(deployment: str, probe: str) -> bool:
+    """Whether the kubelet has restarted one of the Deployment's pods for a failed `probe` probe (a Normal
+    `Killing` event), which takes about 20s after the fixture starts."""
+    events = json.loads(_kubectl("-n", NAMESPACE, "get", "events", "--field-selector", "reason=Killing", "-o", "json"))
+    return any(
+        str((e.get("involvedObject") or {}).get("name", "")).startswith(f"{deployment}-")
+        and f"failed {probe} probe" in str(e.get("message"))
+        for e in events.get("items") or []
+    )
+
+
+def scenario_health_probe_kills(_args):
+    """What restarted a container, from the kubelet's events, not the exit code: e2e-slowstart is killed by its
+    startup probe (exit 137, not an OOM kill), e2e-slowstart-liveness by its liveness probe while still starting
+    (exit 0), and e2e-oom stays OOMKilled, with a suggested memory limit of twice its 32Mi."""
+    deadline = time.monotonic() + 120
+    while not (_probe_killed("e2e-slowstart", "startup") and _probe_killed("e2e-slowstart-liveness", "liveness")):
+        if time.monotonic() > deadline:
+            return False, "no probe kill recorded for the slowstart fixtures within 120s (are they applied?)"
+        time.sleep(5)
+    notes, ok = [], True
+    for name, want in (("e2e-slowstart", "startup_probe"), ("e2e-slowstart-liveness", "liveness_probe"), ("e2e-oom", "oom")):
+        task, elapsed = _run(f"check the health of the deployment {name} in namespace {NAMESPACE}")
+        report = _artifact(task, "health_report") or {}
+        found = [f for f in report.get("findings") or [] if f.get("kind") == "Pod" and f.get("killed_by")]
+        hit = next((f for f in found if f.get("killed_by") == want), None)
+        good = task["status"]["state"] == "TASK_STATE_COMPLETED" and hit is not None
+        if want == "startup_probe" and hit:
+            good = good and (hit.get("probe") or {}).get("allows_seconds") == 15 and "Rebuilding" in str(hit.get("previous_log_tail"))
+        if want == "liveness_probe" and hit:
+            good = good and hit.get("during_startup") is True and "add a startupProbe" in str(hit.get("diagnosis"))
+        if want == "oom" and hit:
+            # 2 x its 32Mi limit, with the request that would get it proposed.
+            suggestion = hit.get("suggestion") or {}
+            good = good and suggestion.get("to") == "64Mi" and str(suggestion.get("request", "")).endswith("e2e-oom in namespace ari-k8s-e2e to 64Mi")
+        ok = ok and good
+        notes.append(f"{name}: {(hit or {}).get('reason') or [f.get('killed_by') for f in found]} in {elapsed:.0f}s")
+    return ok, " | ".join(notes)
+
+
+def _startup_probe_of(name: str) -> dict | None:
+    dep = _object("deployment", name) or {}
+    return (((dep.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers", [{}])[0].get("startupProbe")
+
+
+def _put_back_probes(name: str) -> None:
+    """Back to the fixture as written (no startup probe on e2e-slowstart-liveness, 15s on e2e-slowstart):
+    recreated from deploy/k8s-agent-e2e/fixtures.yaml, since `kubectl apply` keeps a field another manager added."""
+    _kubectl("-n", NAMESPACE, "delete", "deployment", name, "--wait=true")
+    fixtures = Path(__file__).resolve().parents[1] / "deploy" / "k8s-agent-e2e" / "fixtures.yaml"
+    _kubectl("apply", "-f", str(fixtures), "--selector", f"app={name}")
+
+
+def scenario_startup_probe(args):
+    """More time to start: e2e-slowstart-liveness (liveness kills it while it starts, no startup probe) gets a
+    startup probe copying its liveness check; e2e-slowstart's 15s startup probe gets 2 minutes. Each new pod must
+    then start and stay up (succeeded). Without --allow-writes, proposal only."""
+    notes, ok = [], True
+    for name, copied in (("e2e-slowstart-liveness", "livenessProbe"), ("e2e-slowstart", None)):
+        task, pending = _propose(f"give deployment {name} in namespace {NAMESPACE} 2 minutes to start")
+        if task["status"]["state"] != "TASK_STATE_INPUT_REQUIRED" or not pending:
+            return False, f"{name}: expected a proposal, got {task['status']['state']} :: {_artifact(task, 'refusal')}"
+        shape = (
+            pending.get("action") == "set_startup_probe"
+            and pending.get("copy_check_from") == copied
+            and (pending.get("failure_threshold"), pending.get("period_seconds")) == (24, 5)
+        )
+        if not args.allow_writes:
+            notes.append(f"{name}: proposal only ({_cancel(task['id'])}) shape={shape}")
+            ok = ok and shape
+            continue
+        try:
+            done, elapsed = _approve(task, pending)
+            result = _artifact(done, "action_result") or {}
+            probe = _startup_probe_of(name) or {}
+            good = shape and result.get("status") == "succeeded" and probe.get("failureThreshold") == 24 and "tcpSocket" in probe
+            notes.append(f"{name}: {result.get('status')} in {elapsed:.0f}s probe={probe.get('failureThreshold')}x{probe.get('periodSeconds')}")
+            ok = ok and good
+        finally:
+            _put_back_probes(name)
+    return ok, " | ".join(notes)
+
 # ---------------------------------------------------------------- approvals that arrive late (2026-11-26)
 # An approval can come hours after its proposal, and the cluster moves on meanwhile. Each scenario below changes
 # what one approval-time check compares, then approves: nothing may be written, and the worker must have logged
@@ -2323,6 +2406,8 @@ SCENARIOS = {
     "late_storageclass_no_expansion": scenario_late_storageclass_no_expansion,
     "late_storageclass_gone": scenario_late_storageclass_gone,
     "health_statefulset": scenario_health_statefulset,
+    "health_probe_kills": scenario_health_probe_kills,
+    "startup_probe": scenario_startup_probe,
     "restart_deployment": scenario_restart_deployment,
     "delete_pod": scenario_delete_pod,
     "resize_pod": scenario_resize_pod,

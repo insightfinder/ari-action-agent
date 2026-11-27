@@ -46,7 +46,8 @@ META = AgentMeta(
         "CPU/memory requests, limits and usage, workloads, nodes, events, ...), checks Pod-level health, and "
         "changes Deployments only: scales them, changes CPU/memory — of a Deployment (rolls its pods) or of one "
         "of its running pods in place (no rollout, where the cluster supports in-place pod resize) —, restarts "
-        "them, and deletes a single pod for the Deployment to replace (never its only ready pod); it also grows a "
+        "them, deletes a single pod for the Deployment to replace (never its only ready pod), and gives a container more "
+        "time to start (adds a startup probe copying its liveness check, or lengthens its startup probe); it also grows a "
         "StatefulSet's disk (a PVC its claim template created; never smaller) — every change "
         "proposed first and applied only after a person approves it. "
         "StatefulSets, DaemonSets, CronJobs, nodes and protected system namespaces are otherwise read only. Deployments "
@@ -65,7 +66,9 @@ META = AgentMeta(
             "request only); CPU/memory requests or limits of a container (explicit request only), either in the "
             "Deployment's template (rolls its pods) or in place on one named running pod (no recreation; memory "
             "only for containers whose resizePolicy restarts them); a rolling restart; deleting one named pod "
-            "that the Deployment replaces (never its only ready pod). Also growing one named PVC that a "
+            "that the Deployment replaces (never its only ready pod); more time for a container to start, as a "
+            "startup probe copying its liveness check or a longer existing one (only ever more time, at most an "
+            "hour; liveness and readiness probes are never changed). Also growing one named PVC that a "
             "StatefulSet's claim template created to a size the request names (never smaller; a PVC a chart or "
             "GitOps renders is changed in Git instead). Restart and "
             "delete only when the request asks for them. Never scales anything below 1 replica, "
@@ -80,10 +83,11 @@ META = AgentMeta(
             "resize pod checkout-7d9f5c6b8-x2k4q in place: cpu limit 2",
             "restart the checkout deployment",
             "delete pod checkout-7d9f5c6b8-x2k4q",
+            "give the checkout deployment 10 minutes to start",
             "expand pvc data-loki-0 in namespace monitoring to 100Gi",
         ],
     ),
-    planner_description="Kubernetes agent that checks cluster health and changes Deployments (scale, resources, restart, delete a pod) and grows StatefulSet disks",
+    planner_description="Kubernetes agent that checks cluster health and changes Deployments (scale, resources, restart, delete a pod, time to start) and grows StatefulSet disks",
     planner_domain_guidance="""Requests are either a listing question, a health question, a change, or a plain question.
 - A listing question ("list / show / which / table of ...": all pods with their CPU/memory limits and usage, \
 Deployments, nodes, events, PVCs, ...): plan "query_resources" alone (no "find_workload"); pass a namespace the \
@@ -92,7 +96,8 @@ everything of some kind rather than what is wrong.
 - A health question ("what's wrong with X", "check the pods in namespace Y", "is the cluster healthy"): \
 plan "find_workload" then "check_health". Read-only; never needs approval.
 - A change to a Deployment (scale it, change its KEDA/HPA min or max, change its CPU/memory or, in place, \
-that of one of its pods, restart it, delete one of its pods), or growing a disk (a PVC): plan \
+that of one of its pods, restart it, delete one of its pods, give a container more time to start), or growing a \
+disk (a PVC): plan \
 "find_workload" then "propose_change". "propose_change" works out and checks the exact change and pauses for a person's approval; \
 it decides itself whether the request is explicit enough and refuses otherwise — do not try to pre-judge that.
 - **NEVER schedule "apply_approved_change".** It runs only after a person approves a proposal, through a \
@@ -117,8 +122,10 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "write plain sentences, 'Label: value' lines and simple '-' bullet points, with **bold** as the only "
         "emphasis and no tables, headings, code blocks, links or divider lines, because the text may be "
         "emailed to the approver as is. Then, for a health check, the overall picture first (how many pods/deployments are unhealthy), then each "
-        "finding with its evidence — for a crash loop, the previous container's termination reason (an "
-        "OOMKilled is not a failing probe) — and every data gap stated as a gap, never as health. For a "
+        "finding with its evidence — for a crash loop or restarts, the previous container's termination reason and, "
+        "when the finding has `killed_by`, what restarted it (OOMKilled, its startup or liveness probe, or not "
+        "on record) with the finding's `diagnosis` (how long the probe lets it run, and what to change); an exit "
+        "code 137 alone is not an OOM kill — and every data gap stated as a gap, never as health. For a "
         "proposal: exactly what will change (object, field, from -> to), the risk tier and every listed risk, "
         "any value that was clamped to the node capacity cap (requested -> applied, and why), the capacity "
         "outlook, how long the change is expected to last given who owns the object (drift notice), and where "
@@ -129,7 +136,8 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "verification unavailable (the change WAS applied, but its rollout could not be checked; say both); for "
         "an in-place pod resize also: resize infeasible or deferred on the pod's node, pod replaced while "
         "watched, or container failing after the resize — and that the Deployment template still has the old "
-        "values until the change is made in Git; for a deleted pod, which pod "
+        "values until the change is made in Git; for a startup probe change, that it applies while the container "
+        "starts only and the new pods' outcome; for a deleted pod, which pod "
         "replaced it — "
         "plus the drift notice and persistence hint (when it says nothing needs persisting, say so in one line). "
         "For a refusal: "
@@ -139,7 +147,10 @@ confirmation path that bypasses planning; a planned one refuses to run.
         "(container_resources), since a follow-up change has to name a value against them, and when a finding "
         "is one this agent can change (an OOM kill at a memory limit, CPU throttling, too few replicas), end "
         "with the exact request that would get it proposed, e.g. 'To have it proposed, ask: set the memory "
-        "limit of container app in deployment X (namespace Y) to <value>'. Never print anything "
+        "limit of container app in deployment X (namespace Y) to <value>'; when an OOM finding has a "
+        "`suggestion`, give its value with its basis and note (a first step, not a measured need; for pattern "
+        "long_run say plainly it looks like a leak or growth that a larger limit only delays) and use its "
+        "`request` verbatim. Never print anything "
         "that looks like a "
         "credential. For a listing (query_resources) result: the rows reach the caller as structured data (the "
         "query_result artifact), so do not reproduce them or draw a table; say what was listed (kind; namespace or all "

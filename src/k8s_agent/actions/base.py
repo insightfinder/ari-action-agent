@@ -124,6 +124,12 @@ class ActionSpec:
     def operations(self, action: dict) -> list[Operation]:
         raise NotImplementedError
 
+    async def build_operations(self, kube, action: dict) -> list[Operation]:
+        """The operations, built when they run (dry run and write alike). An action whose write copies something
+        from the live object that must not travel in the proposal (a probe's check, which can hold a password)
+        reads it here; every other action builds them from the approved values alone."""
+        return self.operations(action)
+
     def summarize(self, op: Operation, raw: dict, action: dict) -> dict:
         meta = raw.get("metadata") or {}
         return {"resource": op.resource, "name": meta.get("name"), "generation": meta.get("generation")}

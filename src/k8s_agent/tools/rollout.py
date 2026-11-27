@@ -157,6 +157,19 @@ def moved_away(dep: dict, target: dict) -> str | None:
         if dep.get("replicas") != target.get("replicas"):
             return f"spec.replicas is {dep.get('replicas')} again, not the approved {target.get('replicas')}"
         return None
+    if kind == "startup_probe":
+        container = target.get("container")
+        spec = next((c for c in (dep.get("template") or {}).get("containers") or [] if c.get("name") == container), None)
+        probe = (spec or {}).get("startup_probe") or {}
+        if spec is None:
+            return f"container {container} is no longer in the pod template"
+        if (probe.get("failure_threshold"), probe.get("period_seconds")) != (target.get("failure_threshold"), target.get("period_seconds")):
+            return (
+                f"the startup probe of container {container} is "
+                + (f"failureThreshold {probe.get('failure_threshold')} x periodSeconds {probe.get('period_seconds')}" if probe else "gone")
+                + f" again, not the approved failureThreshold {target.get('failure_threshold')} x periodSeconds {target.get('period_seconds')}"
+            )
+        return None
     if kind != "resources":
         return None
     container = target.get("container")
