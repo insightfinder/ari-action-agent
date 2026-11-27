@@ -9,7 +9,9 @@ stuck or misbehaving pod). The only delete this agent makes.
   serve nothing until the replacement is ready.
 - The delete carries a uid precondition, so it removes exactly the approved pod, not a later one.
 - A pod already gone or terminating when the approval arrives was deleted by someone else (or evicted): refused,
-  never reported as this agent's delete (apply_approved_change, first attempt).
+  never reported as this agent's delete (apply_approved_change, first attempt). A failure before the DELETE is
+  sent ends the step (not retried, `retry_before_write`): a gone pod records nobody, so only a lost worker, which
+  may have sent it, reaches the retry that counts a gone pod as its own.
 - A plain delete, not an eviction: it does not wait for a PodDisruptionBudget, which the proposal says when
   one covers the pod.
 - Verified by positive evidence (`rollout.wait_pod_replaced`): the old uid gone and a new pod ready and stable.
@@ -26,6 +28,8 @@ class DeletePod(ActionSpec):
     name = "delete_pod"
     workload_kinds = ("Deployment",)
     target_kinds = ("Pod",)
+    # A gone pod records nobody: a retry could not tell this agent's delete from someone else's.
+    retry_before_write = False
     prompt_line = (
         "delete ONE pod so its controller replaces it — also what restarting one named pod means. Only when the "
         "request asks for a pod to be deleted or restarted; report the pod name exactly as written in the request."

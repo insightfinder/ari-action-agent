@@ -5,7 +5,7 @@ container's current usage (`decrease_check`, shared with `resize_pod`)."""
 import math
 
 from ..stepkit import refusal
-from ..tools import capacity, governance, policy, quantities
+from ..tools import capacity, governance, ownership, policy, quantities
 from .base import DeploymentAction, Operation
 from .restart_rollout import rollout_effects
 
@@ -114,11 +114,28 @@ class SetResources(DeploymentAction):
             for resource, value in (values or {}).items()
         )
 
+    def written_fields(self, action, proposal):
+        then = (proposal["snapshot"].get("container_resources") or {}).get(action["container"])
+        paths = changed_resource_paths(["f:spec", "f:template", "f:spec"], action["container"], action.get("resources"), then)
+        return {"kind": "Deployment", "namespace": action.get("namespace"), "name": action["deployment"], "paths": paths}
+
     def verify_target(self, action):
         return {"kind": "resources", "container": action["container"], "resources": action["resources"]}
 
     def base_tier(self, facts):
         return "medium"  # every resource change restarts pods
+
+
+def changed_resource_paths(prefix: list[str], container: str, approved: dict | None, then: dict | None) -> list[list[str]]:
+    """The `ownership` paths of the approved requests/limits of `container` (under `prefix`, the pod spec) that
+    differ from what the snapshot held (`then`, a container's resources view)."""
+    then = then or {}
+    return [
+        [*prefix, "f:containers", ownership.keyed(container), "f:resources", f"f:{side}", f"f:{resource}"]
+        for side, values in (approved or {}).items()
+        for resource, value in (values or {}).items()
+        if not _same_quantity(resource, (then.get(side) or {}).get(resource), value)
+    ]
 
 
 def pick_container(change: dict, names) -> tuple[str | None, dict | None]:

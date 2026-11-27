@@ -368,6 +368,38 @@ async def test_a_pod_deleted_by_someone_else_just_before_the_write_is_not_report
     assert not cluster.deletes
 
 
+def _reads_fail(cluster, monkeypatch, kind):
+    real_get = cluster.get
+
+    async def get(k, name, namespace=None):
+        if k == kind:
+            raise fx.api_error(403, f"{k} is forbidden right now", "Forbidden")
+        return await real_get(k, name, namespace)
+
+    monkeypatch.setattr(cluster, "get", get)
+
+
+@pytest.mark.asyncio
+async def test_a_delete_that_fails_before_it_is_sent_ends_the_step(cluster, monkeypatch):
+    """No retry for a delete after a failure before the DELETE (user, 2026-11-27): a retry that then found the pod
+    gone could not tell this agent's delete from someone else's."""
+    pa = await _approved(cluster, "delete pod checkout-1", _change(action="delete_pod", pod="checkout-1"))
+    _reads_fail(cluster, monkeypatch, "Pod")
+    with pytest.raises(StepRefused, match="failed before its change was sent .*Forbidden.*Nothing was changed. It is not retried"):
+        await _apply(pa, attempt=1)
+    assert not cluster.deletes
+
+
+@pytest.mark.asyncio
+async def test_a_patch_that_fails_before_it_is_sent_is_still_retried(cluster, monkeypatch):
+    """A patch's retry tells its own write by the field owner, so the failure stays retryable."""
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    _reads_fail(cluster, monkeypatch, "Deployment")
+    with pytest.raises(Exception, match="forbidden right now") as failed:
+        await _apply(pa, attempt=1)
+    assert not isinstance(failed.value, StepRefused) and not cluster.patches
+
+
 @pytest.mark.asyncio
 async def test_a_scale_someone_else_already_made_is_not_reported_as_applied(cluster):
     """The same rule for every action (user, 2026-11-26): replicas already at the approved number on the first
@@ -390,6 +422,94 @@ async def test_a_retry_after_its_own_scale_still_verifies(cluster):
     cluster.patches.clear()
     again = await _apply(pa, attempt=2)
     assert again["applied"]["already_at_target"] is True and again["status"] == "succeeded" and not cluster.patches
+    assert again["applied"]["field_manager"] == "ari-k8s-agent"
+
+
+@pytest.mark.asyncio
+async def test_a_retry_refuses_a_scale_someone_else_made_after_the_first_attempt_failed(cluster):
+    """The first attempt failed before writing; someone scaled by hand before the retry. The replicas field is
+    owned by kubectl, not this agent: refused, not reported as applied (user, 2026-11-27)."""
+    from k8s_agent.tools.client import PATCH_MERGE
+
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    await cluster.patch("Deployment", "checkout", "shop", {"spec": {"replicas": 5}}, PATCH_MERGE, False, "scale", field_manager="kubectl")
+    cluster.patches.clear()
+    with pytest.raises(StepRefused, match="replicas changed from 3 to 5; it already holds what was approved, done by someone else"):
+        await _apply(pa, attempt=2)
+    assert not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_a_retry_counts_a_field_it_shares_with_an_applier_as_its_own(cluster):
+    """A server-side apply of the same value makes its manager a co-owner; this agent's write still counts."""
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    cluster.auto_rollout = True
+    await _apply(pa, attempt=1)
+    managed = _obj(cluster, "Deployment", "checkout")["metadata"]["managedFields"]
+    managed.append({"manager": "flux", "operation": "Apply", "fieldsV1": {"f:spec": {"f:replicas": {}}}})
+    cluster.patches.clear()
+    again = await _apply(pa, attempt=2)
+    assert again["applied"]["already_at_target"] is True and not cluster.patches
+
+
+def _failing_write(cluster, monkeypatch, manager):
+    """The write lands as `manager` (this agent's own, or someone else's just ahead of it), then the call fails."""
+    real = cluster.patch
+
+    async def patch(kind, name, namespace, body, content_type, dry_run, subresource=None, field_manager="ari-k8s-agent"):
+        if dry_run:
+            return await real(kind, name, namespace, body, content_type, dry_run, subresource, field_manager=field_manager)
+        await real(kind, name, namespace, body, content_type, dry_run, subresource, field_manager=manager)
+        raise fx.api_error(500, "etcdserver: request timed out", "InternalError")
+
+    monkeypatch.setattr(cluster, "patch", patch)
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_failed_after_someone_elses_same_change_is_refused(cluster, monkeypatch):
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    _failing_write(cluster, monkeypatch, "kubectl")
+    with pytest.raises(StepRefused, match="had already been changed by someone else"):
+        await _apply(pa, attempt=1)
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_failed_after_landing_is_reported_applied(cluster, monkeypatch):
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    cluster.auto_rollout = True
+    _failing_write(cluster, monkeypatch, "ari-k8s-agent")
+    result = await _apply(pa, attempt=1)
+    assert "etcdserver" in result["applied"]["applied_despite_error"] and result["status"] == "succeeded"
+
+
+async def _unreadable_owners(*_args):
+    raise RuntimeError("could not read Deployment shop/checkout: HTTP 503")
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_cannot_read_who_set_it_does_not_claim_it(cluster, monkeypatch):
+    from k8s_agent.tools import read
+
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    cluster.auto_rollout = True
+    await _apply(pa, attempt=1)
+    cluster.patches.clear()
+    monkeypatch.setattr(read, "get_field_owners", _unreadable_owners)
+    with pytest.raises(StepRefused, match=r"who set it could not be read \(RuntimeError: could not read Deployment") as refused:
+        await _apply(pa, attempt=2)
+    assert "Nothing was changed" not in str(refused.value) and not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_a_write_error_keeps_its_outcome_when_the_owner_cannot_be_read(cluster, monkeypatch):
+    from k8s_agent.tools import read
+
+    pa = await _approved(cluster, "scale checkout to 5", _SCALE5)
+    cluster.auto_rollout = True
+    _failing_write(cluster, monkeypatch, "ari-k8s-agent")
+    monkeypatch.setattr(read, "get_field_owners", _unreadable_owners)
+    result = await _apply(pa, attempt=1)
+    assert "etcdserver" in result["applied"]["applied_despite_error"]
 
 
 @pytest.mark.asyncio

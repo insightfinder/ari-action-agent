@@ -296,6 +296,60 @@ HELM_LABELS = {
 # ---------------------------------------------------------------- fake lightkube client
 
 
+def _leaf_paths(body, path=()):
+    """`fieldsV1` paths of the values a patch body sets (list items keyed by name, as containers are)."""
+    if isinstance(body, dict):
+        for key, value in body.items():
+            yield from _leaf_paths(value, (*path, f"f:{key}"))
+    elif isinstance(body, list) and body and all(isinstance(item, dict) and "name" in item for item in body):
+        for item in body:
+            key = "k:" + json.dumps({"name": item["name"]}, separators=(",", ":"))
+            yield from _leaf_paths({k: v for k, v in item.items() if k != "name"}, (*path, key))
+    else:
+        yield path
+
+
+def _value_at(obj, path):
+    for key in path:
+        if key.startswith("k:"):
+            name = json.loads(key[2:])["name"]
+            obj = next((item for item in obj or [] if isinstance(item, dict) and item.get("name") == name), None)
+        else:
+            obj = (obj or {}).get(key[2:]) if isinstance(obj, dict) else None
+        if obj is None:
+            return None
+    return obj
+
+
+def _take_ownership(before, after, body, manager, subresource):
+    entries = (after.setdefault("metadata", {})).setdefault("managedFields", [])
+    for path in _leaf_paths({k: v for k, v in (body or {}).items() if k != "metadata"}):
+        if _value_at(before, path) == _value_at(after, path):
+            continue
+        for entry in entries:
+            _drop(entry.get("fieldsV1") or {}, path)
+        entry = next((e for e in entries if e.get("manager") == manager and e.get("subresource") == subresource), None)
+        if entry is None:
+            entry = {"manager": manager, "operation": "Update", "fieldsV1": {}}
+            if subresource:
+                entry["subresource"] = subresource
+            entries.append(entry)
+        node = entry["fieldsV1"]
+        for key in path:
+            node = node.setdefault(key, {})
+
+
+def _drop(fields, path):
+    if not path or path[0] not in fields:
+        return
+    if len(path) == 1:
+        del fields[path[0]]
+        return
+    _drop(fields[path[0]], path[1:])
+    if not fields[path[0]]:
+        del fields[path[0]]
+
+
 def _deep_merge(base, patch, strategic=False):
     out = copy.deepcopy(base)
     for key, value in patch.items():
@@ -427,7 +481,9 @@ class FakeClient:
             out.append(copy.deepcopy(obj))
         return out[:max_items]
 
-    async def patch(self, kind, name, namespace, body, content_type, dry_run, subresource=None):
+    async def patch(self, kind, name, namespace, body, content_type, dry_run, subresource=None, field_manager="ari-k8s-agent"):
+        """As the API server: `field_manager` (the agent's own unless a test writes as someone else) takes over
+        each field this patch changes in `metadata.managedFields`; a field it leaves as it was keeps its owner."""
         target_kind = kind
         # Recorded as before the generic client: a scale-subresource patch is kind "Scale".
         kind = "Scale" if subresource == "scale" else kind
@@ -442,6 +498,7 @@ class FakeClient:
         merged = _deep_merge(obj, body, strategic="strategic" in content_type)
         if not dry_run:
             merged["metadata"]["generation"] = (obj["metadata"].get("generation") or 0) + 1
+            _take_ownership(obj, merged, body, field_manager, subresource)
             obj.clear()
             obj.update(merged)
             if self.auto_rollout and target_kind == "Deployment":

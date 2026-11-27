@@ -92,8 +92,9 @@ dry-runs a write to that Helm-rendered PVC (denied) and, on
 `data-e2e-disk-0`, a larger storage request (allowed) and an annotation
 (denied: the agent may only raise a PVC's storage request; oncallari 0.3.20). They need oncallari 0.3.19. On the test cluster the agent runs in namespace `insightfinder`
 (`ari-k8s-api` / `ari-k8s-worker`, secret `ari-k8s-secret`) rather than
-`ari-k8s-agent`; only `ari-k8s-e2e`, the fixtures' StorageClass `ari-k8s-e2e-expand` and,
-in `late_protected` and the restart scenarios, the agent's own Deployments are ever changed. Write scenarios belong
+`ari-k8s-agent`; only `ari-k8s-e2e`, the fixtures' StorageClass `ari-k8s-e2e-expand`, the
+PersistentVolume behind `data-e2e-disk-0` (`late_pvc_lost`) and, in
+`late_protected` and the restart scenarios, the agent's own Deployments are ever changed. Write scenarios belong
 here, not on real services: on test, image automation redeploys the
 `insightfinder` namespace many times an hour.
 
@@ -110,7 +111,7 @@ Approvals that arrive late (2026-11-26): each `late_*` scenario proposes,
 changes what one approval-time check compares, then approves; nothing may be
 written, and the worker's log must hold that check's refusal for the task
 (read from the pods of `ARI_WORKER_DEPLOYMENT`, so they need it). There is
-one per check an approval runs; the script's section comment lists the four
+one per check an approval runs; the script's section comment lists the three
 no cluster can reach. What they change meanwhile:
 - Deployments: `e2e-plain` deleted and recreated, an HPA added for it, its
   CPU or memory limit changed, a too-old approval
@@ -132,13 +133,26 @@ no cluster can reach. What they change meanwhile:
   uid), left terminating, grown by hand, given Helm annotations, given an
   extra owner, its StatefulSet given a controlling owner (a ConfigMap stands
   in for the operator), a second StatefulSet `disk` whose claim template
-  makes the same PVC name, the StatefulSet deleted with `--cascade=orphan`.
+  makes the same PVC name, the StatefulSet deleted with `--cascade=orphan`,
+  or the PVC made `Lost` (`late_pvc_lost`: its PV set to `Retain`, then its
+  `claimRef.uid` to another uid; afterwards the PV goes back to `Delete` and
+  is removed with its EBS volume).
   `data-e2e-vol-0` uses the fixtures' own StorageClass `ari-k8s-e2e-expand`,
   which is set to disallow expansion, or deleted and recreated.
 - Done by someone else (`late_already_*`): replicas, a memory limit, an HPA
   minimum, a pod's CPU limit, a PVC's size set by kubectl to exactly what the
   pending proposal asks for; each approval is refused, never reported as the
   agent's change.
+- `retry_done_by_someone_else`: a retried step that finds the approved value
+  in place counts it as its own only when the agent's field manager
+  (`ari-k8s-agent`) owns the field. A ResourceQuota (`e2e-retry-quota`,
+  `requests.storage` 1Mi) makes the first attempt's growth of
+  `data-e2e-disk-0` fail at the API; in the 10 s before the retry the quota is
+  deleted and kubectl grows the PVC to the approved 2Gi. The retry must refuse
+  (done by someone else) and the size stay owned by kubectl.
+  `worker_restart` and `late_delete_pod_retry` are the other side: the agent's
+  own write, then a retry that reports it done (`worker_restart` also requires
+  `applied.field_manager` `ari-k8s-agent`).
 - `late_protected` adds `ari-k8s-e2e/e2e-plain` and `ari-k8s-e2e/e2e-disk` to
   the worker's `K8S_AGENT_PROTECTED_WORKLOADS` with `kubectl set env` (the
   worker restarts) and puts the original value back afterwards; the next Helm

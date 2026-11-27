@@ -82,7 +82,17 @@ UIE (`ran`).
   step fails; the reason says "it already holds what was approved, done by someone else, not this agent"),
   never reported as this agent's change. Only a retried attempt of the step, after its own first attempt may
   have written (the worker was lost), finds the change in place and verifies it: `applied.already_at_target`
-  is true. A restart cannot be done by someone else: its approved `restartedAt` is the proposal's own.
+  is true. Since 2026-11-27 that retry asks the cluster who set it: every field the change sets (replicas, the
+  container's requests/limits, `minReplicas`/`maxReplicas`/`minReplicaCount`/`maxReplicaCount`, the pod's
+  resources, the PVC's `requests.storage`) must be owned by this agent's field manager `ari-k8s-agent` in
+  `metadata.managedFields` (shared ownership counts); then `applied.field_manager` is `ari-k8s-agent`. Owned
+  only by another manager (`kubectl-patch`, `kubectl-edit`, ...) it is refused as done by someone else; with no
+  owner on record it is refused as undecidable ("records no field manager for it"; that refusal does not say
+  nothing was changed). A write that errored but left the target at the approved values is judged the same
+  way. A pod delete leaves no owner to read, so a retried delete still counts an already-gone pod as its own;
+  to keep that retry for a lost worker only, a delete step that fails before its DELETE is sent ends there
+  (refused, "failed before its change was sent ... It is not retried"), and the person asks again.
+  A restart cannot be done by someone else: its approved `restartedAt` is the proposal's own.
 - An approval is not applied (the step fails, nothing is written) when its target has become protected, when
   its kind is no longer changed (a StatefulSet or DaemonSet restart, or a delete of such a pod, proposed before
   2026-11-26), for an action that no longer exists, when the proposal is older than `proposal_max_age_hours`,
@@ -340,6 +350,11 @@ Recorded for their owners; not changed from this repository.
   step's own write still verifies and sets `already_at_target`. Refusals at approval are no longer retried by
   the worker (one attempt, not two). The too-old refusal states ages as "40 seconds", "12 minutes", "25.5
   hours". No field added or removed; such an approval now ends as a failed task with no `action_result`.
+- **2026-11-27, II-25740** — a retried apply step that finds the approved values in place reports them as its
+  own (`already_at_target`) only when the agent's field manager owns the fields it changes; otherwise refused
+  (done by someone else, or undecidable with no owner on record). New `applied.field_manager` on such a result.
+  `apply_approved_change` reads `managedFields` (get on the objects it already reads; no new RBAC). A
+  `delete_pod` step that fails before the DELETE is sent is no longer retried (refused). Additive.
 - **2026-11-26, II-25740** — lowering CPU/memory (`set_resources`, `resize_pod`): a memory decrease below 1.2 x the
   container's current usage, or with no usage to read, is refused, at proposal and at approval; any decrease is
   `high`; `set_resources` under Recreate is `high`. `propose_change` and `apply_approved_change` read

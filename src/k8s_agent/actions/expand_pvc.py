@@ -354,6 +354,14 @@ class ExpandPvc(ActionSpec):
         asked, target = _bytes(pvc.get("requested")), _bytes(action.get("storage"))
         return pvc.get("uid") == action.get("pvc_uid") and asked is not None and target is not None and asked >= target
 
+    def written_fields(self, action, proposal):
+        return {
+            "kind": "PersistentVolumeClaim",
+            "namespace": action.get("namespace"),
+            "name": action["pvc"],
+            "paths": [["f:spec", "f:resources", "f:requests", "f:storage"]],
+        }
+
     def verify_target(self, action):
         return {"kind": "pvc_expanded", "pvc": action["pvc"], "storage": action["storage"]}
 

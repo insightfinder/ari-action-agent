@@ -742,6 +742,20 @@ async def test_autoscaler_bounds_someone_else_already_set_are_not_reported_as_ap
 
 
 @pytest.mark.asyncio
+async def test_a_retry_refuses_autoscaler_bounds_someone_else_set(cluster):
+    from common.capabilities_base import StepRefused
+    from k8s_agent.tools.client import PATCH_MERGE
+
+    pa = await _proposal(
+        cluster, "set the KEDA max replicas to 10 for worker",
+        _change(action="set_autoscaler_bounds", max=10, max_quote="max replicas to 10"), "worker",
+    )
+    await cluster.patch("ScaledObject", "worker-so", "shop", {"spec": {"maxReplicaCount": 10}}, PATCH_MERGE, False, field_manager="kubectl-patch")
+    with pytest.raises(StepRefused, match="done by someone else"):
+        await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True, attempt=2))
+
+
+@pytest.mark.asyncio
 async def test_resources_someone_else_already_set_are_not_reported_as_applied(cluster):
     from common.capabilities_base import StepRefused
 
@@ -756,6 +770,43 @@ async def test_resources_someone_else_already_set_are_not_reported_as_applied(cl
     with pytest.raises(StepRefused, match="container app resources changed since the proposal; it already holds what was approved"):
         await apply_approved_change.run(ctx)
     assert not [p for p in cluster.patches if not p["dry_run"]]
+
+
+@pytest.mark.asyncio
+async def test_a_retry_tells_its_own_resource_change_from_someone_elses(cluster):
+    """Attempt 2 finds the memory limit at 3Gi: done when this agent's manager set it, refused when kubectl did."""
+    from common.capabilities_base import StepRefused
+    from k8s_agent.tools.client import PATCH_STRATEGIC
+
+    pa = await _proposal(
+        cluster, "set memory limit to 3Gi on checkout",
+        _change(action="set_resources", container="app", resources={"limits": {"memory": {"value": "3Gi", "quote": "limit to 3Gi"}}}),
+        "checkout",
+    )
+    body = {"spec": {"template": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": "3Gi"}}}]}}}}
+    await cluster.patch("Deployment", "checkout", "shop", body, PATCH_STRATEGIC, False, field_manager="kubectl-edit")
+    with pytest.raises(StepRefused, match="done by someone else"):
+        await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True, attempt=2))
+
+    dep = next(d for d in cluster.objects["Deployment"] if d["metadata"]["name"] == "checkout")
+    dep["metadata"]["managedFields"] = []
+    cluster.auto_rollout = True
+    await cluster.patch("Deployment", "checkout", "shop", {"spec": {"template": {"spec": {"containers": [
+        {"name": "app", "resources": {"limits": {"memory": "2Gi"}}}]}}}}, PATCH_STRATEGIC, False, field_manager="kubectl-edit")
+    await cluster.patch("Deployment", "checkout", "shop", body, PATCH_STRATEGIC, False)  # this agent's own write
+    again = (await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True, attempt=2)))["action_result"]
+    assert again["applied"]["already_at_target"] is True and again["applied"]["field_manager"] == "ari-k8s-agent"
+
+
+def test_only_the_resource_values_the_change_alters_are_checked_for_their_owner():
+    from k8s_agent.actions.set_resources import changed_resource_paths
+
+    paths = changed_resource_paths(
+        ["f:spec"], "app",
+        {"limits": {"memory": "3Gi", "cpu": "500m"}, "requests": {"cpu": "0.25"}},
+        {"limits": {"memory": "3072Mi", "cpu": "1"}, "requests": {"cpu": "250m"}},
+    )
+    assert paths == [["f:spec", "f:containers", 'k:{"name":"app"}', "f:resources", "f:limits", "f:cpu"]]
 
 
 @pytest.mark.asyncio

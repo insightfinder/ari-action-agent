@@ -7169,3 +7169,54 @@ fine. `ARI_BASE_URL` can now be the API server's service proxy
 port-forward URL still works. Docs: script docstring, e2e README. Verified: tests/test_k8s_live_script.py 72
 passed (3.12); live on test through the proxy: `card`, `auth`, `resume_after_restart` (API restarted, approval
 COMPLETED in 63 s) all passed. Not yet a full run through the proxy.
+
+**`late_pvc_lost` live; a retry tells its own write from someone else's by field owner (2026-11-27).**
+- `late_pvc_lost` (live script): a Bound PVC can leave Bound only for `Lost`, which the earlier "no cluster can
+  reach" list wrongly ruled out. The scenario sets the PV of `data-e2e-disk-0` to `Retain`, then its
+  `claimRef.uid` to a random uid: the PV controller marks the PVC `Lost` (ClaimMisbound) and the PV `Released`.
+  The approval must be refused; afterwards the PV goes back to `Delete` and is removed with its EBS volume
+  (`kubectl wait --for=delete pv`), and the disk is recreated at 1Gi. Live on test through `kubectl proxy`: PASS,
+  "PVC data-e2e-disk-0 is Lost now, not Bound", size untouched; old PV gone, new PVC Bound 1Gi. Unreachable list
+  now three (withdrawn kind, resizePolicy change, in-place resize going away) plus the same-name pod case. The
+  README's change scope adds that PV.
+- Residual case closed for patches (user, 2026-11-27): attempt 1 failed before writing and someone made the same
+  change before the retry used to be reported as applied. `apply_approved_change` now asks, on attempt 2+, who
+  owns the fields the change sets (`ActionSpec.written_fields`, new read tool `get_field_owners`, module
+  `tools/ownership.py`): done only when `ari-k8s-agent` is among the owners of every changed field; another
+  manager -> refused ("done by someone else"); no owner on record -> refused as undecidable (its own wording,
+  without "Nothing was changed"). The write-error branch uses it too (someone else's write landed, ours errored ->
+  refused). Attempt 1 still refuses any at-target state (the attempt gate stays: ownership has no per-task
+  identity, and the scale subresource's entry has no `time`). Delete has no owner to read: a retried delete still
+  counts a gone pod as its own, so (user, 2026-11-27) a delete step that fails before the DELETE is sent is not
+  retried: `ActionSpec.retry_before_write` (False for delete_pod) turns any non-refusal error from the pre-write
+  part (`_before_write`: rebuild the action, re-read, drift, owners, age) into `StepRefused` ("failed before its
+  change was sent ... It is not retried"). Reads already retry transient errors 3 times inside. Only a lost worker
+  (timeout), which may have sent the DELETE, reaches the retry; the hole left is a worker dying just before the
+  DELETE plus someone deleting that pod within the 10 s backoff. Tests: delete refused on a failed read (mutation:
+  flag True -> fails), a patch's pre-write failure stays retryable. Not exercised live (no clean way to make the
+  pre-write read fail on test); `late_delete_pod_retry` stays the live check of the lost-worker side.
+  Remaining hole for patches: two approved proposals of the same change, where the second one's attempt 1 fails
+  before writing and the first is applied before its retry (the retry then sees this agent's own manager).
+- Checked on test before coding: a write that changes a value moves the field to the writer's manager; a no-op
+  write leaves it (kubectl, scale subresource and plain patch). The agent's real writes (scale, keda_max, hpa_min,
+  slow_start, resize_pod, expand_pvc, dumped right after each approval) are recorded exactly at the paths
+  `written_fields` returns: `f:spec.f:replicas` (subresource scale), `f:spec.f:maxReplicaCount`,
+  `f:spec.f:minReplicas`, `f:spec.f:template.f:spec.f:containers.k:{"name":"app"}.f:resources.f:limits.f:memory`,
+  the pod's `f:spec.f:containers.k:{"name":"app"}.f:resources.f:limits.f:cpu` (subresource resize),
+  `f:spec.f:resources.f:requests.f:storage`. All 6 scenarios passed; fixtures restored (disk recreated at 1Gi).
+- Tests: the fake cluster models ownership (`field_manager` on `patch`, moved only when a value changes); new
+  tests for kubectl-owned retries of scale/resources/bounds/resize/PVC, shared ownership, no owner, the
+  write-error branch both ways, `changed_resource_paths`, and `tools/ownership`. Mutation (gate removed): all 7
+  new refusal tests fail or hang. Suite on 3.12: 1492 passed, 11 skipped. No new lint findings.
+- New live scenario `retry_done_by_someone_else` (ResourceQuota `e2e-retry-quota` makes attempt 1's PVC growth
+  fail at the API; in the 10 s backoff the quota goes and kubectl grows the PVC to 2Gi; the retry must refuse).
+  Baseline on the deployed image (2611261446-test, before this change): FAIL as expected, the residual case
+  reproduced live: kubectl grew the PVC 9 s after the approval, the size stayed owned by `kubectl-patch`, and
+  the task still ended COMPLETED (reported as the agent's change). Must pass once this code is deployed.
+  `worker_restart` now also requires `applied.field_manager == "ari-k8s-agent"` (fails on the old image).
+  A failed ownership read on a retry is refused with its own wording ("who set it could not be read"); in the
+  write-error branch it leaves the write's own outcome (tests for both). RBAC: the agent's ServiceAccount can
+  get all five kinds (`kubectl auth can-i`, test). Live coverage after deploy will be: agent-owned branch via
+  `worker_restart` (set_resources), other-owned via `retry_done_by_someone_else` (PVC); scale, bounds and
+  resize decisions are unit-tested only. Docs: K8S_AGENT_INTERFACE.md (rule, `applied.field_manager`, change
+  log), e2e README.
