@@ -50,7 +50,7 @@ DECISIONS = [
 ]
 APPROVE, DECLINE, SHOW_DIFF, FOLLOW_UP, LATER = range(len(DECISIONS))
 
-PROVIDERS = ["anthropic", "openai", "other"]
+PROVIDERS = ["anthropic", "openai", "moonshotai", "other"]
 CLEAR = "-"
 
 ARTIFACT_HINTS = {"root_cause": "root cause found", "pull_request": "pull request opened"}

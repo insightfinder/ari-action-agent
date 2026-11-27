@@ -41,6 +41,11 @@ from common.redaction import redact_secrets
 _TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 _MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 
+# Kimi (Moonshot AI, international platform). The id matches opencode's
+# provider id, so the same `llm` block drives both this client and opencode.
+MOONSHOT_PROVIDER = "moonshotai"
+MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
+
 
 class LLMProviderError(RuntimeError):
     """A provider's error response, worded so that it carries no part of the API key."""
@@ -62,6 +67,8 @@ async def complete(llm: dict, system_prompt: str, user_prompt: str) -> str:
         call = _openai_complete
     elif provider == "anthropic":
         call = _anthropic_complete
+    elif provider == MOONSHOT_PROVIDER:
+        call = _moonshot_complete
     else:
         raise ValueError(f"Unsupported llm.provider: {provider!r}")
 
@@ -138,6 +145,28 @@ async def _anthropic_complete(llm: dict, system_prompt: str, user_prompt: str) -
     return text, _anthropic_usage(response)
 
 
+async def _moonshot_complete(llm: dict, system_prompt: str, user_prompt: str) -> tuple[str, dict]:
+    """Chat Completions, the interface opencode's own Kimi provider
+    (`@ai-sdk/openai-compatible`) uses too, so ARI's calls and opencode's
+    reach Moonshot the same way."""
+    client = AsyncOpenAI(
+        api_key=llm["api_key"],
+        base_url=llm.get("base_url") or MOONSHOT_BASE_URL,
+        timeout=_TIMEOUT_SECONDS,
+        max_retries=_MAX_RETRIES,
+    )
+    response = await client.chat.completions.create(
+        model=llm["model"],
+        max_tokens=llm.get("max_tokens", 4096),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    text = (response.choices[0].message.content or "") if response.choices else ""
+    return text, _chat_completions_usage(response)
+
+
 def _openai_usage(response) -> dict:
     """OpenAI's input_tokens already include cached ones."""
     usage = getattr(response, "usage", None)
@@ -147,6 +176,20 @@ def _openai_usage(response) -> dict:
         "input_tokens": getattr(usage, "input_tokens", 0) or 0,
         "output_tokens": getattr(usage, "output_tokens", 0) or 0,
         "cache_read": getattr(details, "cached_tokens", 0) or 0,
+        "cache_write": 0,
+    }
+
+
+def _chat_completions_usage(response) -> dict:
+    """Chat Completions' prompt_tokens already include cached ones."""
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "prompt_tokens_details", None)
+    cache_read = getattr(details, "cached_tokens", None) or getattr(usage, "cached_tokens", 0) or 0
+    return {
+        "model": getattr(response, "model", None),
+        "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        "cache_read": cache_read,
         "cache_write": 0,
     }
 

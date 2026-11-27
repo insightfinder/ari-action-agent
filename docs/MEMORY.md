@@ -7339,3 +7339,41 @@ Before this, the reply showed the limits and a request with `<value>` left for a
   64Mi suggestion and its request) and `startup_probe` PASS (both proposed from "give deployment X ... 2 minutes to
   start", approved, `succeeded` in about 125 s, 24 x 5s; fixtures recreated afterwards). Pods of the earlier
   manual runs stay Terminating on NotReady nodes (node issue on test, not touched).
+
+---
+
+## 2026-11-27 - Kimi (Moonshot AI) as an LLM provider (II-25490)
+
+A request can now carry `"llm": {"provider": "moonshotai", "api_key": ..., "model": "kimi-k3.1-pro"}`.
+Only the international platform (`https://api.moonshot.ai/v1`) is supported; the China
+platform (`moonshotai-cn`, `api.moonshot.cn`) is out of scope by decision.
+
+**The provider id is `moonshotai` on purpose.** It is the id opencode uses for Kimi (the
+models.dev catalog: `moonshotai`, `@ai-sdk/openai-compatible`, `https://api.moonshot.ai/v1`),
+and opencode is launched with `--model <provider>/<model>` and gets
+`provider.<provider>.options.apiKey` in its per-request opencode.json. With the same id, the
+opencode side needs no code change at all. A friendlier alias such as `kimi` would have had to
+be translated in every place that builds that config, so there is none.
+
+**Why a branch of its own, not `openai` with a `base_url`.** `_openai_complete` calls the Responses
+API. The Kimi platform documents Responses too, but opencode reaches Kimi through Chat Completions
+(`@ai-sdk/openai-compatible`), so ARI uses the same interface. `common/llm/client.py` has its own
+`_moonshot_complete`: the same `AsyncOpenAI` SDK with this
+module's timeout and retry overrides, `chat.completions.create` with a system and a user
+message, `max_tokens` from `llm.max_tokens` (default 4096, as for Anthropic), and
+`base_url` falling back to the international endpoint. A `base_url` in the request still wins.
+Errors go through the existing `_provider_error`, so a 401 reads
+`moonshotai rejected the API key (HTTP 401)` with no part of the key in it. Token usage is mapped
+from `prompt_tokens` / `completion_tokens`, and cached tokens are read from
+`prompt_tokens_details.cached_tokens` or a top-level `cached_tokens`.
+
+Other places that enumerate providers: `k8s_agent/schemas.py` (a `Literal`, so it would have
+rejected the request), the chat gateway's `DEFAULT_MODELS` (`kimi-k3.1-pro`), and the `ari setup`
+provider list. Adding `moonshotai` there moved "other" from option 3 to option 4, which is why
+`test_setup_refuses_an_unnamed_or_modelless_other_provider` types `4` now.
+
+**Not verified yet.** Unit tests were added in `tests/test_llm_client.py`,
+`tests/test_chat_gateway_config.py` and `tests/test_ari_cli_chat_decisions.py`, with the SDK mocked.
+Still open, to be checked on the test environment with a real Kimi key: that opencode 1.18.31 in
+the worker image resolves `moonshotai/kimi-k3.1-pro`, and that 4096 output tokens is enough for a Kimi
+model that reasons before it answers.

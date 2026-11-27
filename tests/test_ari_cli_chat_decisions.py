@@ -194,13 +194,21 @@ def test_enter_through_setup_keeps_an_openai_configuration(first_run, tmp_path):
 
 
 def test_setup_refuses_an_unnamed_or_modelless_other_provider(first_run, tmp_path):
-    result = runner.invoke(cli.app, ["setup"], input=setup_input("http://agent.test", "k", "3", "", "", "sk-new", "", "", ""))
+    result = runner.invoke(cli.app, ["setup"], input=setup_input("http://agent.test", "k", "4", "", "", "sk-new", "", "", ""))
     assert result.exit_code == 1
     assert "an LLM provider name is required" in result.output
-    result = runner.invoke(cli.app, ["setup"], input=setup_input("http://agent.test", "k", "3", "azure", "", "sk-new", "", "", ""))
+    result = runner.invoke(cli.app, ["setup"], input=setup_input("http://agent.test", "k", "4", "azure", "", "sk-new", "", "", ""))
     assert result.exit_code == 1
     assert "LLM_MODEL is not set" in result.output
     assert not (tmp_path / "config.toml").exists()
+
+
+def test_setup_offers_kimi_and_fills_in_its_default_model(first_run, tmp_path):
+    result = runner.invoke(cli.app, ["setup"], input=setup_input("http://agent.test", "k", "3", "", "sk-kimi", "", "", ""))
+    assert result.exit_code == 0, result.output
+    saved = cli.read_config_file(tmp_path / "config.toml")
+    assert saved["llm_provider"] == "moonshotai"
+    assert saved["llm_model"] == "kimi-k3.1-pro"
 
 
 def test_setup_refuses_an_agent_url_without_a_scheme(first_run, tmp_path):

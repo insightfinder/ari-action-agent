@@ -28,7 +28,7 @@ The first time, `ari` walks you through a short setup:
 |---|---|
 | Agent URL | where the agent answers, e.g. `https://ari.example.com` |
 | Agent API key | one of the agent's `AGENT_API_KEYS` |
-| LLM provider and model | the model the agent uses for your requests (`anthropic`, `openai`, or another provider the agent supports) |
+| LLM provider and model | the model the agent uses for your requests (`anthropic`, `openai`, `moonshotai` for Kimi, or another provider the agent supports) |
 | LLM API key | your key for that provider |
 | GitHub token | needed to push branches and open pull requests |
 | Default repository and branch | optional; you can also set them per conversation |
