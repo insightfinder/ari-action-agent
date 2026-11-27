@@ -7325,3 +7325,11 @@ Before this, the reply showed the limits and a request with `<value>` left for a
   `suggestion.pattern` `early` (< 1 h, `LONG_RUN_SECONDS`) keeps the "first step" note; `long_run` says it looks
   like a leak or growth that a larger limit only delays. 2 new tests (1534 passed on 3.12). Live read-only:
   e2e-oom and e2e-memhungry are `early`.
+- Commit security review (automated) on ff14ba9: the probe check fingerprint was a plain truncated sha256, shown in
+  proposals and health findings, so a low-entropy password in an exec check could be guessed offline against it.
+  Fixed: `views.probe_digest` is HMAC-SHA256 keyed with a key derived from the worker's
+  `TEMPORAL_PAYLOAD_ENCRYPTION_KEY` (in `ari-k8s-secret` on test); without the key there is no fingerprint and
+  `set_startup_probe` refuses to add a probe (it could not tell at approval whether the check changed); health
+  findings no longer carry the fingerprint. Rotating that key makes pending add-a-probe approvals refuse as drift
+  (conservative). Tests: keyed (differs by key, not the plain hash), no key -> refused, no digest in findings;
+  suite 1536 passed on 3.12.

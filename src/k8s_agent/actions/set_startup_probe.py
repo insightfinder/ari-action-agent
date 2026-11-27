@@ -86,8 +86,14 @@ class SetStartupProbe(DeploymentAction):
                 "probe: no probe restarts it, so more time to start would change nothing, and this agent never makes "
                 "up a check for a new probe. Nothing was proposed."
             )
-        if source and not probes[source].get("check_digest"):
+        if source and not probes[source].get("handler"):
             return None, refusal(f"The {source} probe of container {name} has no check to copy. Nothing was proposed.")
+        if source and not probes[source].get("check_digest"):
+            # Without its key the agent cannot tell at approval whether the check it would copy changed.
+            return None, refusal(
+                "This agent cannot add a startup probe here: the key it fingerprints the copied check with "
+                "(TEMPORAL_PAYLOAD_ENCRYPTION_KEY) is not set. Nothing was proposed."
+            )
 
         period, threshold, requested, refused = self._requested(ctx, change, startup, probes[source] if source else None)
         if refused:

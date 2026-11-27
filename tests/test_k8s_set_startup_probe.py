@@ -21,7 +21,7 @@ import test_k8s_change_actions as ca  # noqa: E402
 from test_k8s_capabilities import _change  # noqa: E402
 
 from common.capabilities_base import StepRefused  # noqa: E402
-from k8s_agent.tools import policy  # noqa: E402
+from k8s_agent.tools import policy, views  # noqa: E402
 
 LIVENESS = {"exec": {"command": ["sh", "-c", f"curl -f --user admin:{fx.CANARY} localhost:15672/health"]}, "periodSeconds": 30,
             "failureThreshold": 6, "initialDelaySeconds": 120, "timeoutSeconds": 20}
@@ -29,6 +29,8 @@ LIVENESS = {"exec": {"command": ["sh", "-c", f"curl -f --user admin:{fx.CANARY} 
 
 @pytest.fixture
 def cluster(monkeypatch):
+    # The worker's key for check fingerprints (its payload encryption key); not set in unit tests otherwise.
+    monkeypatch.setattr(views, "_digest_key", lambda: b"k" * 32)
     return ca.build_cluster(monkeypatch)
 
 
@@ -200,3 +202,29 @@ async def test_the_write_itself_refuses_a_check_that_changed_after_the_re_check(
     _container(cluster)["livenessProbe"]["exec"]["command"] = ["true"]
     with pytest.raises(RuntimeError, match="changed since the proposal, so it was not copied"):
         await spec.build_operations(cluster, spec.patch_action(pa))
+
+
+def test_the_fingerprint_is_keyed():
+    probe = {"exec": {"command": ["redis-cli", "-a", "secret", "ping"]}}
+    import hashlib
+
+    plain = hashlib.sha256(json.dumps(views.probe_check(probe), sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    original = views._digest_key
+    try:
+        views._digest_key = lambda: b"a" * 32
+        a = views.probe_digest(probe)
+        views._digest_key = lambda: b"b" * 32
+        b = views.probe_digest(probe)
+        views._digest_key = lambda: None
+        none = views.probe_digest(probe)
+    finally:
+        views._digest_key = original
+    assert a and b and a != b and plain not in (a, b) and none is None
+
+
+@pytest.mark.asyncio
+async def test_without_the_key_no_check_is_copied(cluster, monkeypatch):
+    _no_startup_probe(cluster)
+    monkeypatch.setattr(views, "_digest_key", lambda: None)
+    result = await ca._propose("give checkout 20 minutes to start", _time("20 minutes"))
+    assert "TEMPORAL_PAYLOAD_ENCRYPTION_KEY" in result["refusal"]["reason"] and not cluster.patches
