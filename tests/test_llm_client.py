@@ -64,6 +64,95 @@ async def test_anthropic_complete_uses_messages_api_and_concatenates_text_blocks
     assert result == "hello world"
 
 
+def _chat_completion(content, usage=None):
+    message = SimpleNamespace(content=content)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)], model="kimi-k3.1-pro", usage=usage)
+
+
+def _fake_moonshot(response):
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=response))))
+
+
+@pytest.mark.asyncio
+async def test_moonshot_complete_uses_chat_completions_on_the_international_endpoint():
+    fake_client = _fake_moonshot(_chat_completion("the plan"))
+
+    with patch.object(llm_client, "AsyncOpenAI", return_value=fake_client) as ctor:
+        result = await llm_client.complete(
+            {"provider": "moonshotai", "api_key": "sk-kimi", "model": "kimi-k3.1-pro"},
+            "system prompt",
+            "user prompt",
+        )
+
+    ctor.assert_called_once_with(
+        api_key="sk-kimi",
+        base_url="https://api.moonshot.ai/v1",
+        timeout=llm_client._TIMEOUT_SECONDS,
+        max_retries=llm_client._MAX_RETRIES,
+    )
+    fake_client.chat.completions.create.assert_awaited_once_with(
+        model="kimi-k3.1-pro",
+        max_tokens=4096,
+        messages=[
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "user prompt"},
+        ],
+    )
+    assert result == "the plan"
+
+
+@pytest.mark.asyncio
+async def test_moonshot_honours_a_base_url_override_and_a_mixed_case_provider():
+    fake_client = _fake_moonshot(_chat_completion("ok"))
+
+    with patch.object(llm_client, "AsyncOpenAI", return_value=fake_client) as ctor:
+        await llm_client.complete(
+            {"provider": "MoonshotAI", "api_key": "k", "model": "kimi-k3.1-pro", "base_url": "https://llm-proxy.test/v1"},
+            "s",
+            "u",
+        )
+
+    assert ctor.call_args.kwargs["base_url"] == "https://llm-proxy.test/v1"
+
+
+@pytest.mark.asyncio
+async def test_moonshot_with_no_content_returns_empty_text_instead_of_none():
+    with patch.object(llm_client, "AsyncOpenAI", return_value=_fake_moonshot(_chat_completion(None))):
+        assert await llm_client.complete({"provider": "moonshotai", "api_key": "k", "model": "m"}, "s", "u") == ""
+    with patch.object(llm_client, "AsyncOpenAI", return_value=_fake_moonshot(SimpleNamespace(choices=[]))):
+        assert await llm_client.complete({"provider": "moonshotai", "api_key": "k", "model": "m"}, "s", "u") == ""
+
+
+def test_chat_completions_usage_maps_prompt_and_completion_tokens():
+    usage = SimpleNamespace(prompt_tokens=120, completion_tokens=30, prompt_tokens_details=None, cached_tokens=100)
+    assert llm_client._chat_completions_usage(_chat_completion("x", usage)) == {
+        "model": "kimi-k3.1-pro",
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "cache_read": 100,
+        "cache_write": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_moonshot_key_names_the_provider_and_no_key():
+    exc = _status_error(openai.AuthenticationError, 401, "Invalid Authentication: sk-kimi-abcdefgh")
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(side_effect=exc))))
+    with patch.object(llm_client, "AsyncOpenAI", return_value=fake):
+        with pytest.raises(llm_client.LLMProviderError) as raised:
+            await llm_client.complete({"provider": "moonshotai", "api_key": "sk-kimi", "model": "m"}, "s", "u")
+
+    assert str(raised.value) == "moonshotai rejected the API key (HTTP 401)"
+
+
+def test_every_agent_kinds_llm_schema_accepts_moonshotai():
+    from ari_oncall_agent.schemas import LLMConfig as OncallLLMConfig
+    from k8s_agent.schemas import LLMConfig as K8sLLMConfig
+
+    for schema in (OncallLLMConfig, K8sLLMConfig):
+        assert schema(provider="moonshotai", api_key="k", model="kimi-k3.1-pro").provider == "moonshotai"
+
+
 @pytest.mark.asyncio
 async def test_unsupported_provider_raises():
     with pytest.raises(ValueError, match="Unsupported llm.provider"):

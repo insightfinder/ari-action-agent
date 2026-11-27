@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_MODELS = {"openai": "gpt-4o-mini", "anthropic": "claude-haiku-4-5"}
+DEFAULT_MODELS = {"openai": "gpt-4o-mini", "anthropic": "claude-haiku-4-5", "moonshotai": "kimi-k3.1-pro"}
 
 INTERACTIVE_LANE = "interactive"
 

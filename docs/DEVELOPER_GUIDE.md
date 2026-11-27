@@ -237,7 +237,7 @@ agent's own contract for what it expects inside one `DataPart`.
     "ssh_key": "-----BEGIN..."  // optional, alternative to pat
   },
   "llm": {
-    "provider": "openai",       // or "anthropic"
+    "provider": "openai",       // or "anthropic", or "moonshotai" (Kimi)
     "api_key": "sk-...",
     "model": "gpt-5-mini",
     "base_url": null            // optional override
