@@ -39,6 +39,10 @@ live cluster, so a request it will refuse still gets a reply that says why.
 - **Results.** Every applied change's `action_result` has `kubernetes_change: true`, whatever its `action`.
   `query_result` rows are data only (the reply text summarises them). The task's status message is written for
   people; the artifacts are for programs.
+- **Scope of the reply.** The reply text covers only what the agent found, did, proposed or refused and what it
+  can do. For a request it does not handle (a node, a StatefulSet restart, a Secret, a Deployment deletion) it says
+  so and that nothing was proposed; it suggests no commands, tools or other ways to make the change. The
+  persistence hint (where a change lives in Git) is part of its own output and stays.
 
 ## Request
 
@@ -456,6 +460,9 @@ Recorded for their owners; not changed from this repository.
   disk or start time beyond the agent's limits no longer says to change it in Git, and a Helm/Flux-rendered PVC says
   its size is set in Git rather than telling the reader to change it there (user: say nothing beyond the agent's
   scope). Text only; no field changed.
+- **2026-11-27, II-25740** — the reply text no longer suggests kubectl, CI, GitOps or other ways to do what the
+  agent does not do, also for a request that ran no steps (a node or Secret request); found live after the refusal
+  change, where the reply model still added such advice. Text only; no field changed.
 - **2026-11-27, II-25740** — new sections "Capabilities" and "Behaviour a caller relies on" (what the agent reads,
   proposes and refuses; request values, approval, timing and results), from the ARI chat e2e. Documentation only.
 - **2026-11-27, II-25740** — new action `set_startup_probe` (fields above; `target.kind: "Deployment"`). Callers
