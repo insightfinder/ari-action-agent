@@ -6809,3 +6809,9 @@ Before this, the reply showed the limits and a request with `<value>` left for a
   findings no longer carry the fingerprint. Rotating that key makes pending add-a-probe approvals refuse as drift
   (conservative). Tests: keyed (differs by key, not the plain hash), no key -> refused, no digest in findings;
   suite 1536 passed on 3.12.
+- Live on the deployed images (2611270743-test, api and worker, real model), through kubectl proxy:
+  `health_probe_kills` PASS (e2e-slowstart `CrashLoopBackOff (killed by startup probe)` with the 15s allowance and
+  the previous log, e2e-slowstart-liveness `killed by liveness probe` while starting, e2e-oom `OOMKilled` with the
+  64Mi suggestion and its request) and `startup_probe` PASS (both proposed from "give deployment X ... 2 minutes to
+  start", approved, `succeeded` in about 125 s, 24 x 5s; fixtures recreated afterwards). Pods of the earlier
+  manual runs stay Terminating on NotReady nodes (node issue on test, not touched).
