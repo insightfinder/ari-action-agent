@@ -19,33 +19,26 @@ for a container to start (`set_startup_probe`); growing a StatefulSet claim-temp
 
 Refused, with the reason in the reply and a `refusal` (see "Never" below): changes to StatefulSets, DaemonSets,
 CronJobs, nodes, protected namespaces and workloads; scaling to 0; shrinking a disk or growing a Helm/Flux PVC;
-liveness/readiness probe changes; Secrets; anything without an exact value. A caller's routing text (an agent card
-description, a coordinator prompt) should name these, and send every request about the cluster to the agent,
-including ones it may refuse, rather than answer them itself: it is the agent that knows the cluster's state and
-rules. (Found 2026-11-27: a description naming three changes made a chat answer that restarts and disks were "out
-of scope" and hand out kubectl commands for exactly what the agent refuses.)
+liveness/readiness probe changes; Secrets; anything without an exact value. The agent decides this itself from the
+live cluster, so a request it will refuse still gets a reply that says why.
 
-## Calling it (any caller)
+## Behaviour a caller relies on
 
-- **Request text.** The agent acts only on values the request states, read from its words: pass the person's
-  request with the namespace, the workload and every value exactly as given (sizes and CPU/memory with units, a
-  start time as a duration such as "10 minutes"). Never invent, convert or change a value, and do not retry a
-  refusal with other values; report its reason. A health report ends with the exact request that would get a fix
-  proposed; use it as written. `last_run_seconds` (how long a container ran before it was killed) is not how long
-  it needs to start.
-- **Approval.** A proposal pauses the task (`pending_action`). It is applied only when the caller resumes the task
-  with `confirm_pending_action.id` = that `pending_action.id`; declining is cancelling the task. Forward a person's
-  explicit decision, not a model's reading of it (found 2026-11-27: a chat model answered "reject" itself and the
-  proposal stayed paused), and cancel a proposal that will not be answered any more. A proposal older than
-  `proposal_max_age_hours` is refused when confirmed.
+- **Request text.** The agent acts only on values the request states in its own words (sizes and CPU/memory with
+  units; a start time as a duration such as "10 minutes", also when restated in another unit, "2 minutes (120
+  seconds)"); it never guesses a value and refuses instead. A health report ends with the exact request that would
+  get its fix proposed. `last_run_seconds` is how long a container ran before it was killed, a lower bound of the
+  time it needs to start, not that time.
+- **Approval.** A proposal pauses the task (`pending_action`). It is applied only when the task is resumed with
+  `confirm_pending_action.id` = that `pending_action.id`; cancelling the task declines it. A proposal older than
+  `proposal_max_age_hours` is refused when confirmed. A paused task stays paused until it is confirmed or cancelled.
 - **Timing.** A confirmed change is applied and then verified before the task ends (rollout progress, new pods
-  stable for 45 s, a resize as reported by the kubelet, a disk's capacity): the apply step allows 900 s, so wait at
-  least 960 s after a confirmation. Cancelling after a confirmation stops only the verification, never the change;
-  do not tell anyone that nothing changed (found 2026-11-27: a 300 s wait reported "cancelled" for a change in
-  place).
-- **Results.** Every applied change's `action_result` has `kubernetes_change: true`; recognise changes by it rather
-  than by a list of action names. `query_result` rows are data for the caller to render; never have a model retype
-  them. The agent's status message (the task's reply) is written for people; the artifacts are for programs.
+  stable for 45 s, a resize as the kubelet reports it, a disk's capacity). The apply step allows 900 s; a rolling
+  update of pods that take minutes to start uses most of it. Cancelling the task after a confirmation stops the
+  verification only: a change already written stays.
+- **Results.** Every applied change's `action_result` has `kubernetes_change: true`, whatever its `action`.
+  `query_result` rows are data only (the reply text summarises them). The task's status message is written for
+  people; the artifacts are for programs.
 
 ## Request
 
@@ -233,7 +226,7 @@ nothing that could break a product environment).
   twice; both kinds together, or several sizes without one clear target, are refused); the model is not asked.
 - Only a PVC that a StatefulSet's `volumeClaimTemplates` created (name `<template>-<statefulset>-<ordinal>` of
   a StatefulSet in its namespace, no Helm/Flux/Argo CD label, annotation or field manager, no owner but that
-  StatefulSet or its pod). Anything else is refused with "change the size in Git": checked on test, a
+  StatefulSet or its pod). Anything else is refused (its size is set in Git): checked on test, a
   Helm-rendered PVC grown in the cluster makes the release's next upgrade fail (`field can not be less than
   status.capacity`) and stall until Git catches up; a StatefulSet's claim-template PVC grown the same way did
   not affect its release's upgrade.
@@ -403,10 +396,10 @@ Recorded for their owners; not changed from this repository.
 | Repo | What | Why | Since |
 |---|---|---|---|
 | insightfinder-mcp-service | `app/a2a/client.py`: `KUBERNETES_CHANGE_ACTIONS` hard-codes three action names. Recognise `action_result.kubernetes_change == true` instead (or as well). | New actions would otherwise be missing from the incident digest. Now needed: `resize_pod`, `restart_rollout`, `delete_pod`, `expand_pvc` and `set_startup_probe` ship with II-25740 (`rollback`, `set_image`, pause/resume and the CronJob actions were removed before shipping). | II-25740 |
-| insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only; they should follow "Capabilities" and "Calling it" above (route every request about the cluster to the agent; values verbatim; no retry of a refusal). In chat: forward approve/reject as the person's decision and cancel unanswered proposals; `a2a.timeout_s` at least 960. | ARI chat on test, 2026-11-27: PVC, restart, StatefulSet and Secret requests never reached the agent (kubectl commands instead); a start time was rewritten and retried down to 25 s; a "reject" was answered without the agent; an approved change was reported "cancelled" after 300 s. A change set that fixed all of these was run on test (docs/MEMORY.md, 2026-11-27). | II-25740 |
+| insightfinder-mcp-service | `config/agents/arik8s.yaml` description and `app/oncall/prompt.py` K1–K4 rules describe health checks and three changes only; "Capabilities" and "Behaviour a caller relies on" above list what the agent now reads, proposes and refuses, and how long an approved change takes (up to 900 s; the chat waits 300 s). | ARI chat on test, 2026-11-27 (docs/MEMORY.md): requests the agent handles never reached it, and an approved change still being verified was reported cancelled after 300 s. | II-25740 |
 | test-fluxcd, eks-fluxcd | Set `ariK8sAgent.protection.admissionPolicy: true` in the ari-k8s HelmRelease values (the chart default `auto` silently leaves the policy out on a cluster without the API). | A missing policy should fail the release, not go unnoticed. | II-25740 |
 | eks-fluxcd | When the k8s agent is deployed to stg/prod: check `ariK8sAgent.protection.workloads` against that cluster's names (the defaults are bare names in the release namespace: insightfinder-mcp-service, insightfinder-mcp-service-worker, temporal-*, ari-coordinator) and add whatever runs the approval path there. | The agent and its approval path are protected by name; a name that differs there is not protected. | II-25740 |
-| insightfinder-mcp-service | Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. Do not have a model re-type the rows: 100+ rows exceed its output limit and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
+| insightfinder-mcp-service | Render the `query_result` artifact (`columns`, `column_types`, `rows`) for the user; the agent's text only summarises it. The rows are only in the artifact: 100+ rows exceed a model's output limit, and re-typed rows can be altered. | The stg question returns 127 rows on test's `insightfinder` namespace. | II-25740 |
 | insightfinder-mcp-service | Confirm live that a follow-up chat turn ("in table format") can reach the previous turn's agent result, or that the coordinator calls the agent again. | Screenshot of 2026-11-19 (stg): the coordinator answered from memory. | II-25740 |
 
 ## Change log
@@ -458,8 +451,13 @@ Recorded for their owners; not changed from this repository.
   (done by someone else, or undecidable with no owner on record). New `applied.field_manager` on such a result.
   `apply_approved_change` reads `managedFields` (get on the objects it already reads; no new RBAC). A
   `delete_pod` step that fails before the DELETE is sent is no longer retried (refused). Additive.
-- **2026-11-27, II-25740** — new sections "Capabilities" and "Calling it" (what callers route to the agent, how to
-  pass values, approve, wait and read results), from the ARI chat e2e. Documentation only.
+- **2026-11-27, II-25740** — refusal reasons state only what the agent does and why: protected namespaces and
+  workloads no longer add "use kubectl if a change is really needed", a node change no longer says "Use kubectl", a
+  disk or start time beyond the agent's limits no longer says to change it in Git, and a Helm/Flux-rendered PVC says
+  its size is set in Git rather than telling the reader to change it there (user: say nothing beyond the agent's
+  scope). Text only; no field changed.
+- **2026-11-27, II-25740** — new sections "Capabilities" and "Behaviour a caller relies on" (what the agent reads,
+  proposes and refuses; request values, approval, timing and results), from the ARI chat e2e. Documentation only.
 - **2026-11-27, II-25740** — new action `set_startup_probe` (fields above; `target.kind: "Deployment"`). Callers
   that list change actions by name (mcp-service `KUBERNETES_CHANGE_ACTIONS`) need it; `kubernetes_change: true`
   is set on its `action_result` as on every change.

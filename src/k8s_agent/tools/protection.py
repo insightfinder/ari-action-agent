@@ -63,12 +63,12 @@ def why_protected(namespace: str | None, name: str | None) -> str | None:
     if namespace in protected_namespaces():
         return (
             f"Namespace {namespace} is protected: this agent changes nothing in it (system components). "
-            "Nothing was proposed; use kubectl if a change is really needed."
+            "Nothing was proposed."
         )
     for pattern in protected_workloads():
         if name and namespace and _matches(pattern, namespace, name):
             return (
                 f"{namespace}/{name} is protected: it runs this agent or its approval path ({pattern}), and this "
-                "agent never changes it. Nothing was proposed; use kubectl if a change is really needed."
+                "agent never changes it. Nothing was proposed."
             )
     return None

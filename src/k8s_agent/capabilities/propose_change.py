@@ -225,7 +225,7 @@ async def run(ctx: StepContext) -> dict:
         # Cordon, uncordon and drain were built and then declined (user, 2026-11-25): nodes are only read.
         return refusal(
             f"This agent does not change nodes (cordon, uncordon, drain, labels, taints), so nothing was proposed for "
-            f"node {target.get('name')}. Use kubectl, or ask for a health check of the node."
+            f"node {target.get('name')}. A health check of the node is available."
         )
     if target.get("scope") == "pvc" and target.get("name") and target.get("namespace"):
         return await _propose_pvc(ctx, target)
