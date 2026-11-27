@@ -7369,7 +7369,7 @@ Fixed in this repo (uncommitted at the time of writing):
   place: cpu limit 100m" rolled every pod of e2e-plain instead), and `resize_pod` takes the pod named verbatim in
   the request when the model leaves it out. Suite 1543 passed on 3.12.
 
-mcp-service (branch `II-25740-k8s-agent-capabilities` from origin/main, uncommitted): arik8s.yaml description lists
+mcp-service (branch `II-25740-k8s-agent-capabilities` from origin/main at c12bf93, local only; not committed from here): arik8s.yaml description lists
 every read, change and refusal, and tells the coordinator to call it for anything about the cluster, never give
 kubectl commands for it, pass values verbatim and not retry refused requests with other values; on-call rule K2 the
 same; `is_kubernetes_change` reads `kubernetes_change: true` (and the new action names); `query_result` rows are
@@ -7400,3 +7400,14 @@ fixtures during its rollout (the agent's revert detection was right); rerun foll
   data-e2e-vol-0 recreated at 1Gi), HelmRelease insightfinder resumed and its reconcile annotation removed;
   `flux reconcile` applied revision 0.9.477 and mcp-service and its worker are back on 2611242139-test. Temporary
   Docker Hub tags `mcp-service:ii25740-*` (4) remain to be deleted by someone with delete rights.
+- User decision (2026-11-27): mcp-service is only used here for integration testing, swapped on test for a run;
+  its developers (and any other caller) adapt from this repository's docs, which describe the agent's capabilities
+  and interface for every caller, not one consumer: K8S_AGENT_INTERFACE.md "Capabilities" and "Calling it" (added
+  from the findings above) and its "Needed from other repositories" rows. No per-consumer docs here.
+- Swapping mcp-service on test for a run: build from mcp-service `origin/test` plus the change, linux/amd64, a tag
+  NOT ending in `-test` (the ImagePolicy `^(.*)-test$` would make it the official image; e.g. `ii25740-<time>`);
+  check for conflict markers and run its tests first; push; annotate HelmRelease insightfinder
+  `kustomize.toolkit.fluxcd.io/reconcile=disabled` and suspend it (this pauses every insightfinder deploy on test:
+  keep it to about an hour); `kubectl set image` on insightfinder-mcp-service and -worker; test; then remove the
+  annotation, unsuspend, `flux reconcile helmrelease insightfinder`, and check both run the test-fluxcd `-test`
+  image again. Re-apply the e2e fixtures only after approved rollouts finish.
