@@ -7479,8 +7479,23 @@ rejected the request), the chat gateway's `DEFAULT_MODELS` (`kimi-k3.1-pro`), an
 provider list. Adding `moonshotai` there moved "other" from option 3 to option 4, which is why
 `test_setup_refuses_an_unnamed_or_modelless_other_provider` types `4` now.
 
-**Not verified yet.** Unit tests were added in `tests/test_llm_client.py`,
+**Tests.** Unit tests were added in `tests/test_llm_client.py`,
 `tests/test_chat_gateway_config.py` and `tests/test_ari_cli_chat_decisions.py`, with the SDK mocked.
-Still open, to be checked on the test environment with a real Kimi key: that opencode 1.18.31 in
-the worker image resolves `moonshotai/kimi-k3.1-pro`, and that 4096 output tokens is enough for a Kimi
-model that reasons before it answers.
+
+**Verified on test, 2026-11-27,** images `2611270935-test` (deployed by Flux), against
+`https://test-ari-oncall-agent.insightfinder.com` with a real Kimi key and `kimi-k3.1-pro`:
+
+- A plain question (task `8129cf70`) completed in about 20 s with a correct two-sentence answer.
+  The planner and `respond` both go through `_moonshot_complete`; the image before this change
+  would have failed with `Unsupported llm.provider`. 4096 output tokens was enough here.
+- A one-line README edit on `octocat/Hello-World` with `skip_tests` and no PAT (task `4085f8be`):
+  `clone_repo` and `generate_change` succeeded and produced the expected diff, so opencode 1.18.31
+  in the worker image resolves `moonshotai/kimi-k3.1-pro` with no custom provider block. The run
+  then failed in `propose_pr`, as expected without a PAT. Its reported error was `git commit` with
+  no detail, not the push. The worker log shows why: attempt 1 committed and then failed with
+  `git push failed: fatal: could not read Username for 'https://github.com'`; attempts 2 and 3
+  (`max_attempts: 3`) found nothing left to commit, which git reports on stdout, so they failed with
+  an empty `git commit failed: `. Temporal keeps only the last attempt's failure, so the push error
+  is visible only in the worker log. Unrelated to Kimi and left as it is.
+- Both workflows' inputs in the Temporal UI show `"provider": "moonshotai"`,
+  `"model": "kimi-k3.1-pro"`, with the key stored as `enc:v1:...`.
