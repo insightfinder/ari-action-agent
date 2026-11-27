@@ -7220,3 +7220,16 @@ COMPLETED in 63 s) all passed. Not yet a full run through the proxy.
   `worker_restart` (set_resources), other-owned via `retry_done_by_someone_else` (PVC); scale, bounds and
   resize decisions are unit-tested only. Docs: K8S_AGENT_INTERFACE.md (rule, `applied.field_manager`, change
   log), e2e README.
+- Full run on the deployed images (2611270245-test, both api and worker), all through `kubectl proxy`, no
+  port-forward: every registered scenario passed. The first pass got 54 passes, then the session ended and
+  killed it; resumed with nohup for 3 more (`late_delete_pod_retry`, `retry_done_by_someone_else`: refused,
+  owner `kubectl-patch`; `late_delete_pod_orphaned`). During the resume, node ip-10-1-19-82 went NotReady with
+  a worker pod stuck Terminating on it; `kubectl logs -l` then failed for that pod and 7 scenarios that read
+  worker logs failed (not the agent's fault). Fix in the live script: `_worker_pod_logs` lists the worker pods,
+  skips those with a deletionTimestamp, and reads each one's log with `--request-timeout=20s`, ignoring a pod
+  whose log can't be read; `_worker_refusals` and `_worker_logs_since` use it (72 live-script unit tests pass
+  on 3.12). The remaining 34 scenarios, rerun with this fix: 34 passed, 0 failed, including `late_pvc_lost`,
+  `worker_restart` (`applied.field_manager == "ari-k8s-agent"`, `already_at_target`) and
+  `resume_after_restart`. Fixtures after the run: data-e2e-disk-0 and data-e2e-vol-0 Bound at 1Gi, no
+  Released PVs, no ResourceQuota left, worker env unchanged (AGENT_KIND and the two protection lists), api and
+  worker 1/1. Two other nodes (ip-10-1-18-19, ip-10-1-21-212) were NotReady afterwards; not touched.

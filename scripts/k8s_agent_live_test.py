@@ -1093,12 +1093,26 @@ def _kubectl_in(stdin: str, *args: str) -> str:
     return subprocess.run(cmd, check=True, capture_output=True, text=True, input=stdin).stdout.strip()
 
 
-def _worker_refusals(task_id: str) -> list[str]:
-    """The `apply_approved_change` refusals the worker pods logged for this task in the last 30 minutes."""
+def _worker_pod_logs(since: str) -> str:
+    """The logs of the worker's live pods, one pod at a time. Pods being deleted are left out: a worker a scenario
+    killed can sit Terminating on a node that stopped answering (the cluster autoscaler was removing it: test,
+    2026-11-27), and `kubectl logs -l` then fails as a whole; every scenario's refusal comes from a live worker."""
     namespace, deployment = _split("ARI_WORKER_DEPLOYMENT")
     selector = json.loads(_kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.selector.matchLabels}"))
     labels = ",".join(f"{k}={v}" for k, v in selector.items())
-    return _refusals_in(_kubectl("-n", namespace, "logs", "-l", labels, "--since=30m", "--tail=-1", "--max-log-requests=10"), task_id)
+    pods = json.loads(_kubectl("-n", namespace, "get", "pods", "-l", labels, "-o", "json"))["items"]
+    logs = []
+    for pod in pods:
+        if pod["metadata"].get("deletionTimestamp"):
+            continue
+        with contextlib.suppress(subprocess.CalledProcessError):
+            logs.append(_kubectl("-n", namespace, "logs", pod["metadata"]["name"], f"--since={since}", "--tail=-1", "--request-timeout=20s"))
+    return "\n".join(logs)
+
+
+def _worker_refusals(task_id: str) -> list[str]:
+    """The `apply_approved_change` refusals the worker pods logged for this task in the last 30 minutes."""
+    return _refusals_in(_worker_pod_logs("30m"), task_id)
 
 
 # The exception line of a refusal in the worker's traceback, whatever its class: `RuntimeError: ...` before
@@ -1769,10 +1783,7 @@ RETRY_QUOTA = "e2e-retry-quota"
 
 
 def _worker_logs_since(seconds: int) -> str:
-    namespace, deployment = _split("ARI_WORKER_DEPLOYMENT")
-    selector = json.loads(_kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.selector.matchLabels}"))
-    labels = ",".join(f"{k}={v}" for k, v in selector.items())
-    return _kubectl("-n", namespace, "logs", "-l", labels, f"--since={seconds}s", "--tail=-1", "--max-log-requests=10")
+    return _worker_pod_logs(f"{seconds}s")
 
 
 def _storage_owners(name: str) -> list[str]:
