@@ -5541,3 +5541,56 @@ policy, which is why the loop-count assertion is on `generate_change`.
 so a transient kill (OOM at 2Gi, a lost worker) now gets no retry at all
 rather than a useless one. If those should be retried, that policy is the
 lever, not the `on_failure` loop.
+
+---
+
+## 2026-11-27 - Kimi (Moonshot AI) as an LLM provider (II-25490)
+
+A request can now carry `"llm": {"provider": "moonshotai", "api_key": ..., "model": "kimi-k3.1-pro"}`.
+Only the international platform (`https://api.moonshot.ai/v1`) is supported; the China
+platform (`moonshotai-cn`, `api.moonshot.cn`) is out of scope by decision.
+
+**The provider id is `moonshotai` on purpose.** It is the id opencode uses for Kimi (the
+models.dev catalog: `moonshotai`, `@ai-sdk/openai-compatible`, `https://api.moonshot.ai/v1`),
+and opencode is launched with `--model <provider>/<model>` and gets
+`provider.<provider>.options.apiKey` in its per-request opencode.json. With the same id, the
+opencode side needs no code change at all. A friendlier alias such as `kimi` would have had to
+be translated in every place that builds that config, so there is none.
+
+**Why a branch of its own, not `openai` with a `base_url`.** `_openai_complete` calls the Responses
+API. The Kimi platform documents Responses too, but opencode reaches Kimi through Chat Completions
+(`@ai-sdk/openai-compatible`), so ARI uses the same interface. `common/llm/client.py` has its own
+`_moonshot_complete`: the same `AsyncOpenAI` SDK with this
+module's timeout and retry overrides, `chat.completions.create` with a system and a user
+message, `max_tokens` from `llm.max_tokens` (default 4096, as for Anthropic), and
+`base_url` falling back to the international endpoint. A `base_url` in the request still wins.
+Errors go through the existing `_provider_error`, so a 401 reads
+`moonshotai rejected the API key (HTTP 401)` with no part of the key in it. Token usage is mapped
+from `prompt_tokens` / `completion_tokens`, and cached tokens are read from
+`prompt_tokens_details.cached_tokens` or a top-level `cached_tokens`.
+
+Other places that enumerate providers: `k8s_agent/schemas.py` (a `Literal`, so it would have
+rejected the request), the chat gateway's `DEFAULT_MODELS` (`kimi-k3.1-pro`), and the `ari setup`
+provider list. Adding `moonshotai` there moved "other" from option 3 to option 4, which is why
+`test_setup_refuses_an_unnamed_or_modelless_other_provider` types `4` now.
+
+**Tests.** Unit tests were added in `tests/test_llm_client.py`,
+`tests/test_chat_gateway_config.py` and `tests/test_ari_cli_chat_decisions.py`, with the SDK mocked.
+
+**Verified on test, 2026-11-27,** images `2611270935-test` (deployed by Flux), against
+`https://test-ari-oncall-agent.insightfinder.com` with a real Kimi key and `kimi-k3.1-pro`:
+
+- A plain question (task `8129cf70`) completed in about 20 s with a correct two-sentence answer.
+  The planner and `respond` both go through `_moonshot_complete`; the image before this change
+  would have failed with `Unsupported llm.provider`. 4096 output tokens was enough here.
+- A one-line README edit on `octocat/Hello-World` with `skip_tests` and no PAT (task `4085f8be`):
+  `clone_repo` and `generate_change` succeeded and produced the expected diff, so opencode 1.18.31
+  in the worker image resolves `moonshotai/kimi-k3.1-pro` with no custom provider block. The run
+  then failed in `propose_pr`, as expected without a PAT. Its reported error was `git commit` with
+  no detail, not the push. The worker log shows why: attempt 1 committed and then failed with
+  `git push failed: fatal: could not read Username for 'https://github.com'`; attempts 2 and 3
+  (`max_attempts: 3`) found nothing left to commit, which git reports on stdout, so they failed with
+  an empty `git commit failed: `. Temporal keeps only the last attempt's failure, so the push error
+  is visible only in the worker log. Unrelated to Kimi and left as it is.
+- Both workflows' inputs in the Temporal UI show `"provider": "moonshotai"`,
+  `"model": "kimi-k3.1-pro"`, with the key stored as `enc:v1:...`.
