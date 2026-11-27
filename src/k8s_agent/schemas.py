@@ -14,7 +14,7 @@ from common.models.trace_config import TraceConfig
 
 
 class LLMConfig(BaseModel):
-    provider: Literal["openai", "anthropic"]
+    provider: Literal["openai", "anthropic", "moonshotai"]
     api_key: str
     model: str
     base_url: Optional[str] = None
