@@ -56,6 +56,10 @@ class ScaleReplicas(DeploymentAction):
     def at_target(self, action, state):
         return state["deployment"].get("replicas") == action["replicas"]
 
+    def written_fields(self, action, proposal):
+        # Written through the scale subresource; the API server records it on the Deployment's own field.
+        return {"kind": "Deployment", "namespace": action.get("namespace"), "name": action["deployment"], "paths": [["f:spec", "f:replicas"]]}
+
     def verify_target(self, action):
         return {"kind": "replicas", "replicas": action["replicas"]}
 

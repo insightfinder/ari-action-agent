@@ -229,6 +229,22 @@ async def test_a_resize_someone_else_already_made_is_not_reported_as_applied(clu
     assert not [p for p in cluster.patches if not p["dry_run"]]
 
 
+
+async def test_a_retry_refuses_a_resize_someone_else_made(cluster):
+    """Recorded under the pod's own fields with subresource resize, as on test: kubectl's, not this agent's."""
+    from common.capabilities_base import StepRefused
+    from k8s_agent.tools.client import PATCH_STRATEGIC
+
+    pa = await _approved(cluster, "resize pod checkout-1 in place: cpu limit 2", _CPU_LIMIT)
+    cluster.auto_resize = True
+    body = {"spec": {"containers": [{"name": "app", "resources": {"limits": {"cpu": "2"}}}]}}
+    await cluster.patch("Pod", "checkout-1", "shop", body, PATCH_STRATEGIC, False, "resize", field_manager="kubectl-patch")
+    cluster.patches.clear()
+    with pytest.raises(StepRefused, match="done by someone else"):
+        await apply_approved_change.run(_ctx("apply_approved_change", "", params=pa, confirmed=True, attempt=2))
+    assert not cluster.patches
+
+
 async def test_a_retried_apply_after_the_patch_landed_verifies_instead_of_refusing(cluster):
     pa = await _approved(cluster, "resize pod checkout-1 in place: cpu limit 2", _CPU_LIMIT)
     cluster.auto_resize = True

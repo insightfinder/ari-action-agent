@@ -536,6 +536,8 @@ def _worker_restart(worker: str):
         done["status"]["state"] == "TASK_STATE_COMPLETED"
         and result.get("ran") is True
         and (result.get("applied") or {}).get("already_at_target") is True
+        # The retry read the memory limit's field owner and found this agent's own (2026-11-27).
+        and (result.get("applied") or {}).get("field_manager") == "ari-k8s-agent"
         and result.get("status") in ("succeeded", "in_progress")
     )
     return ok, f"{done['status']['state']} in {elapsed:.0f}s status={result.get('status')} applied={result.get('applied')}"
@@ -1049,11 +1051,12 @@ def scenario_health_statefulset(_args):
 # from the worker's log (the failed activity names the task id as its workflow id).
 #
 # Every check an approval runs has a scenario here (the actions' `drift`, apply_approved_change's protection and
-# age checks), except four no cluster can be made to reach: a proposal for a target kind this build no longer
-# changes (only an older build made those), a Bound PVC turning unbound (its PV is protected while bound), a pod's
-# resizePolicy changing (immutable once the pod exists), and in-place resize becoming unavailable (the API server
-# or the kubelets would have to be downgraded). A Deployment pod "replaced under the same name" cannot happen
-# either: its replacement gets a new name, which is the `no longer exists` case.
+# age checks), except three no cluster can be made to reach: a proposal for a target kind this build no longer
+# changes (only an older build made those), a pod's resizePolicy changing (immutable once the pod exists), and
+# in-place resize becoming unavailable (the API server or the kubelets would have to be downgraded). A Deployment
+# pod "replaced under the same name" cannot happen either: its replacement gets a new name, which is the `no longer
+# exists` case. A Bound PVC can leave Bound only for Lost (its PV gone or claimed by another uid), which
+# `late_pvc_lost` makes.
 
 LATE_MARK = "ari-e2e/late-approval"
 LATE_OWNER = "e2e-late-owner"  # ConfigMap that stands in for an extra owner or an operator
@@ -1712,6 +1715,109 @@ def scenario_late_pvc_terminating(args):
             _disk_up()
 
 
+def scenario_late_pvc_lost(args):
+    """data-e2e-disk-0 made Lost after its growth was proposed: its PV is set to Retain, then its claimRef to
+    another uid, so the PV controller marks the PVC Lost (and the PV Released): refused (not Bound). Afterwards
+    the PV goes back to Delete and is removed with its volume, and the disk is recreated at 1Gi."""
+    if not args.allow_writes:
+        return _late_skip(args)
+    _fresh_disk()
+    pv = _kubectl("-n", NAMESPACE, "get", "pvc", DISK_PVC, "-o", "jsonpath={.spec.volumeName}")
+
+    def lose():
+        _kubectl("patch", "pv", pv, "--type", "merge", "-p", json.dumps({"spec": {"persistentVolumeReclaimPolicy": "Retain"}}))
+        _kubectl("patch", "pv", pv, "--type", "merge", "-p", json.dumps({"spec": {"claimRef": {"uid": str(uuid.uuid4())}}}))
+        _kubectl("-n", NAMESPACE, "wait", "--for=jsonpath={.status.phase}=Lost", f"pvc/{DISK_PVC}", "--timeout=120s")
+
+    try:
+        return _late(args, _EXPAND, lose, f"PVC {DISK_PVC} is Lost now, not Bound", _disk_untouched)
+    finally:
+        try:
+            _disk_down()
+        finally:
+            # Back to Delete whatever happened above, or the EBS volume outlives the run.
+            if _kubectl("get", "pv", pv, "--ignore-not-found", "-o", "name"):
+                _kubectl("patch", "pv", pv, "--type", "merge", "-p", json.dumps({"spec": {"persistentVolumeReclaimPolicy": "Delete"}}))
+        if _kubectl("get", "pv", pv, "--ignore-not-found", "-o", "name"):
+            _kubectl("wait", "--for=delete", f"pv/{pv}", "--timeout=300s")
+        _disk_up()
+
+
+RETRY_QUOTA = "e2e-retry-quota"
+
+
+def _worker_logs_since(seconds: int) -> str:
+    namespace, deployment = _split("ARI_WORKER_DEPLOYMENT")
+    selector = json.loads(_kubectl("-n", namespace, "get", "deploy", deployment, "-o", "jsonpath={.spec.selector.matchLabels}"))
+    labels = ",".join(f"{k}={v}" for k, v in selector.items())
+    return _kubectl("-n", namespace, "logs", "-l", labels, f"--since={seconds}s", "--tail=-1", "--max-log-requests=10")
+
+
+def _storage_owners(name: str) -> list[str]:
+    raw = json.loads(_kubectl("-n", NAMESPACE, "get", "pvc", name, "-o", "json", "--show-managed-fields"))
+    return sorted(
+        e["manager"] for e in raw["metadata"].get("managedFields") or []
+        if "f:storage" in (((e.get("fieldsV1") or {}).get("f:spec") or {}).get("f:resources") or {}).get("f:requests", {})
+    )
+
+
+def scenario_retry_done_by_someone_else(args):
+    """The retried step tells its own write from someone else's by field owner (2026-11-27). A ResourceQuota
+    makes the first attempt's growth of data-e2e-disk-0 fail at the API with nothing written; while the step
+    waits for its retry (10 s), the quota goes and kubectl grows the PVC to exactly the approved 2Gi. The retry
+    finds the size owned by kubectl, not this agent: refused, never reported as applied. The disk is recreated
+    at 1Gi afterwards."""
+    skip = _late_skip(args)
+    if skip:
+        return skip
+    _fresh_disk()
+    task, pending = _must_propose(_EXPAND)
+    try:
+        _kubectl_in(json.dumps({
+            "apiVersion": "v1", "kind": "ResourceQuota",
+            "metadata": {"name": RETRY_QUOTA, "namespace": NAMESPACE},
+            "spec": {"hard": {"requests.storage": "1Mi"}},
+        }), "apply", "-f", "-")
+        _kubectl("-n", NAMESPACE, "wait", "--for=jsonpath={.status.hard.requests\\.storage}=1Mi", f"resourcequota/{RETRY_QUOTA}", "--timeout=60s")
+        started = time.monotonic()
+        resumed = _send_approval(task, pending["id"])
+        failed_once = False
+        while time.monotonic() - started < 60 and not failed_once:
+            logs = _worker_logs_since(20)
+            failed_once = any("Completing activity as failed" in line and task["id"] in line for line in logs.splitlines())
+            if not failed_once:
+                time.sleep(1)
+        if not failed_once:
+            return False, "the first attempt's failure never showed in the worker log"
+        _kubectl("-n", NAMESPACE, "delete", "resourcequota", RETRY_QUOTA, "--wait=true")
+        for left in range(5, -1, -1):  # the quota admission's cache can outlive the delete by a moment
+            try:
+                _kubectl("-n", NAMESPACE, "patch", "pvc", DISK_PVC, "--type", "merge",
+                         "-p", json.dumps({"spec": {"resources": {"requests": {"storage": "2Gi"}}}}))
+                break
+            except subprocess.CalledProcessError:
+                if not left:
+                    raise
+                time.sleep(1)
+        patched = time.monotonic() - started
+        done, _ = _wait(resumed["id"], budget_seconds=600)
+        time.sleep(5)
+        reasons = _worker_refusals(task["id"])
+        owners = _storage_owners(DISK_PVC)
+        ok = (
+            done["status"]["state"] != "TASK_STATE_COMPLETED"
+            and _artifact(done, "action_result") is None
+            and any(_DONE_ELSEWHERE in r for r in reasons)
+            and "ari-k8s-agent" not in owners
+        )
+        return ok, (f"{done['status']['state']} kubectl grew it {patched:.0f}s after the approval; storage owned by "
+                    f"{owners}; refusal={(reasons or ['none logged'])[-1][:200]}")
+    finally:
+        _kubectl("-n", NAMESPACE, "delete", "resourcequota", RETRY_QUOTA, "--ignore-not-found")
+        _disk_down()
+        _disk_up()
+
+
 def scenario_late_pvc_size_changed(args):
     """data-e2e-disk-0 grown by kubectl to 1536Mi after a growth to 2Gi was proposed: refused (its requested size
     changed). The disk is recreated at 1Gi afterwards."""
@@ -2187,6 +2293,7 @@ SCENARIOS = {
     "late_restart_strategy": scenario_late_restart_strategy,
     "late_delete_pod_gone": scenario_late_delete_pod_gone,
     "late_delete_pod_retry": scenario_late_delete_pod_retry,
+    "retry_done_by_someone_else": scenario_retry_done_by_someone_else,
     "late_delete_pod_orphaned": scenario_late_delete_pod_orphaned,
     "late_delete_pod_last_ready": scenario_late_delete_pod_last_ready,
     "late_resize_pod_gone": scenario_late_resize_pod_gone,
@@ -2194,6 +2301,7 @@ SCENARIOS = {
     "late_resize_pod_usage": scenario_late_resize_pod_usage,
     "late_pvc_deleted_then_replaced": scenario_late_pvc_deleted_then_replaced,
     "late_pvc_terminating": scenario_late_pvc_terminating,
+    "late_pvc_lost": scenario_late_pvc_lost,
     "late_pvc_size_changed": scenario_late_pvc_size_changed,
     "late_pvc_helm_marked": scenario_late_pvc_helm_marked,
     "late_pvc_extra_owner": scenario_late_pvc_extra_owner,

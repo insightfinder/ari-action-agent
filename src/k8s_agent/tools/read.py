@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 from urllib3.exceptions import HTTPError as Urllib3Error
 
-from . import capacity, catalog, governance, persistence, views
+from . import capacity, catalog, governance, ownership, persistence, views
 from .client import CHART_SOURCES, FLUX_SOURCES, HELMRELEASE_KINDS, api_status, get_client, safe_error
 from .redact import bounded, redact_text
 
@@ -354,6 +354,20 @@ async def get_pvc(namespace: str, name: str) -> dict | None:
         if api_status(exc) == 404:
             return None
         raise RuntimeError(f"could not read PersistentVolumeClaim {namespace}/{name}: {safe_error(exc)}") from None
+
+
+async def get_field_owners(kind: str, namespace: str | None, name: str, paths: list[list[str]]) -> dict | None:
+    """The field managers that own each of `paths` on this object (`ownership.owners`), in the same order, and
+    the object's uid; None when the object does not exist. Only manager names leave here, never the fields."""
+    try:
+        raw = await _get_dict(kind, name, namespace)
+    except Exception as exc:  # noqa: BLE001
+        if api_status(exc) == 404:
+            return None
+        raise RuntimeError(f"could not read {kind} {namespace}/{name}: {safe_error(exc)}") from None
+    meta = raw.get("metadata") or {}
+    managed = meta.get("managedFields") or []
+    return {"uid": meta.get("uid"), "owners": [ownership.owners(managed, list(path)) for path in paths]}
 
 
 async def get_storageclass(name: str | None) -> dict | None:

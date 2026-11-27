@@ -67,6 +67,10 @@ tools:
     module: k8s_agent.tools.read
     function: namespace_names
 
+  get_field_owners:     # managedFields: which field managers set given fields (manager names only)
+    module: k8s_agent.tools.read
+    function: get_field_owners
+
   get_resize_support:   # discovery (/api/v1 pods/resize) and /version, read live
     module: k8s_agent.tools.read
     function: get_resize_support

@@ -57,6 +57,19 @@ class SetAutoscalerBounds(DeploymentAction):
             return False
         return all(artifact_int(fingerprint.get(b)) == action[b] for b in ("min", "max") if action.get(b) is not None)
 
+    def written_fields(self, action, proposal):
+        target = action["autoscaler"]
+        fields = _FIELDS.get(target.get("kind"))
+        if fields is None:
+            return None
+        then = (proposal.get("snapshot") or {}).get("autoscaler") or {}
+        paths = [
+            ["f:spec", f"f:{fields[bound]}"]
+            for bound in ("min", "max")
+            if action.get(bound) is not None and artifact_int(then.get(bound)) != action[bound]
+        ]
+        return {"kind": target["kind"], "namespace": action.get("namespace"), "name": target["name"], "paths": paths}
+
     def verify_target(self, action):
         return {"kind": "autoscaler", "min": action.get("min"), "max": action.get("max")}
 

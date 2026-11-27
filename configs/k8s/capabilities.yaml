@@ -124,8 +124,10 @@ capabilities:
       - get_pod_metrics
       - wait_pvc_expanded
       - get_flux_chain
+      - get_field_owners
     # A second attempt (the worker died, or a read failed, mid-step) finds the
-    # approved values already in place and verifies instead of writing again.
+    # approved values already in place and verifies instead of writing again,
+    # when this agent's field manager owns the fields it changed.
     retry:
       max_attempts: 2
       backoff_seconds: 10

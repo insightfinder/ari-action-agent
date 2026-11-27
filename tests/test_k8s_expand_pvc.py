@@ -341,11 +341,41 @@ async def test_a_size_someone_else_already_asked_for_is_not_reported_as_applied(
 
 @pytest.mark.asyncio
 async def test_a_retried_approval_finds_the_size_asked_and_does_not_write_again(cluster):
+    """The first attempt's own write (field manager ari-k8s-agent) landed before the worker was lost."""
+    pa = await _approved(cluster)
+    await _grow_as(cluster, "ari-k8s-agent")
+    result = await _apply(pa, attempt=2)
+    assert result["status"] == "succeeded" and result["applied"]["already_at_target"] is True
+    assert result["applied"]["field_manager"] == "ari-k8s-agent"
+    assert not cluster.patches
+
+
+async def _grow_as(cluster, manager):
+    await cluster.patch("PersistentVolumeClaim", "data-db-0", "shop", {"spec": {"resources": {"requests": {"storage": "20Gi"}}}},
+                        "application/merge-patch+json", False, field_manager=manager)
+    _pvc(cluster, "data-db-0")["status"]["capacity"]["storage"] = "20Gi"
+    cluster.patches.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_retried_approval_refuses_a_size_someone_else_set(cluster):
+    """The first attempt failed before writing and someone grew the PVC by hand before the retry: the retry finds
+    the size owned by kubectl, not this agent, and refuses instead of reporting it as applied."""
+    pa = await _approved(cluster)
+    await _grow_as(cluster, "kubectl-patch")
+    with pytest.raises(RuntimeError, match="already holds what was approved, done by someone else"):
+        await _apply(pa, attempt=2)
+    assert not cluster.patches
+
+
+@pytest.mark.asyncio
+async def test_a_retried_approval_with_no_owner_on_record_is_refused_as_undecidable(cluster):
     pa = await _approved(cluster)
     _pvc(cluster, "data-db-0")["spec"]["resources"]["requests"]["storage"] = "20Gi"
     _pvc(cluster, "data-db-0")["status"]["capacity"]["storage"] = "20Gi"
-    result = await _apply(pa)
-    assert result["status"] == "succeeded" and result["applied"]["already_at_target"] is True
+    with pytest.raises(RuntimeError, match="records no field manager for it") as refused:
+        await _apply(pa, attempt=2)
+    assert "Nothing was changed" not in str(refused.value)
     assert not cluster.patches
 
 

@@ -75,6 +75,12 @@ class ActionSpec:
     # instead. Decided in code, never by the model.
     fallback: str | None = None
 
+    # Whether the step may be retried after failing before its write was sent. A retry that finds the approved
+    # result in place counts it as its own only by the fields' owner (`written_fields`); an action that leaves
+    # no owner to read (a delete) ends the step on such a failure instead (user, 2026-11-27), so only a lost
+    # worker, which may have sent the write, reaches a retry.
+    retry_before_write: bool = True
+
     # Said when `accepts` is False and there is no fallback: the request does not itself ask for this change.
     not_asked: str = ""
 
@@ -131,6 +137,13 @@ class ActionSpec:
 
     def at_target(self, action: dict, state: dict) -> bool:
         raise NotImplementedError
+
+    def written_fields(self, action: dict, proposal: dict) -> dict | None:
+        """`{kind, namespace, name, paths}`: the object and the fields (`tools/ownership` paths) this change sets
+        to a value other than the one in the proposal's snapshot. Once this agent's write lands, each of them is
+        owned by its field manager; set by anyone else, they are not. None when the change leaves no such record
+        (a delete, a restart)."""
+        return None
 
     def verify_target(self, action: dict) -> dict:
         raise NotImplementedError

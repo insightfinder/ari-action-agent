@@ -29,7 +29,15 @@ re-reading the target. On the first attempt nothing of this step's own can
 have been written, so a target already holding the approved result (a pod
 already gone, replicas already at the number, a PVC already that size) was
 put there by someone else: refused, never reported as this agent's change
-(user, 2026-11-26). Refusals raise `StepRefused`, which is never retried: a
+(user, 2026-11-26). A later attempt asks the cluster who set it (user,
+2026-11-27): the fields a patch changes (`written_fields`) record their field
+manager, and only fields this agent's manager owns count as its own write;
+set by any other manager they are refused the same way, and with no owner on
+record they are refused as undecidable. A delete leaves no such record, so a
+retried delete still counts an already-gone pod as its own; for it a failure
+before the DELETE is sent is not retried (`retry_before_write`), so only a
+lost worker reaches that retry. Refusals raise
+`StepRefused`, which is never retried: a
 retry would find the same state, or one a refusal seconds earlier ruled
 out, and act on it. Once the patch is in, nothing below it may turn the
 run into "nothing was executed": a verification that cannot finish is
@@ -48,6 +56,7 @@ from .. import actions
 from ..actions.base import artifact_int as _int, target_of
 from ..stepkit import finish, options
 from ..tools import governance, persistence, protection
+from ..tools.client import FIELD_MANAGER
 
 _VERIFY_MARGIN_SECONDS = 60
 _DEFAULT_STEP_SECONDS = 900
@@ -119,6 +128,51 @@ def _duration(seconds: float) -> str:
     raise AssertionError("unreachable")
 
 
+async def _before_write(ctx: StepContext, spec, proposal: dict, target: dict):
+    """Everything before the write: the action, the re-read state and its drift, and whether an earlier attempt
+    already wrote it (`already`, `writer`). Refusals raise `StepRefused`; anything else is a failure before the
+    change was sent."""
+    namespace = target["namespace"]
+    action = spec.patch_action(proposal)
+
+    state = await spec.load_state(ctx, target)
+    drift = spec.drift(proposal, state)
+    # The approved result already in place. From the second attempt on, the earlier attempt may have written it
+    # (the worker was lost after the write): verify instead of refusing or writing again. On the first attempt
+    # nothing of this step's own has run, so someone else put it there and this agent did nothing: refused.
+    at_target = bool(drift) and spec.at_target(action, state)
+    # Who set the approved values, from the fields' managers: "agent", "other", "unknown", or None when the
+    # action leaves no record (then the attempt number alone decides, as before 2026-11-27).
+    writer, unread = await _writer(ctx, spec, action, proposal) if at_target and ctx.attempt != 1 else (None, None)
+    already = at_target and ctx.attempt != 1 and writer in (None, "agent")
+    if drift and not already:
+        if writer in ("unknown", "unreadable"):
+            why = (
+                "the cluster records no field manager for it"
+                if writer == "unknown"
+                else f"who set it could not be read ({unread})"
+            )
+            raise StepRefused(
+                f"apply_approved_change: {target['kind']} {namespace}/{target['name']} already holds what was approved ("
+                + "; ".join(drift)
+                + f"), but {why}, so this agent cannot tell its own earlier attempt from someone else's change and "
+                "does not report it as applied. Check the object before asking again."
+            )
+        done_elsewhere = "; it already holds what was approved, done by someone else, not this agent" if at_target else ""
+        raise StepRefused(
+            "apply_approved_change: the cluster changed after this proposal was made ("
+            + "; ".join(drift)
+            + done_elsewhere
+            + "). Nothing was changed. Ask again so a fresh proposal reflects the current state."
+        )
+
+    # Too old to write, but not too old to verify what an earlier attempt of this step already wrote.
+    stale = None if already else _too_old(ctx, proposal)
+    if stale:
+        raise StepRefused(stale)
+    return action, state, state.get("deployment") or {}, drift, already, writer
+
+
 async def run(ctx: StepContext) -> dict:
     proposal = _require_confirmed(ctx)
     spec = actions.get(proposal["action"])
@@ -133,29 +187,18 @@ async def run(ctx: StepContext) -> dict:
     protected = protection.why_protected(namespace, proposal.get("deployment") or proposal.get("workload") or target["name"])
     if protected:
         raise StepRefused(f"apply_approved_change: {protected}")
-    action = spec.patch_action(proposal)
-
-    state = await spec.load_state(ctx, target)
-    dep = state.get("deployment") or {}
-    drift = spec.drift(proposal, state)
-    # The approved result already in place. From the second attempt on, the earlier attempt may have written it
-    # (the worker was lost after the write): verify instead of refusing or writing again. On the first attempt
-    # nothing of this step's own has run, so someone else put it there and this agent did nothing: refused.
-    at_target = bool(drift) and spec.at_target(action, state)
-    already = at_target and ctx.attempt != 1
-    if drift and not already:
-        done_elsewhere = "; it already holds what was approved, done by someone else, not this agent" if at_target else ""
+    try:
+        action, state, dep, drift, already, writer = await _before_write(ctx, spec, proposal, target)
+    except StepRefused:
+        raise
+    except Exception as exc:  # noqa: BLE001 — nothing was sent yet; whether to retry is the action's call
+        if spec.retry_before_write:
+            raise
         raise StepRefused(
-            "apply_approved_change: the cluster changed after this proposal was made ("
-            + "; ".join(drift)
-            + done_elsewhere
-            + "). Nothing was changed. Ask again so a fresh proposal reflects the current state."
-        )
-
-    # Too old to write, but not too old to verify what an earlier attempt of this step already wrote.
-    stale = None if already else _too_old(ctx, proposal)
-    if stale:
-        raise StepRefused(stale)
+            f"apply_approved_change: this step failed before its change was sent ({type(exc).__name__}: {exc}). "
+            "Nothing was changed. It is not retried: a retry that found the change in place could not tell this "
+            "agent's own work from someone else's. Ask again."
+        ) from None
 
     # Second precision on pod creation timestamps: back off a little so pods
     # created by this very patch are never mistaken for older ones.
@@ -164,13 +207,16 @@ async def run(ctx: StepContext) -> dict:
     # that expects one container restart counts it from here.
     before_write = None if already else state
     if already:
-        # An earlier attempt of this step (or, between it and this one, someone else) put the approved values in place.
+        # An earlier attempt of this step put the approved values in place: its field manager owns them (or, for
+        # a delete, which leaves no owner, the pod is gone).
         applied = {
             "already_at_target": True,
             "note": "the cluster already held the approved values; nothing was written again",
-            # What differs from the proposal's snapshot: this step's own earlier write, or someone else's change.
+            # What differs from the proposal's snapshot: this step's own earlier write.
             "changed_since_proposal": drift,
         }
+        if writer == "agent":
+            applied["field_manager"] = FIELD_MANAGER
         # When it was written is unknown here, but not before the proposal: pods from before it (often the
         # very crash loop this change fixes) must not be judged as the change's own.
         applied_at = _proposed_at(proposal)
@@ -184,7 +230,8 @@ async def run(ctx: StepContext) -> dict:
                 raise
             # The API answered "not there" (404) or "not that object" (409, a uid precondition): this write did
             # nothing; someone else got there between the re-check above and the write.
-            if ctx.attempt == 1 and _NOT_THERE.search(str(exc)):
+            # Who set it, when that can be read: a failed read leaves the write's own error as the outcome below.
+            if (ctx.attempt == 1 and _NOT_THERE.search(str(exc))) or (await _writer(ctx, spec, action, proposal))[0] == "other":
                 raise StepRefused(
                     f"apply_approved_change: {target['kind']} {namespace}/{target['name']} had already been changed "
                     f"by someone else when this agent's write reached the API ({exc}). Nothing was changed by this agent."
@@ -243,6 +290,24 @@ async def run(ctx: StepContext) -> dict:
         "executed_at": datetime.now(timezone.utc).isoformat(),
     }
     return finish({"action_result": action_result})
+
+
+async def _writer(ctx: StepContext, spec, action: dict, proposal: dict) -> tuple[str | None, str | None]:
+    """Who set the fields this change writes, now holding the approved values, and the read error if any:
+    "agent" when this agent's field manager is among the owners of every one of them, "other" when some field
+    is owned only by other managers, "unknown" when one has no owner on record, "unreadable" when the object
+    could not be read; None when the action leaves no such record (`written_fields`)."""
+    fields = spec.written_fields(action, proposal)
+    if not fields or not fields.get("paths"):
+        return None, None
+    try:
+        found = await ctx.tool("get_field_owners")(fields["kind"], fields["namespace"], fields["name"], fields["paths"])
+    except Exception as exc:  # noqa: BLE001 — reads already retry transient errors; this one is reported
+        return "unreadable", f"{type(exc).__name__}: {exc}"
+    owners = (found or {}).get("owners") or []
+    if len(owners) != len(fields["paths"]) or any(not names for names in owners):
+        return "unknown", None
+    return ("agent" if all(FIELD_MANAGER in names for names in owners) else "other"), None
 
 
 async def _check_bounds_held(ctx: StepContext, action: dict, verification: dict) -> dict:

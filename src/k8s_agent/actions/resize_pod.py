@@ -30,6 +30,7 @@ from ..stepkit import refusal
 from ..tools import governance, policy, quantities
 from .base import ActionSpec, Operation, target_of
 from .set_resources import (
+    changed_resource_paths,
     decrease_check,
     decrease_drift,
     own_pod_usage,
@@ -386,6 +387,12 @@ class ResizePod(ActionSpec):
     def at_target(self, action, state):
         pod = state.get("pod")
         return bool(pod) and matches((pod.get("resources") or {}).get(action["container"]), action.get("resources"))
+
+    def written_fields(self, action, proposal):
+        then = ((proposal.get("snapshot") or {}).get("container_resources") or {}).get(action["container"])
+        paths = changed_resource_paths(["f:spec"], action["container"], action.get("resources"), then)
+        # Written through the resize subresource; recorded on the pod's own fields.
+        return {"kind": "Pod", "namespace": action.get("namespace"), "name": action["pod"], "paths": paths}
 
     def verify_target(self, action):
         return {"kind": "pod_resources", "pod": action["pod"], "container": action["container"], "resources": action["resources"]}
